@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import os
+import traceback
 from typing import Any
 
 from dimos_lcm.std_msgs import Bool, String
@@ -28,6 +29,12 @@ from dimos.msgs.nav_msgs.OccupancyGrid import OccupancyGrid
 from dimos.msgs.nav_msgs.Path import Path
 from dimos.navigation.base import NavigationInterface, NavigationState
 from dimos.navigation.replanning_a_star.global_planner import GlobalPlanner
+from dimos.utils.logging_config import setup_logger
+
+logger = setup_logger()
+
+# Task names the nav module looks for in the coordinator (controller-agnostic)
+_PATH_FOLLOWER_TASK_NAMES = ("path_follower", "reactive_path_follower")
 
 
 class ReplanningAStarPlanner(Module, NavigationInterface):
@@ -48,6 +55,9 @@ class ReplanningAStarPlanner(Module, NavigationInterface):
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
         self._planner = GlobalPlanner(self.config.g)
+
+        self._has_path_follower = False
+        self._local_planner_cmd_vel_disposable: Disposable | None = None
 
     @rpc
     def start(self) -> None:
@@ -72,7 +82,14 @@ class ReplanningAStarPlanner(Module, NavigationInterface):
 
         self._disposables.add(self._planner.path.subscribe(self.path.publish))
 
-        self._disposables.add(self._planner.cmd_vel.subscribe(self.cmd_vel.publish))
+        if not self._has_path_follower:
+            self._local_planner_cmd_vel_disposable = self._planner.cmd_vel.subscribe(
+                self.cmd_vel.publish
+            )
+            self._disposables.add(self._local_planner_cmd_vel_disposable)
+            logger.warning("No path follower task detected — using LocalPlanner fallback")
+        else:
+            logger.info("Path follower task active — LocalPlanner cmd_vel disabled")
 
         self._disposables.add(self._planner.goal_reached.subscribe(self.goal_reached.publish))
 
@@ -119,3 +136,60 @@ class ReplanningAStarPlanner(Module, NavigationInterface):
     @rpc
     def reset_safe_goal_clearance(self) -> None:
         self._planner.reset_safe_goal_clearance()
+
+    @rpc
+    def on_system_modules(self, modules: list) -> None:
+        """Auto-detect ControlCoordinator and its path follower task.
+
+        The nav module is **controller-agnostic** — it does not create or
+        configure path follower tasks.  The blueprint declares the task via
+        TaskConfig on the coordinator; this method simply discovers it by
+        name and wires the GlobalPlanner to route paths through it.
+        """
+        from dimos.control.coordinator import ControlCoordinator as CoordinatorClass
+        from dimos.core.rpc_client import RPCClient
+
+        has_coordinator = False
+        for module in modules:
+            try:
+                if issubclass(module.actor_class, CoordinatorClass):
+                    has_coordinator = True
+                    break
+            except (AttributeError, TypeError):
+                continue
+
+        if not has_coordinator:
+            logger.info("No ControlCoordinator in blueprint — LocalPlanner fallback active")
+            return
+
+        try:
+            coordinator = RPCClient(None, CoordinatorClass)
+
+            # Discover a path follower task already registered in the coordinator
+            task_list = coordinator.list_tasks() if hasattr(coordinator, "list_tasks") else []
+            task_name: str | None = None
+            for name in _PATH_FOLLOWER_TASK_NAMES:
+                if name in task_list:
+                    task_name = name
+                    break
+
+            if task_name is None:
+                logger.info(
+                    "ControlCoordinator found but no path follower task registered — "
+                    "LocalPlanner fallback active"
+                )
+                return
+
+            logger.info(f"Found path follower task '{task_name}' in coordinator")
+
+            self._planner.set_path_follower_task(coordinator, task_name)
+            self._has_path_follower = True
+
+            if self._local_planner_cmd_vel_disposable is not None:
+                self._local_planner_cmd_vel_disposable.dispose()
+                self._local_planner_cmd_vel_disposable = None
+                logger.info("Disabled LocalPlanner cmd_vel — coordinator path follower is active")
+
+        except Exception as e:
+            logger.error(f"Failed to wire coordinator path follower: {e}")
+            logger.error(traceback.format_exc())

@@ -328,6 +328,36 @@ class ControlCoordinator(Module[ControlCoordinatorConfig]):
                 ),
             )
 
+        elif task_type == "path_follower":
+            from dimos.control.tasks.path_follower_task import (
+                PathFollowerTask,
+                PathFollowerTaskConfig,
+            )
+            from dimos.core.global_config import global_config
+
+            return PathFollowerTask(
+                cfg.name,
+                PathFollowerTaskConfig(
+                    joint_names=cfg.joint_names,
+                    priority=cfg.priority,
+                ),
+                global_config,
+            )
+
+        elif task_type == "reactive_path_follower":
+            from dimos.control.tasks.reactive_path_follower_task import (
+                ReactivePathFollowerTask,
+                ReactivePathFollowerTaskConfig,
+            )
+
+            return ReactivePathFollowerTask(
+                cfg.name,
+                ReactivePathFollowerTaskConfig(
+                    joint_names=cfg.joint_names,
+                    priority=cfg.priority,
+                ),
+            )
+
         else:
             raise ValueError(f"Unknown task type: {task_type}")
 
@@ -418,6 +448,12 @@ class ControlCoordinator(Module[ControlCoordinatorConfig]):
         """List all joint names across all hardware."""
         with self._hardware_lock:
             return list(self._joint_to_hardware.keys())
+
+    @rpc
+    def list_tasks(self) -> list[str]:
+        """List all registered task names."""
+        with self._task_lock:
+            return list(self._tasks.keys())
 
     @rpc
     def get_joint_positions(self) -> dict[str, float]:
