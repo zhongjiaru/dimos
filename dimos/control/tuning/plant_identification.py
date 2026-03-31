@@ -69,6 +69,21 @@ def _zero_phase_lowpass(signal: NDArray, dt_arr: NDArray, cutoff_hz: float = 2.0
     return filtfilt(b, a, signal)
 
 
+def fopdt_step_response(t: NDArray, K: float, tau: float, theta: float, amplitude: float) -> NDArray:
+    """Analytical FOPDT step response.
+
+    y(t) = K * amplitude * (1 - exp(-(t - theta) / tau))  for t >= theta
+    y(t) = 0                                                for t < theta
+    """
+    y = np.zeros_like(t)
+    mask = t >= theta
+    if tau > 1e-6:
+        y[mask] = K * amplitude * (1.0 - np.exp(-(t[mask] - theta) / tau))
+    else:
+        y[mask] = K * amplitude
+    return y
+
+
 @dataclass
 class FOPDTParams:
     """First-Order Plus Dead Time model parameters."""
@@ -84,6 +99,65 @@ class FOPDTParams:
             f"FOPDT({self.channel} @ {self.amplitude:+.1f}: "
             f"K={self.K:.3f}, τ={self.tau:.3f}s, θ={self.theta:.3f}s)"
         )
+
+
+def remove_outlier_trials(trials: list[TrialData]) -> list[TrialData]:
+    """Drop outlier trials using both FOPDT params and steady-state velocity.
+
+    Two-stage rejection:
+    1. FOPDT-based: drop if K or tau deviates >30% from median.
+    2. Steady-state: drop if mean velocity during last 50% of step phase
+       deviates >25% from median across trials.
+    """
+    groups: dict[tuple[str, float], list[TrialData]] = {}
+    for t in trials:
+        groups.setdefault((t.channel, t.amplitude), []).append(t)
+
+    clean: list[TrialData] = []
+    for (channel, amplitude), group in groups.items():
+        if len(group) < 2:
+            clean.extend(group)
+            continue
+
+        # Stage 1: FOPDT param check
+        fits = [(t, identify_fopdt(t)) for t in group]
+        Ks = [p.K for _, p in fits]
+        taus = [p.tau for _, p in fits]
+        K_med = float(np.median(Ks))
+        tau_med = float(np.median(taus))
+
+        stage1 = []
+        for t, p in fits:
+            K_dev = abs(p.K - K_med) / max(K_med, 1e-6)
+            tau_dev = abs(p.tau - tau_med) / max(tau_med, 1e-6)
+            if K_dev <= 0.25 and tau_dev <= 0.25:
+                stage1.append(t)
+
+        # Stage 2: steady-state velocity check on survivors
+        # Skip percentage-based rejection when steady-state is near zero
+        # (e.g. vy=0.2 where the robot genuinely can't move laterally)
+        if len(stage1) >= 2:
+            ss_values = []
+            for t in stage1:
+                step_mask = np.array([p == "step" for p in t.phase])
+                step_vel = t.actual[step_mask]
+                n_tail = max(1, len(step_vel) // 2)
+                ss_values.append(float(np.mean(step_vel[-n_tail:])))
+
+            ss_med = float(np.median(ss_values))
+            # Only apply percentage rejection if steady-state is large enough
+            # to make percentages meaningful (>0.05 m/s or rad/s)
+            if abs(ss_med) > 0.05:
+                for t, ss in zip(stage1, ss_values):
+                    ss_dev = abs(ss - ss_med) / abs(ss_med)
+                    if ss_dev <= 0.25:
+                        clean.append(t)
+            else:
+                clean.extend(stage1)
+        else:
+            clean.extend(stage1)
+
+    return clean
 
 
 @dataclass
@@ -244,7 +318,19 @@ def identify_fopdt(trial: TrialData) -> FOPDTParams:
                            channel=trial.channel, amplitude=trial.amplitude)
 
 
-def plot_step_responses(trials: list[TrialData], output: str = "step_response_curves.png") -> None:
+def _get_ylim(channel: str, amplitude: float) -> tuple[float, float]:
+    """Consistent y-axis limits per channel and sign."""
+    if channel == "wz":
+        return (-0.1, 3.5) if amplitude > 0 else (-3.5, 0.1)
+    else:
+        return (-0.1, 1.5) if amplitude > 0 else (-1.5, 0.1)
+
+
+def plot_step_responses(
+    trials: list[TrialData],
+    output: str = "step_response_curves.png",
+    title_suffix: str = "",
+) -> None:
     """Plot step response curves grouped by (channel, amplitude)."""
     import matplotlib.pyplot as plt
 
@@ -294,18 +380,24 @@ def plot_step_responses(trials: list[TrialData], output: str = "step_response_cu
         ax.legend(fontsize=7, loc="lower right")
         ax.grid(True, alpha=0.3)
         ax.set_xlim(-2.5, 13.5)
+        ax.set_ylim(_get_ylim(channel, amplitude))
 
     # Hide unused subplots
     for idx in range(n_plots, rows_count * cols):
         axes[idx // cols][idx % cols].set_visible(False)
 
-    fig.suptitle("Go2 Step Response — Raw Odom Velocity", fontsize=13, fontweight="bold")
+    suffix = f" — {title_suffix}" if title_suffix else ""
+    fig.suptitle(f"Go2 Step Response{suffix}", fontsize=13, fontweight="bold")
     plt.tight_layout()
     plt.savefig(output, dpi=150)
     print(f"Saved plot to {output}")
 
 
-def plot_averaged_responses(trials: list[TrialData], output: str = "step_response_averaged.png") -> None:
+def plot_averaged_responses(
+    trials: list[TrialData],
+    output: str = "step_response_averaged.png",
+    title_suffix: str = "",
+) -> None:
     """Plot trial-averaged step response per (channel, amplitude)."""
     import matplotlib.pyplot as plt
 
@@ -361,11 +453,95 @@ def plot_averaged_responses(trials: list[TrialData], output: str = "step_respons
         ax.legend(fontsize=7, loc="lower right")
         ax.grid(True, alpha=0.3)
         ax.set_xlim(-2.5, 13.5)
+        ax.set_ylim(_get_ylim(channel, amplitude))
 
     for idx in range(n_plots, rows_count * cols):
         axes[idx // cols][idx % cols].set_visible(False)
 
-    fig.suptitle("Go2 Step Response — Trial-Averaged", fontsize=13, fontweight="bold")
+    suffix = f" — {title_suffix}" if title_suffix else ""
+    fig.suptitle(f"Go2 Step Response — Trial-Averaged{suffix}", fontsize=13, fontweight="bold")
+    plt.tight_layout()
+    plt.savefig(output, dpi=150)
+    print(f"Saved plot to {output}")
+
+
+def plot_fopdt_overlay(trials: list[TrialData], output: str = "step_response_fopdt.png") -> None:
+    """Plot trial-averaged actual response with FOPDT model overlay.
+
+    Shows how well the identified model fits the measured data.
+    """
+    import matplotlib.pyplot as plt
+
+    _UNITS = {"vx": "m/s", "vy": "m/s", "wz": "rad/s"}
+    _LABELS = {
+        "vx": "Forward velocity (vx)",
+        "vy": "Lateral velocity (vy)",
+        "wz": "Yaw rate (ωz)",
+    }
+
+    groups: dict[tuple[str, float], list[TrialData]] = {}
+    for t in trials:
+        groups.setdefault((t.channel, t.amplitude), []).append(t)
+
+    n_plots = len(groups)
+    if n_plots == 0:
+        return
+
+    cols = min(3, n_plots)
+    rows_count = math.ceil(n_plots / cols)
+    fig, axes = plt.subplots(rows_count, cols, figsize=(6 * cols, 4 * rows_count), squeeze=False)
+
+    for idx, ((channel, amplitude), group_trials) in enumerate(sorted(groups.items())):
+        ax = axes[idx // cols][idx % cols]
+        unit = _UNITS.get(channel, "")
+        label = _LABELS.get(channel, channel)
+
+        # Average the trials onto common time grid
+        t_min = max(td.time[0] for td in group_trials)
+        t_max = min(td.time[-1] for td in group_trials)
+        t_common = np.linspace(t_min, t_max, 500)
+
+        all_interp = []
+        for td in group_trials:
+            all_interp.append(np.interp(t_common, td.time, td.actual))
+
+        mean_vel = np.mean(all_interp, axis=0)
+
+        # Fit FOPDT on each trial, average the params
+        fits = [identify_fopdt(td) for td in group_trials]
+        K_avg = float(np.mean([f.K for f in fits]))
+        tau_avg = float(np.mean([f.tau for f in fits]))
+        theta_avg = float(np.mean([f.theta for f in fits]))
+
+        # Generate model response on the same time grid
+        # t_common is relative to step onset (t=0)
+        amp_abs = abs(amplitude)
+        model_vel = fopdt_step_response(t_common, K_avg, tau_avg, theta_avg, amp_abs)
+        if amplitude < 0:
+            model_vel = -model_vel
+
+        # Plot
+        ax.plot(t_common, mean_vel, "b-", linewidth=1.5, label="Actual (averaged)")
+        ax.plot(t_common, model_vel, "r--", linewidth=1.5,
+                label=f"FOPDT (K={K_avg:.2f}, τ={tau_avg:.2f}s, θ={theta_avg:.2f}s)")
+        ax.axhline(y=amplitude, color="green", linestyle=":", alpha=0.5,
+                    label=f"Commanded: {amplitude} {unit}")
+        ax.axvline(x=0, color="gray", linestyle="-", alpha=0.3, label="Step onset")
+        ax.axhline(y=0, color="gray", linestyle=":", alpha=0.2)
+
+        direction = "+" if amplitude > 0 else ""
+        ax.set_title(f"{label} @ {direction}{amplitude} {unit}", fontsize=10)
+        ax.set_xlabel("Time (s)")
+        ax.set_ylabel(f"Velocity ({unit})")
+        ax.legend(fontsize=7, loc="lower right")
+        ax.grid(True, alpha=0.3)
+        ax.set_xlim(-2.5, 13.5)
+        ax.set_ylim(_get_ylim(channel, amplitude))
+
+    for idx in range(n_plots, rows_count * cols):
+        axes[idx // cols][idx % cols].set_visible(False)
+
+    fig.suptitle("Go2 Step Response — FOPDT Model Fit", fontsize=13, fontweight="bold")
     plt.tight_layout()
     plt.savefig(output, dpi=150)
     print(f"Saved plot to {output}")
@@ -378,23 +554,29 @@ def main() -> None:
     parser.add_argument("--fopdt", action="store_true", help="Also fit FOPDT models")
     args = parser.parse_args()
 
-    trials = load_trials(args.data, channel_filter=args.channel)
-    print(f"Loaded {len(trials)} trials")
+    trials_raw = load_trials(args.data, channel_filter=args.channel)
+    print(f"Loaded {len(trials_raw)} trials")
 
-    if not trials:
+    if not trials_raw:
         print("No data found")
         return
 
-    # Always plot
+    trials = remove_outlier_trials(trials_raw)
+    dropped = len(trials_raw) - len(trials)
+    if dropped:
+        print(f"Removed {dropped} outlier trial(s), {len(trials)} remaining")
+
+    # Always plot (with outliers removed)
     try:
         import matplotlib
         matplotlib.use("Agg")
         plot_step_responses(trials)
         plot_averaged_responses(trials)
+        plot_fopdt_overlay(trials)
     except ImportError:
         print("matplotlib not available — skipping plots")
 
-    # Optional FOPDT fitting
+    # Optional FOPDT fitting (print numbers)
     if args.fopdt:
         print("\n" + "=" * 65)
         print("FOPDT Plant Identification Results")
