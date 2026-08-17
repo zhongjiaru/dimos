@@ -20,7 +20,7 @@ from reactivex import Subject
 from dimos.agents.annotation import skill
 from dimos.constants import DEFAULT_THREAD_JOIN_TIMEOUT
 from dimos.core.core import rpc
-from dimos.core.module import Module
+from dimos.core.module import Module, ModuleConfig
 from dimos.stream.audio.node_output import SounddeviceAudioOutput
 from dimos.stream.audio.tts.node_openai import OpenAITTSNode, Voice
 from dimos.utils.logging_config import setup_logger
@@ -28,7 +28,24 @@ from dimos.utils.logging_config import setup_logger
 logger = setup_logger()
 
 
+class SpeakSkillConfig(ModuleConfig):
+    tts_api_key: str | None = None
+    tts_base_url: str | None = None
+    tts_model: str = "tts-1"
+    tts_voice: str = Voice.ONYX.value
+    tts_speed: float = 1.2
+    tts_response_format: str | None = None
+    tts_sample_rate: int | None = None
+    tts_gain: float | None = None
+    tts_stream: bool | None = None
+    tts_input_prefix: str = ""
+    audio_sample_rate: int = 24000
+    audio_device_index: int | None = None
+
+
 class SpeakSkill(Module):
+    config: SpeakSkillConfig
+
     _tts_node: OpenAITTSNode | None = None
     _audio_output: SounddeviceAudioOutput | None = None
     _audio_lock: threading.Lock = threading.Lock()
@@ -38,8 +55,22 @@ class SpeakSkill(Module):
     @rpc
     def start(self) -> None:
         super().start()
-        self._tts_node = OpenAITTSNode(speed=1.2, voice=Voice.ONYX)
-        self._audio_output = SounddeviceAudioOutput(sample_rate=24000)
+        self._tts_node = OpenAITTSNode(
+            api_key=self.config.tts_api_key,
+            base_url=self.config.tts_base_url,
+            model=self.config.tts_model,
+            voice=self.config.tts_voice,
+            speed=self.config.tts_speed,
+            response_format=self.config.tts_response_format,
+            sample_rate=self.config.tts_sample_rate,
+            gain=self.config.tts_gain,
+            stream=self.config.tts_stream,
+            input_prefix=self.config.tts_input_prefix,
+        )
+        self._audio_output = SounddeviceAudioOutput(
+            device_index=self.config.audio_device_index,
+            sample_rate=self.config.audio_sample_rate,
+        )
         self._audio_output.consume_audio(self._tts_node.emit_audio())
 
     @rpc

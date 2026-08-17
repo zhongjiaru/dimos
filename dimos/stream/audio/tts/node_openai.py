@@ -55,27 +55,47 @@ class OpenAITTSNode(AbstractTextConsumer, AbstractAudioEmitter, AbstractTextEmit
     def __init__(
         self,
         api_key: str | None = None,
-        voice: Voice = Voice.ECHO,
+        base_url: str | None = None,
+        voice: str | Voice = Voice.ECHO,
         model: str = "tts-1",
         buffer_size: int = 1024,
         speed: float = 1.0,
+        response_format: str | None = None,
+        sample_rate: int | None = None,
+        gain: float | None = None,
+        stream: bool | None = None,
+        input_prefix: str = "",
     ) -> None:
         """
         Initialize OpenAITTSNode.
 
         Args:
             api_key: OpenAI API key (if None, will try to use environment variable)
+            base_url: OpenAI-compatible API base URL
             voice: TTS voice to use
             model: TTS model to use
             buffer_size: Audio buffer size in samples
+            response_format: OpenAI-compatible response format, e.g. mp3 or wav
+            sample_rate: Provider-specific output sample rate
+            gain: Provider-specific output gain in dB
+            stream: Provider-specific streaming flag
+            input_prefix: Prefix added only to TTS API input, e.g. MOSS speaker tags
         """
-        self.voice = voice
+        self.voice = voice.value if isinstance(voice, Voice) else voice
         self.model = model
         self.speed = speed
         self.buffer_size = buffer_size
+        self.response_format = response_format
+        self.sample_rate = sample_rate
+        self.gain = gain
+        self.stream = stream
+        self.input_prefix = input_prefix
 
         # Initialize OpenAI client
-        self.client = OpenAI(api_key=api_key)
+        kwargs = {"api_key": api_key}
+        if base_url is not None:
+            kwargs["base_url"] = base_url
+        self.client = OpenAI(**kwargs)
 
         # Initialize state
         self.audio_subject = Subject()  # type: ignore[var-annotated]
@@ -165,9 +185,26 @@ class OpenAITTSNode(AbstractTextConsumer, AbstractAudioEmitter, AbstractTextEmit
         """
         try:
             # Call OpenAI TTS API
-            response = self.client.audio.speech.create(
-                model=self.model, voice=self.voice.value, input=text, speed=self.speed
-            )
+            kwargs = {
+                "model": self.model,
+                "voice": self.voice,
+                "input": f"{self.input_prefix}{text}",
+                "speed": self.speed,
+            }
+            if self.response_format is not None:
+                kwargs["response_format"] = self.response_format
+
+            extra_body = {}
+            if self.sample_rate is not None:
+                extra_body["sample_rate"] = self.sample_rate
+            if self.gain is not None:
+                extra_body["gain"] = self.gain
+            if self.stream is not None:
+                extra_body["stream"] = self.stream
+            if extra_body:
+                kwargs["extra_body"] = extra_body
+
+            response = self.client.audio.speech.create(**kwargs)
             self.text_subject.on_next(text)
 
             # Convert the response to audio data
@@ -178,7 +215,7 @@ class OpenAITTSNode(AbstractTextConsumer, AbstractAudioEmitter, AbstractTextEmit
                 # Get the sample rate from the file
                 actual_sample_rate = sound_file.samplerate
                 # Read the entire file
-                audio_array = sound_file.read()
+                audio_array = sound_file.read(dtype="float32")
 
             # Debug log the sample rate from the OpenAI file
             logger.debug(f"OpenAI audio sample rate: {actual_sample_rate}Hz")
@@ -188,7 +225,7 @@ class OpenAITTSNode(AbstractTextConsumer, AbstractAudioEmitter, AbstractTextEmit
             # Create AudioEvent and emit it
             audio_event = AudioEvent(
                 data=audio_array,
-                sample_rate=24000,
+                sample_rate=actual_sample_rate,
                 timestamp=timestamp,
                 channels=1 if audio_array.ndim == 1 else audio_array.shape[1],
             )

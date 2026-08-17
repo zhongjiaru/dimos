@@ -250,6 +250,29 @@ def test_on_system_modules_uses_responses_api_model(
     assert model.reasoning == {"effort": "medium", "summary": "auto"}
 
 
+def test_on_system_modules_passes_openai_compatible_model_config(
+    configured_mcp_client: McpClient,
+) -> None:
+    """Configured OpenAI-compatible endpoints are passed to ChatOpenAI."""
+    configured_mcp_client.config.model = "qwen-plus"
+    configured_mcp_client.config.api_key = "test-key"
+    configured_mcp_client.config.base_url = "https://example.test/v1"
+    configured_mcp_client.config.use_responses_api = False
+
+    with (
+        patch("dimos.agents.mcp.mcp_client.create_agent"),
+        patch("dimos.agents.mcp.mcp_client.ChatOpenAI") as chat_openai,
+    ):
+        configured_mcp_client.on_system_modules([])
+
+    chat_openai.assert_called_once_with(
+        model="qwen-plus",
+        use_responses_api=False,
+        api_key="test-key",
+        base_url="https://example.test/v1",
+    )
+
+
 @pytest.mark.parametrize("model_name", ["gpt-4o", "ollama:qwen3:8b", "huggingface:Qwen/Qwen3-8B"])
 def test_on_system_modules_resolves_non_reasoning_models(
     configured_mcp_client: McpClient, model_name: str

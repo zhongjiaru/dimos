@@ -104,8 +104,11 @@ class AudioEvent:
             return self
 
         new_data = self.data
-        if self.data.dtype == np.float32:
+        if np.issubdtype(self.data.dtype, np.floating):
+            new_data = np.clip(new_data, -1.0, 1.0)
             new_data = (new_data * 32767).astype(np.int16)
+        else:
+            new_data = new_data.astype(np.int16)
 
         return AudioEvent(
             data=new_data,

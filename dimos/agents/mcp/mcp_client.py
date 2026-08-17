@@ -16,7 +16,7 @@ from collections.abc import Callable
 from queue import Empty, Queue
 from threading import Event, RLock, Thread
 import time
-from typing import Any
+from typing import Any, Literal
 import uuid
 
 from langchain.agents import create_agent
@@ -45,21 +45,44 @@ logger = setup_logger()
 _RESPONSES_REASONING_MODEL_PREFIXES = ("gpt-5", "o1", "o3", "o4")
 
 
-def _init_model(model_name: str) -> Any:
+def _init_model(config: "McpClientConfig") -> Any:
     """Initialize a model while preserving LangChain provider resolution."""
-    if ":" in model_name or not model_name.startswith(_RESPONSES_REASONING_MODEL_PREFIXES):
-        return init_chat_model(model=model_name)
+    use_responses_api = config.use_responses_api
+    if use_responses_api is None:
+        use_responses_api = config.model.startswith(_RESPONSES_REASONING_MODEL_PREFIXES)
 
-    return ChatOpenAI(
-        model=model_name,
-        use_responses_api=True,
-        reasoning={"effort": "medium", "summary": "auto"},
-    )
+    if not config.api_key and not config.base_url and not use_responses_api:
+        kwargs: dict[str, Any] = {"model": config.model}
+        if config.model_provider is not None:
+            kwargs["model_provider"] = config.model_provider
+        return init_chat_model(**kwargs)
+
+    kwargs = {
+        "model": config.model,
+        "use_responses_api": use_responses_api,
+    }
+    if config.api_key is not None:
+        kwargs["api_key"] = config.api_key
+    if config.base_url is not None:
+        kwargs["base_url"] = config.base_url
+    if use_responses_api and config.reasoning_effort is not None:
+        kwargs["reasoning"] = {
+            "effort": config.reasoning_effort,
+            "summary": config.reasoning_summary,
+        }
+
+    return ChatOpenAI(**kwargs)
 
 
 class McpClientConfig(ModuleConfig):
     system_prompt: str | None = SYSTEM_PROMPT
     model: str = "gpt-5.6-luna"
+    model_provider: str | None = None
+    api_key: str | None = None
+    base_url: str | None = None
+    use_responses_api: bool | None = None
+    reasoning_effort: Literal["minimal", "low", "medium", "high"] | None = "medium"
+    reasoning_summary: str = "auto"
     model_fixture: str | None = None
     mcp_server_url: str = "http://localhost:9990/mcp"
 
@@ -233,7 +256,7 @@ class McpClient(Module):
 
             model = MockModel(json_path=self.config.model_fixture)
         else:
-            model = _init_model(self.config.model)
+            model = _init_model(self.config)
 
         with self._lock:
             self._state_graph = create_agent(
