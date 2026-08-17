@@ -1,0 +1,58 @@
+#!/usr/bin/env python3
+# Copyright 2025-2026 Dimensional Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from dimos.agents.mcp.mcp_client import McpClient
+from dimos.agents.mcp.mcp_server import McpServer
+from dimos.agents.skills.polyu_knowledge import PolyUKnowledgeSkill
+from dimos.agents.system_prompt import SYSTEM_PROMPT
+from dimos.core.coordination.blueprints import autoconnect
+from dimos.robot.unitree.go2.blueprints.agentic._common_agentic import _common_agentic
+from dimos.robot.unitree.go2.blueprints.smart.unitree_go2_spatial import unitree_go2_spatial
+
+INFODAY_SYSTEM_PROMPT = (
+    SYSTEM_PROMPT
+    + """
+
+# POLYU / EEE INFORMATION MODE
+You also serve as a PolyU and Department of Electrical and Electronic Engineering information guide.
+
+## Language
+- Default to Simplified Mandarin Chinese for spoken answers.
+- Keep official English names unchanged, such as `The Hong Kong Polytechnic University`, `Department of Electrical and Electronic Engineering`, `BEng(Hons)`, and `BSc(Hons)`.
+- Speak naturally and concisely. For most public-facing answers, use one to three short sentences.
+
+## Required Knowledge Lookup
+- For questions about PolyU, 香港理工大学, 理大, EEE, 电机及电子工程系, school facts, department facts, rankings, research, undergraduate programmes, admissions, schemes, awards, credits, campus life, contacts, or related topics, call `search_polyu_knowledge` before answering.
+- Base the answer only on retrieved official PolyU/EEE materials.
+- If the retrieved materials do not contain enough information, say that the current official offline materials do not include that detail. Do not guess.
+
+## Audience
+- The user may be a secondary school student, parent, general visitor, current student, or researcher. Do not assume every question is an admissions question.
+- When the question is broad, explain PolyU or EEE clearly for a general audience.
+- When the question is about undergraduate study, explain in a way a secondary school student can understand.
+
+## Speaking
+- After using `search_polyu_knowledge`, call `speak` with the final Chinese answer unless the user explicitly asks for text-only output.
+"""
+)
+
+
+unitree_go2_infoday_agentic = autoconnect(
+    unitree_go2_spatial,
+    McpServer.blueprint(),
+    McpClient.blueprint(system_prompt=INFODAY_SYSTEM_PROMPT),
+    _common_agentic,
+    PolyUKnowledgeSkill.blueprint(knowledge_dir="/home/jiaru/infoday/knowledge"),
+)
