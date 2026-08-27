@@ -20,7 +20,7 @@ import reactivex.operators as ops
 
 from dimos.constants import DEFAULT_THREAD_JOIN_TIMEOUT
 from dimos.core.core import rpc
-from dimos.core.module import Module
+from dimos.core.module import Module, ModuleConfig
 from dimos.core.transport import PubSubTransport
 from dimos.core.transport_factory import make_transport
 from dimos.stream.audio.node_normalizer import AudioNormalizer
@@ -33,7 +33,16 @@ if TYPE_CHECKING:
 logger = setup_logger()
 
 
+class WebInputConfig(ModuleConfig):
+    stt_model: str = "base"
+    stt_language: str | None = "en"
+    stt_fp16: bool = False
+    stt_initial_prompt: str | None = None
+
+
 class WebInput(Module):
+    config: WebInputConfig
+
     _web_interface: RobotWebInterface | None = None
     _thread: Thread | None = None
     _human_transport: PubSubTransport[str] | None = None
@@ -57,7 +66,19 @@ class WebInput(Module):
         # Here to prevent unwanted imports in the file.
         from dimos.stream.audio.stt.node_whisper import WhisperNode
 
-        stt_node = WhisperNode()
+        modelopts: dict[str, object] = {"fp16": self.config.stt_fp16}
+        if self.config.stt_language is not None:
+            modelopts["language"] = self.config.stt_language
+        if self.config.stt_initial_prompt:
+            modelopts["initial_prompt"] = self.config.stt_initial_prompt
+
+        stt_node = WhisperNode(model=self.config.stt_model, modelopts=modelopts)
+        logger.info(
+            "Configured web speech-to-text",
+            stt_model=self.config.stt_model,
+            stt_language=self.config.stt_language,
+            stt_initial_prompt=bool(self.config.stt_initial_prompt),
+        )
 
         # Connect audio pipeline: browser audio → normalizer → whisper
         normalizer.consume_audio(audio_subject.pipe(ops.share()))

@@ -13,13 +13,27 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# ruff: noqa: RUF001
+
 from dimos.agents.mcp.mcp_client import McpClient
 from dimos.agents.mcp.mcp_server import McpServer
+from dimos.agents.skills.navigation import NavigationSkillContainer
+from dimos.agents.skills.person_follow import PersonFollowSkillContainer
 from dimos.agents.skills.polyu_knowledge import PolyUKnowledgeSkill
 from dimos.agents.system_prompt import SYSTEM_PROMPT
+from dimos.agents.web_human_input import WebInput
 from dimos.core.coordination.blueprints import autoconnect
-from dimos.robot.unitree.go2.blueprints.agentic._common_agentic import _common_agentic
 from dimos.robot.unitree.go2.blueprints.smart.unitree_go2_spatial import unitree_go2_spatial
+from dimos.robot.unitree.go2.connection import GO2Connection
+from dimos.robot.unitree.go2.go2_speak_skill import Go2SpeakSkill
+from dimos.robot.unitree.unitree_skill_container import UnitreeSkillContainer
+
+INFODAY_STT_INITIAL_PROMPT = (
+    "香港理工大学，理大，PolyU，电机及电子工程系，EEE，开放日，"
+    "本科，课程，专业，入学，申请，JUPAS，BEng，BSc，IAIE，"
+    "Electrical Engineering，Information and Artificial Intelligence Engineering，"
+    "Electronic Systems and Internet-of-Things，Information Security。"
+)
 
 INFODAY_SYSTEM_PROMPT = (
     SYSTEM_PROMPT
@@ -64,6 +78,14 @@ unitree_go2_infoday_agentic = autoconnect(
     unitree_go2_spatial,
     McpServer.blueprint(),
     McpClient.blueprint(system_prompt=INFODAY_SYSTEM_PROMPT),
-    _common_agentic,
+    NavigationSkillContainer.blueprint(),
+    PersonFollowSkillContainer.blueprint(camera_info=GO2Connection.camera_info_static),
+    UnitreeSkillContainer.blueprint(),
+    WebInput.blueprint(
+        stt_model="small",
+        stt_language="zh",
+        stt_initial_prompt=INFODAY_STT_INITIAL_PROMPT,
+    ),
+    Go2SpeakSkill.blueprint(),
     PolyUKnowledgeSkill.blueprint(knowledge_dir="/home/jiaru/infoday/knowledge"),
 )
