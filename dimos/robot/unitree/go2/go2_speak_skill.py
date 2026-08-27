@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import base64
+from dataclasses import dataclass
 import json
 import threading
 import time
@@ -46,6 +47,16 @@ from dimos.teleop.hosted.go2_audio_bridge import (
 from dimos.utils.logging_config import setup_logger
 
 logger = setup_logger()
+
+
+@dataclass(frozen=True)
+class _SpeakTiming:
+    tts_ms: float
+    upload_ms: float
+    playback_wait_ms: float
+    audio_duration_sec: float
+    upload_chunks: int
+    wav_bytes: int
 
 
 class Go2SpeakSkillConfig(ModuleConfig):
@@ -138,7 +149,9 @@ class Go2SpeakSkill(Module):
         finally:
             with self._bg_threads_lock:
                 self._bg_threads = [
-                    thread for thread in self._bg_threads if thread is not threading.current_thread()
+                    thread
+                    for thread in self._bg_threads
+                    if thread is not threading.current_thread()
                 ]
 
     def _speak_blocking(self, text: str) -> str:
@@ -147,8 +160,10 @@ class Go2SpeakSkill(Module):
                 return "Error: Go2 speaker audio is unavailable"
 
             try:
+                tts_start = time.monotonic()
                 audio_event = self._synthesize_audio(text)
-                self._play_audio_event(audio_event)
+                tts_ms = (time.monotonic() - tts_start) * 1000.0
+                timing = self._play_audio_event(audio_event, tts_ms=tts_ms)
             except Exception as exc:
                 logger.error("Error speaking through Go2", exc_info=True)
                 self._exit_megaphone()
@@ -156,6 +171,16 @@ class Go2SpeakSkill(Module):
                     self._speaker_available = False
                 return f"Error speaking text through Go2: {exc}"
 
+            logger.info(
+                "Go2 speak timing",
+                tts_ms=round(timing.tts_ms, 1),
+                upload_ms=round(timing.upload_ms, 1),
+                playback_wait_ms=round(timing.playback_wait_ms, 1),
+                audio_duration_sec=round(timing.audio_duration_sec, 2),
+                upload_chunks=timing.upload_chunks,
+                wav_bytes=timing.wav_bytes,
+                text_chars=len(text),
+            )
             return f"Spoke on Go2: {text}"
 
     def _synthesize_audio(self, text: str) -> AudioEvent:
@@ -202,11 +227,16 @@ class Go2SpeakSkill(Module):
             subscription.dispose()
             tts_node.dispose()
 
-    def _play_audio_event(self, audio_event: AudioEvent) -> None:
+    def _play_audio_event(self, audio_event: AudioEvent, *, tts_ms: float = 0.0) -> _SpeakTiming:
         pcm = Go2AudioBridgeModule._to_mono_target_rate(audio_event)
         pcm = self._normalize_level(pcm)
         if pcm.size == 0:
             raise RuntimeError("TTS audio was silent or invalid")
+        audio_duration_sec = pcm.size / TARGET_SAMPLE_RATE
+        wav_data = Go2AudioBridgeModule._wav_bytes(pcm)
+        upload_ms = 0.0
+        playback_wait_ms = 0.0
+        upload_chunks = 0
 
         try:
             if not self._megaphone_active:
@@ -215,11 +245,23 @@ class Go2SpeakSkill(Module):
                 if self.config.megaphone_enter_delay_sec > 0:
                     time.sleep(self.config.megaphone_enter_delay_sec)
 
-            self._upload_wav(Go2AudioBridgeModule._wav_bytes(pcm))
+            upload_start = time.monotonic()
+            upload_chunks = self._upload_wav(wav_data)
+            upload_ms = (time.monotonic() - upload_start) * 1000.0
             if self.config.wait_for_playback:
-                time.sleep((pcm.size / TARGET_SAMPLE_RATE) + self.config.playback_tail_sec)
+                playback_wait_start = time.monotonic()
+                time.sleep(audio_duration_sec + self.config.playback_tail_sec)
+                playback_wait_ms = (time.monotonic() - playback_wait_start) * 1000.0
         finally:
             self._exit_megaphone()
+        return _SpeakTiming(
+            tts_ms=tts_ms,
+            upload_ms=upload_ms,
+            playback_wait_ms=playback_wait_ms,
+            audio_duration_sec=audio_duration_sec,
+            upload_chunks=upload_chunks,
+            wav_bytes=len(wav_data),
+        )
 
     def _ensure_speaker(self) -> bool:
         if self._speaker_available is not None:
@@ -234,7 +276,7 @@ class Go2SpeakSkill(Module):
             self._speaker_available = True
         return self._speaker_available
 
-    def _upload_wav(self, wav_data: bytes) -> None:
+    def _upload_wav(self, wav_data: bytes) -> int:
         encoded = base64.b64encode(wav_data).decode("ascii")
         chunks = [
             encoded[index : index + UPLOAD_CHUNK_CHARS]
@@ -252,6 +294,7 @@ class Go2SpeakSkill(Module):
             )
             if index < len(chunks) and self.config.chunk_interval_sec > 0:
                 time.sleep(self.config.chunk_interval_sec)
+        return len(chunks)
 
     def _exit_megaphone(self) -> None:
         if not self._megaphone_active:
