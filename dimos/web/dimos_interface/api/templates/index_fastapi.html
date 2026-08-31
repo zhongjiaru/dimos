@@ -361,65 +361,96 @@
 
         // Voice recording functionality
         {% if has_voice %}
-        let mediaRecorder;
-        let chunks = [];
+        let audioContext;
+        let microphoneStream;
+        let mediaSource;
+        let processor;
+        let silentOutput;
+        let audioSocket;
+        let isRecording = false;
         const voiceBtn = document.getElementById('voiceButton');
         const queryResponse = document.getElementById('queryResponse');
 
-        voiceBtn.addEventListener('click', async () => {
-            if (mediaRecorder && mediaRecorder.state === 'recording') {
-                // Stop recording
-                mediaRecorder.stop();
+        function audioSocketUrl() {
+            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            return `${protocol}//${window.location.host}/stream_audio`;
+        }
+
+        function cleanupAudio() {
+            if (processor) processor.disconnect();
+            if (silentOutput) silentOutput.disconnect();
+            if (mediaSource) mediaSource.disconnect();
+            if (microphoneStream) microphoneStream.getTracks().forEach(track => track.stop());
+            if (audioSocket && audioSocket.readyState === WebSocket.OPEN) audioSocket.close();
+            if (audioContext) audioContext.close();
+            processor = null;
+            silentOutput = null;
+            mediaSource = null;
+            microphoneStream = null;
+            audioSocket = null;
+            audioContext = null;
+        }
+
+        async function startVoiceStreaming() {
+            microphoneStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+            audioContext = new AudioContext();
+            mediaSource = audioContext.createMediaStreamSource(microphoneStream);
+            processor = audioContext.createScriptProcessor(4096, 1, 1);
+            silentOutput = audioContext.createGain();
+            silentOutput.gain.value = 0;
+            audioSocket = new WebSocket(audioSocketUrl());
+            audioSocket.binaryType = 'arraybuffer';
+            audioSocket.onopen = () => {
+                audioSocket.send(JSON.stringify({
+                    type: 'start',
+                    sample_rate: audioContext.sampleRate,
+                    channels: 1,
+                }));
+            };
+            audioSocket.onerror = () => {
+                queryResponse.textContent = 'Streaming voice connection failed';
+                queryResponse.className = 'query-response error';
+                queryResponse.style.display = 'block';
+                cleanupAudio();
                 voiceBtn.classList.remove('recording');
+                isRecording = false;
+            };
+            processor.onaudioprocess = event => {
+                if (!isRecording || audioSocket.readyState !== WebSocket.OPEN) return;
+                const input = event.inputBuffer.getChannelData(0);
+                audioSocket.send(new Float32Array(input).buffer);
+            };
+            mediaSource.connect(processor);
+            processor.connect(silentOutput);
+            silentOutput.connect(audioContext.destination);
+            isRecording = true;
+            voiceBtn.classList.add('recording');
+        }
+
+        function stopVoiceStreaming() {
+            isRecording = false;
+            if (audioSocket && audioSocket.readyState === WebSocket.OPEN) {
+                audioSocket.send(JSON.stringify({ type: 'stop' }));
+            }
+            cleanupAudio();
+            voiceBtn.classList.remove('recording');
+            queryResponse.textContent = 'Voice command received!';
+            queryResponse.className = 'query-response success';
+            queryResponse.style.display = 'block';
+            setTimeout(() => {
+                queryResponse.style.display = 'none';
+            }, 3000);
+        }
+
+        voiceBtn.addEventListener('click', async () => {
+            if (isRecording) {
+                stopVoiceStreaming();
             } else {
-                // Start recording
                 try {
-                    if (!mediaRecorder) {
-                        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-                        mediaRecorder = new MediaRecorder(stream);
-
-                        mediaRecorder.ondataavailable = e => chunks.push(e.data);
-
-                        mediaRecorder.onstop = async () => {
-                            const blob = new Blob(chunks, { type: 'audio/webm' });
-                            chunks = [];
-
-                            // Show uploading status
-                            queryResponse.textContent = 'Processing voice command...';
-                            queryResponse.className = 'query-response';
-                            queryResponse.style.display = 'block';
-
-                            const formData = new FormData();
-                            formData.append('file', blob, 'recording.webm');
-
-                            try {
-                                const res = await fetch('/upload_audio', {
-                                    method: 'POST',
-                                    body: formData
-                                });
-                                const json = await res.json();
-
-                                if (json.success) {
-                                    queryResponse.textContent = 'Voice command received!';
-                                    queryResponse.className = 'query-response success';
-                                    setTimeout(() => {
-                                        queryResponse.style.display = 'none';
-                                    }, 3000);
-                                } else {
-                                    queryResponse.textContent = 'Error: ' + json.message;
-                                    queryResponse.className = 'query-response error';
-                                }
-                            } catch (err) {
-                                queryResponse.textContent = 'Upload failed: ' + err.message;
-                                queryResponse.className = 'query-response error';
-                            }
-                        };
-                    }
-
-                    mediaRecorder.start();
-                    voiceBtn.classList.add('recording');
+                    await startVoiceStreaming();
                 } catch (err) {
                     alert('Microphone access denied. Please allow microphone access to use voice commands.');
+                    cleanupAudio();
                 }
             }
         });

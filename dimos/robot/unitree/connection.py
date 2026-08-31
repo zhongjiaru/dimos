@@ -59,6 +59,9 @@ VideoMessage: TypeAlias = NDArray[np.uint8]  # Shape: (height, width, 3)
 
 logger = setup_logger()
 
+_WEBRTC_DISCONNECT_TIMEOUT = 3.0
+_WEBRTC_SHUTDOWN_REQUEST_TIMEOUT = 1.0
+
 
 _T = TypeVar("_T", bound=Timestamped)
 
@@ -112,6 +115,8 @@ class UnitreeWebRTCConnection(Resource):
         self.cmd_vel_timeout = 0.2
         self._velocity_api = velocity_api
         self._move_ids = SequentialIds()
+        self._stop_lock = threading.Lock()
+        self._stopped = False
         # Per-device AES-128 key for new Unitree firmware (data2=3 handshake); omitted when unset.
         self.conn = LegionConnection(
             WebRTCConnectionMethod.LocalSTA, ip=self.ip, aes_128_key=aes_128_key
@@ -145,7 +150,7 @@ class UnitreeWebRTCConnection(Resource):
             # Best-effort disconnect — don't leave a half-open peer on the dog.
             try:
                 asyncio.run_coroutine_threadsafe(self.conn.disconnect(), self.loop).result(
-                    timeout=3.0
+                    timeout=_WEBRTC_DISCONNECT_TIMEOUT
                 )
             except Exception:
                 logger.warning("best-effort disconnect on connect failure failed", exc_info=True)
@@ -157,25 +162,33 @@ class UnitreeWebRTCConnection(Resource):
         pass
 
     def stop(self) -> None:
-        # Cancel timer
-        if self.stop_timer:
-            self.stop_timer.cancel()
-            self.stop_timer = None
+        with self._stop_lock:
+            if self._stopped:
+                return
 
-        async def async_disconnect() -> None:
-            try:
-                self._publish_movement(0, 0, 0)
+            if self.stop_timer:
+                self.stop_timer.cancel()
+                self.stop_timer = None
+
+            async def async_disconnect() -> None:
+                try:
+                    self._publish_movement(0, 0, 0)
+                except Exception:
+                    logger.warning("Failed to publish stop twist during disconnect", exc_info=True)
                 await self.conn.disconnect()
+
+            try:
+                if self.loop.is_running():
+                    future = asyncio.run_coroutine_threadsafe(async_disconnect(), self.loop)
+                    future.result(timeout=_WEBRTC_DISCONNECT_TIMEOUT)
             except Exception:
-                pass
-
-        if self.loop.is_running():
-            asyncio.run_coroutine_threadsafe(async_disconnect(), self.loop)
-
-            self.loop.call_soon_threadsafe(self.loop.stop)
-
-        if self.thread.is_alive():
-            self.thread.join(timeout=DEFAULT_THREAD_JOIN_TIMEOUT)
+                logger.warning("WebRTC disconnect failed", exc_info=True)
+            finally:
+                if self.loop.is_running():
+                    self.loop.call_soon_threadsafe(self.loop.stop)
+                if self.thread.is_alive():
+                    self.thread.join(timeout=DEFAULT_THREAD_JOIN_TIMEOUT)
+                self._stopped = True
 
     def _publish_movement(self, x: float, y: float, yaw: float) -> None:
         if self._velocity_api:
@@ -272,11 +285,13 @@ class UnitreeWebRTCConnection(Resource):
         )
 
     # Generic sync API call (we jump into the client thread)
-    def publish_request(self, topic: str, data: dict[Any, Any]) -> Any:
+    def publish_request(
+        self, topic: str, data: dict[Any, Any], timeout: float | None = None
+    ) -> Any:
         future = asyncio.run_coroutine_threadsafe(
             self.conn.datachannel.pub_sub.publish_request_new(topic, data), self.loop
         )
-        return future.result()
+        return future.result(timeout=timeout)
 
     @simple_mcache
     def raw_lidar_stream(self) -> Observable[RawLidarMsg]:
@@ -417,7 +432,11 @@ class UnitreeWebRTCConnection(Resource):
 
     def liedown(self) -> bool:
         return bool(
-            self.publish_request(RTC_TOPIC["SPORT_MOD"], {"api_id": SPORT_CMD["StandDown"]})
+            self.publish_request(
+                RTC_TOPIC["SPORT_MOD"],
+                {"api_id": SPORT_CMD["StandDown"]},
+                timeout=_WEBRTC_SHUTDOWN_REQUEST_TIMEOUT,
+            )
         )
 
     async def handstand(self):  # type: ignore[no-untyped-def]
@@ -515,24 +534,4 @@ class UnitreeWebRTCConnection(Resource):
 
     def disconnect(self) -> None:
         """Disconnect from the robot and clean up resources."""
-        # Cancel timer
-        if self.stop_timer:
-            self.stop_timer.cancel()
-            self.stop_timer = None
-
-        if hasattr(self, "conn"):
-
-            async def async_disconnect() -> None:
-                try:
-                    await self.conn.disconnect()
-                except:
-                    pass
-
-            if hasattr(self, "loop") and self.loop.is_running():
-                asyncio.run_coroutine_threadsafe(async_disconnect(), self.loop)
-
-        if hasattr(self, "loop") and self.loop.is_running():
-            self.loop.call_soon_threadsafe(self.loop.stop)
-
-        if hasattr(self, "thread") and self.thread.is_alive():
-            self.thread.join(timeout=DEFAULT_THREAD_JOIN_TIMEOUT)
+        self.stop()

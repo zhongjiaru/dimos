@@ -55,6 +55,40 @@ def test_connection_config_aes_key_defaults_from_global_config() -> None:
     assert ConnectionConfig(g=g).aes_128_key == "dd" * 16
 
 
+def test_stop_disposes_module_before_disconnect_and_is_idempotent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Repeated worker/coordinator stops perform one ordered WebRTC teardown."""
+    calls: list[str] = []
+    connection = MagicMock(name="Go2ConnectionProtocol")
+    connection.liedown.side_effect = lambda: calls.append("liedown") or True
+    connection.stop.side_effect = lambda: calls.append("disconnect")
+
+    def module_init(module: GO2Connection, **kwargs: object) -> None:
+        module._module_closed = False
+        module.config = ConnectionConfig(
+            g=GlobalConfig(robot_ip="127.0.0.1"),
+            ip="127.0.0.1",
+            camera=False,
+            lidar=False,
+        )
+
+    def module_stop(module: GO2Connection) -> None:
+        calls.append("dispose")
+        module._module_closed = True
+
+    monkeypatch.setattr(go2_conn.Module, "__init__", module_init)
+    monkeypatch.setattr(go2_conn.Module, "stop", module_stop)
+    monkeypatch.setattr(go2_conn, "make_connection", MagicMock(return_value=connection))
+    module = GO2Connection()
+
+    module.stop()
+    module.stop()
+
+    assert calls == ["liedown", "dispose", "disconnect"]
+    assert module._camera_info_stop.is_set()
+
+
 def test_odom_to_tf_unprefixed_by_default() -> None:
     odom = PoseStamped(ts=1.0, frame_id="world")
     base, camera_link, camera_optical = GO2Connection._odom_to_tf(odom)

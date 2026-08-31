@@ -29,13 +29,14 @@ import asyncio
 
 # For audio processing
 import io
+import json
 from pathlib import Path
 from queue import Empty, Queue
 import subprocess
 from threading import Lock
 import time
 
-from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.templating import Jinja2Templates
@@ -64,6 +65,7 @@ class FastAPIServer(EdgeIO):
         port: int = 5555,
         text_streams=None,
         audio_subject=None,
+        audio_end_subject=None,
         **streams,
     ) -> None:
         super().__init__(dev_name, edge_type)
@@ -100,6 +102,7 @@ class FastAPIServer(EdgeIO):
         self.query_subject = rx.subject.Subject()  # type: ignore[var-annotated]
         self.query_stream = self.query_subject.pipe(ops.share())
         self.audio_subject = audio_subject
+        self.audio_end_subject = audio_end_subject
 
         for key in self.streams:
             if self.streams[key] is not None:
@@ -309,11 +312,57 @@ class FastAPIServer(EdgeIO):
 
                 # Push to reactive stream
                 self.audio_subject.on_next(event)
+                if self.audio_end_subject is not None:
+                    self.audio_end_subject.on_next(None)
                 print(f"Received audio - {event.data.shape[0] / sr:.2f} s, {sr} Hz")
                 return {"success": True}
             except Exception as e:
                 print(f"Failed to process uploaded audio: {e}")
                 return JSONResponse(status_code=500, content={"success": False, "message": str(e)})
+
+        @self.app.websocket("/stream_audio")
+        async def stream_audio(websocket: WebSocket):  # type: ignore[no-untyped-def]
+            """Receive browser microphone PCM chunks for streaming speech input."""
+            if self.audio_subject is None:
+                await websocket.close(code=1008, reason="Voice input not configured")
+                return
+
+            await websocket.accept()
+            sample_rate = 48000
+            channels = 1
+            try:
+                while True:
+                    message = await websocket.receive()
+                    if message.get("type") == "websocket.disconnect":
+                        break
+                    if message.get("text") is not None:
+                        payload = json.loads(message["text"])
+                        event_type = payload.get("type")
+                        if event_type == "start":
+                            sample_rate = int(payload.get("sample_rate") or sample_rate)
+                            channels = int(payload.get("channels") or channels)
+                            await websocket.send_json({"success": True, "type": "started"})
+                        elif event_type == "stop":
+                            if self.audio_end_subject is not None:
+                                self.audio_end_subject.on_next(None)
+                            await websocket.send_json({"success": True, "type": "stopped"})
+                            break
+                    elif message.get("bytes") is not None:
+                        audio = np.frombuffer(message["bytes"], dtype=np.float32).copy()
+                        if audio.size == 0:
+                            continue
+                        self.audio_subject.on_next(
+                            AudioEvent(
+                                data=audio,
+                                sample_rate=sample_rate,
+                                timestamp=time.time(),
+                                channels=channels,
+                            )
+                        )
+            except Exception as exc:
+                print(f"Streaming audio websocket closed: {exc}")
+                if self.audio_end_subject is not None:
+                    self.audio_end_subject.on_next(None)
 
         # Unitree API endpoints
         @self.app.get("/unitree/status")

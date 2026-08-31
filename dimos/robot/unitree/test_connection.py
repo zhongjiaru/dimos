@@ -18,14 +18,15 @@ Pure-Python test suite with no hardware or network. Covers connect() error propa
 aes_128_key forwarding, and the UNITREE_AES_128_KEY env var via GlobalConfig.
 """
 
+import asyncio
 import json
+import threading
 from typing import Any
 from unittest.mock import ANY, AsyncMock, MagicMock, call
 
 import pytest
 from unitree_webrtc_connect.constants import DATA_CHANNEL_TYPE, RTC_TOPIC, SPORT_CMD
 
-from dimos.constants import DEFAULT_THREAD_JOIN_TIMEOUT
 from dimos.core.global_config import GlobalConfig
 from dimos.msgs.geometry_msgs.Twist import Twist
 from dimos.msgs.geometry_msgs.Vector3 import Vector3
@@ -37,6 +38,7 @@ def _stub_driver(connect_exc: Exception | None = None) -> MagicMock:
     """A LegionConnection instance double covering everything connect() touches."""
     driver = MagicMock(name="LegionConnection-instance")
     driver.connect = AsyncMock(side_effect=connect_exc)
+    driver.disconnect = AsyncMock()
     driver.datachannel.disableTrafficSaving = AsyncMock()
     driver.datachannel.set_decoder = MagicMock()
     driver.datachannel.pub_sub.publish_request_new = AsyncMock()
@@ -63,8 +65,7 @@ def built_connection(monkeypatch: pytest.MonkeyPatch) -> Any:
     try:
         yield conn, driver
     finally:
-        conn.loop.call_soon_threadsafe(conn.loop.stop)
-        conn.thread.join(timeout=DEFAULT_THREAD_JOIN_TIMEOUT)
+        conn.stop()
 
 
 def test_connect_success_completes_setup(built_connection: Any) -> None:
@@ -124,8 +125,70 @@ def test_move_api_toggle_sends_selected_wire_command(
         assert driver.datachannel.pub_sub.publish_without_callback.call_args == expected_call
     finally:
         connection.stop_movement()
-        connection.loop.call_soon_threadsafe(connection.loop.stop)
-        connection.thread.join(timeout=DEFAULT_THREAD_JOIN_TIMEOUT)
+        connection.stop()
+
+
+def test_stop_waits_for_disconnect_and_is_idempotent(built_connection: Any) -> None:
+    """Concurrent stop calls wait for one peer close before stopping the loop."""
+    connection, driver = built_connection
+    disconnect_started = threading.Event()
+    allow_disconnect = asyncio.Event()
+
+    async def delayed_disconnect() -> None:
+        disconnect_started.set()
+        await allow_disconnect.wait()
+
+    driver.disconnect.side_effect = delayed_disconnect
+    first_stop = threading.Thread(target=connection.stop)
+    second_stop = threading.Thread(target=connection.stop)
+
+    first_stop.start()
+    assert disconnect_started.wait(timeout=1.0)
+    second_stop.start()
+    assert first_stop.is_alive()
+    assert second_stop.is_alive()
+
+    connection.loop.call_soon_threadsafe(allow_disconnect.set)
+    first_stop.join(timeout=1.0)
+    second_stop.join(timeout=1.0)
+
+    assert not first_stop.is_alive()
+    assert not second_stop.is_alive()
+    assert not connection.thread.is_alive()
+    driver.disconnect.assert_awaited_once()
+
+
+def test_stop_disconnects_when_stop_twist_fails(
+    built_connection: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed final movement command must not leave the WebRTC peer open."""
+    connection, driver = built_connection
+    monkeypatch.setattr(
+        connection,
+        "_publish_movement",
+        MagicMock(side_effect=RuntimeError("data channel closed")),
+    )
+
+    connection.stop()
+
+    driver.disconnect.assert_awaited_once()
+    assert not connection.thread.is_alive()
+
+
+def test_liedown_uses_bounded_shutdown_request(
+    built_connection: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A missing StandDown response must not block WebRTC teardown indefinitely."""
+    connection, _driver = built_connection
+    publish_request = MagicMock(return_value=True)
+    monkeypatch.setattr(connection, "publish_request", publish_request)
+
+    assert connection.liedown()
+    publish_request.assert_called_once_with(
+        RTC_TOPIC["SPORT_MOD"],
+        {"api_id": SPORT_CMD["StandDown"]},
+        timeout=1.0,
+    )
 
 
 @pytest.fixture

@@ -60,7 +60,7 @@ def test_polyu_knowledge_returns_structured_facts(tmp_path) -> None:  # type: ig
 
     assert "+852 2766 6150" in result
     assert "eee.notice@polyu.edu.hk" in result
-    assert "普通话简体中文" in result
+    assert "请只基于这些资料回答" in result
 
 
 def test_polyu_knowledge_searches_chunks(tmp_path) -> None:  # type: ignore[no-untyped-def]

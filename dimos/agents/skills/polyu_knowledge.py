@@ -101,7 +101,7 @@ class PolyUKnowledgeSkill(Module):
             return "我在当前 PolyU 官方离线资料里没有找到足够相关的信息。请不要编造答案。"
 
         sections = [
-            "以下是 PolyU/EEE 官方离线资料检索结果。请只基于这些资料，用普通话简体中文回答；官方英文名称保留原文；如果资料不足，要直接说明。",
+            "以下是 PolyU/EEE 官方离线资料检索结果。请只基于这些资料回答；官方英文名称保留原文；如果资料不足，要直接说明。",
         ]
         if fact_hits:
             sections.append("\n[结构化事实]\n" + "\n".join(f"- {hit}" for hit in fact_hits))

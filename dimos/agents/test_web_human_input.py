@@ -101,3 +101,61 @@ def test_web_input_passes_configured_stt_options(monkeypatch) -> None:  # type: 
         "initial_prompt": "理大，EEE，电机及电子工程系",
     }
     assert instances[0].audio == "normalized-audio"
+
+
+def test_web_input_can_use_qwen3_asr_backend(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    instances = []
+
+    class FakeQwen3AsrNode:
+        def __init__(self, **kwargs):  # type: ignore[no-untyped-def]
+            self.kwargs = kwargs
+            instances.append(self)
+
+        def consume_audio(self, audio):  # type: ignore[no-untyped-def]
+            self.audio = audio
+            return self
+
+        def consume_end(self, end):  # type: ignore[no-untyped-def]
+            self.end = end
+            return self
+
+        def emit_text(self) -> _FakeStream:
+            return _FakeStream()
+
+    fake_qwen_module = ModuleType("dimos.stream.audio.stt.node_qwen3_asr")
+    fake_qwen_module.Qwen3AsrStreamingNode = FakeQwen3AsrNode  # type: ignore[attr-defined]
+    monkeypatch.setitem(
+        __import__("sys").modules,
+        "dimos.stream.audio.stt.node_qwen3_asr",
+        fake_qwen_module,
+    )
+    monkeypatch.setattr("dimos.agents.web_human_input.RobotWebInterface", _FakeWebInterface)
+    monkeypatch.setattr(
+        "dimos.agents.web_human_input.make_transport", lambda _name: _FakeTransport()
+    )
+
+    web_input = WebInput(
+        stt_backend="qwen3_asr",
+        stt_model="Qwen/Qwen3-ASR-0.6B",
+        stt_language="Cantonese",
+        stt_endpoint="http://localhost:8000",
+        stt_api_key="test-key",
+        stt_initial_prompt="理大，EEE",
+    )
+
+    try:
+        web_input.start()
+    finally:
+        web_input.stop()
+
+    assert len(instances) == 1
+    assert instances[0].kwargs == {
+        "endpoint": "http://localhost:8000",
+        "model": "Qwen/Qwen3-ASR-0.6B",
+        "language": "Cantonese",
+        "api_key": "test-key",
+        "initial_prompt": "理大，EEE",
+        "sample_rate": 16000,
+    }
+    assert instances[0].audio is not None
+    assert instances[0].end is not None

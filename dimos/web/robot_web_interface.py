@@ -36,6 +36,7 @@ class RobotWebInterface(FastAPIServer):
         host: str | None = None,
         text_streams: Mapping[str, Observable[str]] | None = None,
         audio_subject: Subject[AudioEvent] | None = None,
+        audio_end_subject: Subject[None] | None = None,
         **streams: Observable[Any],
     ) -> None:
         super().__init__(
@@ -45,5 +46,6 @@ class RobotWebInterface(FastAPIServer):
             port=port,
             text_streams=text_streams,
             audio_subject=audio_subject,
+            audio_end_subject=audio_end_subject,
             **streams,
         )

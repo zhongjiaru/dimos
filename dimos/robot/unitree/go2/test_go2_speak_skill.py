@@ -88,3 +88,30 @@ def test_auto_mode_probe_failure_skips_tts(mocker) -> None:  # type: ignore[no-u
 
     assert result == "Error: Go2 speaker audio is unavailable"
     synthesize.assert_not_called()
+
+
+def test_speak_can_use_cosyvoice3_backend(enabled_skill: Go2SpeakSkill, mocker) -> None:  # type: ignore[no-untyped-def]
+    """Go2 speak can synthesize with the local CosyVoice3 HTTP backend."""
+    enabled_skill.config.tts_backend = "cosyvoice3"
+    enabled_skill.config.tts_endpoint = "http://localhost:8001/v1/audio/speech/stream"
+    enabled_skill.config.tts_model = "CosyVoice3"
+    enabled_skill.config.tts_voice = "cantonese"
+    enabled_skill.config.tts_sample_rate = TARGET_SAMPLE_RATE
+
+    frame_a = AudioEvent(np.array([100, 200], dtype=np.int16), TARGET_SAMPLE_RATE, 1.0, 1)
+    frame_b = AudioEvent(np.array([300], dtype=np.int16), TARGET_SAMPLE_RATE, 1.1, 1)
+    tts_node_cls = mocker.patch("dimos.robot.unitree.go2.go2_speak_skill.CosyVoice3TTSNode")
+    tts_node_cls.return_value.iter_audio_events.return_value = iter([frame_a, frame_b])
+
+    audio_event = enabled_skill._synthesize_audio("你好")
+
+    tts_node_cls.assert_called_once_with(
+        endpoint="http://localhost:8001/v1/audio/speech/stream",
+        model="CosyVoice3",
+        voice="cantonese",
+        api_key=None,
+        sample_rate=TARGET_SAMPLE_RATE,
+        response_format="pcm_s16le",
+    )
+    assert audio_event.sample_rate == TARGET_SAMPLE_RATE
+    assert audio_event.data.tolist() == [100, 200, 300]

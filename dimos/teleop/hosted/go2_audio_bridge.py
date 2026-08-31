@@ -47,7 +47,7 @@ TARGET_SAMPLE_RATE = 44100
 INT16_MIN = np.iinfo(np.int16).min
 INT16_MAX = np.iinfo(np.int16).max
 # Base64-character block size the Unitree upload API takes per request.
-UPLOAD_CHUNK_CHARS = 4096
+DEFAULT_UPLOAD_CHUNK_CHARS = 8192
 
 
 class Go2AudioBridgeConfig(ModuleConfig):
@@ -57,6 +57,9 @@ class Go2AudioBridgeConfig(ModuleConfig):
     queue_frames: int = 100
     chunk_interval_sec: float = 0.05
     megaphone_enter_delay_sec: float = 0.2
+    upload_chunk_chars: int = DEFAULT_UPLOAD_CHUNK_CHARS
+    wait_for_playback: bool = False
+    playback_tail_sec: float = 0.5
     target_peak: int = 12000
     max_gain: float = 128.0
     noise_gate_peak: int = 32
@@ -195,7 +198,18 @@ class Go2AudioBridgeModule(Module):
                         self._exit_megaphone()
                         return
             wav_data = self._wav_bytes(pcm)
+            logger.info(
+                "Go2 speaker audio upload starting",
+                samples=pcm.size,
+                wav_bytes=len(wav_data),
+            )
             self._upload_wav(wav_data)
+            if self.config.wait_for_playback:
+                audio_duration_sec = pcm.size / TARGET_SAMPLE_RATE
+                if self._stop_event.wait(audio_duration_sec + self.config.playback_tail_sec):
+                    self._exit_megaphone()
+                    return
+            logger.info("Go2 speaker audio upload finished")
         except Exception:
             logger.warning("Go2 speaker audio send failed", exc_info=True)
             self._exit_megaphone()
@@ -204,9 +218,18 @@ class Go2AudioBridgeModule(Module):
 
     def _upload_wav(self, wav_data: bytes) -> None:
         encoded = base64.b64encode(wav_data).decode("ascii")
+        chunk_chars = max(1, self.config.upload_chunk_chars)
         chunks = [
-            encoded[i : i + UPLOAD_CHUNK_CHARS] for i in range(0, len(encoded), UPLOAD_CHUNK_CHARS)
+            encoded[i : i + chunk_chars] for i in range(0, len(encoded), chunk_chars)
         ]
+        started_at = time.monotonic()
+        logger.info(
+            "Go2 megaphone WAV upload chunked",
+            wav_bytes=len(wav_data),
+            encoded_chars=len(encoded),
+            chunk_chars=chunk_chars,
+            upload_chunks=len(chunks),
+        )
         for index, chunk in enumerate(chunks, 1):
             if self._stop_event.is_set():
                 return
@@ -222,6 +245,11 @@ class Go2AudioBridgeModule(Module):
             if index < len(chunks) and self.config.chunk_interval_sec > 0:
                 if self._stop_event.wait(self.config.chunk_interval_sec):
                     return
+        logger.info(
+            "Go2 megaphone WAV upload sent",
+            upload_chunks=len(chunks),
+            upload_ms=(time.monotonic() - started_at) * 1000.0,
+        )
 
     def _exit_megaphone(self) -> None:
         if not self._megaphone_active:

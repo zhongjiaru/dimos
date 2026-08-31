@@ -19,7 +19,7 @@ from dataclasses import dataclass
 import json
 import threading
 import time
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 import numpy as np
 from numpy.typing import NDArray
@@ -32,15 +32,16 @@ from dimos.core.core import rpc
 from dimos.core.module import Module, ModuleConfig
 from dimos.robot.unitree.go2.connection_spec import GO2ConnectionSpec
 from dimos.stream.audio.base import AudioEvent
+from dimos.stream.audio.tts.node_cosyvoice3 import CosyVoice3TTSNode, CosyVoiceAudioFormat
 from dimos.stream.audio.tts.node_openai import OpenAITTSNode, Voice
 from dimos.teleop.hosted.go2_audio_bridge import (
+    DEFAULT_UPLOAD_CHUNK_CHARS,
     ENTER_MEGAPHONE,
     EXIT_MEGAPHONE,
     GET_AUDIO_LIST,
     INT16_MAX,
     INT16_MIN,
     TARGET_SAMPLE_RATE,
-    UPLOAD_CHUNK_CHARS,
     UPLOAD_MEGAPHONE,
     Go2AudioBridgeModule,
 )
@@ -60,8 +61,10 @@ class _SpeakTiming:
 
 
 class Go2SpeakSkillConfig(ModuleConfig):
+    tts_backend: Literal["openai", "cosyvoice3"] = "openai"
     tts_api_key: str | None = None
     tts_base_url: str | None = None
+    tts_endpoint: str | None = None
     tts_model: str = "tts-1"
     tts_voice: str = Voice.ONYX.value
     tts_speed: float = 1.2
@@ -184,6 +187,9 @@ class Go2SpeakSkill(Module):
             return f"Spoke on Go2: {text}"
 
     def _synthesize_audio(self, text: str) -> AudioEvent:
+        if self.config.tts_backend == "cosyvoice3":
+            return self._synthesize_cosyvoice3_audio(text)
+
         tts_node = OpenAITTSNode(
             api_key=self.config.tts_api_key,
             base_url=self.config.tts_base_url,
@@ -226,6 +232,40 @@ class Go2SpeakSkill(Module):
         finally:
             subscription.dispose()
             tts_node.dispose()
+
+    def _synthesize_cosyvoice3_audio(self, text: str) -> AudioEvent:
+        endpoint = self.config.tts_endpoint or self.config.tts_base_url
+        if endpoint is None:
+            raise ValueError("CosyVoice3 TTS endpoint is required")
+        response_format = cast(
+            "CosyVoiceAudioFormat",
+            self.config.tts_response_format or "pcm_s16le",
+        )
+        tts_node = CosyVoice3TTSNode(
+            endpoint=endpoint,
+            model=self.config.tts_model,
+            voice=self.config.tts_voice,
+            api_key=self.config.tts_api_key,
+            sample_rate=self.config.tts_sample_rate or 24000,
+            response_format=response_format,
+        )
+        try:
+            frames = [
+                Go2AudioBridgeModule._to_mono_target_rate(audio_event)
+                for audio_event in tts_node.iter_audio_events(text)
+            ]
+        finally:
+            tts_node.dispose()
+        audible_frames = [frame for frame in frames if frame.size]
+        pcm = np.concatenate(audible_frames) if audible_frames else np.empty(0, dtype=np.int16)
+        if pcm.size == 0:
+            raise RuntimeError("CosyVoice3 TTS returned no audio")
+        return AudioEvent(
+            data=np.asarray(pcm, dtype=np.int16),
+            sample_rate=TARGET_SAMPLE_RATE,
+            timestamp=time.time(),
+            channels=1,
+        )
 
     def _play_audio_event(self, audio_event: AudioEvent, *, tts_ms: float = 0.0) -> _SpeakTiming:
         pcm = Go2AudioBridgeModule._to_mono_target_rate(audio_event)
@@ -279,8 +319,8 @@ class Go2SpeakSkill(Module):
     def _upload_wav(self, wav_data: bytes) -> int:
         encoded = base64.b64encode(wav_data).decode("ascii")
         chunks = [
-            encoded[index : index + UPLOAD_CHUNK_CHARS]
-            for index in range(0, len(encoded), UPLOAD_CHUNK_CHARS)
+            encoded[index : index + DEFAULT_UPLOAD_CHUNK_CHARS]
+            for index in range(0, len(encoded), DEFAULT_UPLOAD_CHUNK_CHARS)
         ]
         for index, chunk in enumerate(chunks, 1):
             self._request(

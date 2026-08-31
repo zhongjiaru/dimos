@@ -13,7 +13,7 @@
 # limitations under the License.
 
 from threading import Thread
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 import reactivex as rx
 import reactivex.operators as ops
@@ -34,10 +34,14 @@ logger = setup_logger()
 
 
 class WebInputConfig(ModuleConfig):
+    stt_backend: Literal["whisper", "qwen3_asr"] = "whisper"
     stt_model: str = "base"
     stt_language: str | None = "en"
     stt_fp16: bool = False
     stt_initial_prompt: str | None = None
+    stt_endpoint: str | None = None
+    stt_api_key: str | None = None
+    stt_sample_rate: int = 16000
 
 
 class WebInput(Module):
@@ -46,6 +50,7 @@ class WebInput(Module):
     _web_interface: RobotWebInterface | None = None
     _thread: Thread | None = None
     _human_transport: PubSubTransport[str] | None = None
+    _stt_node: object | None = None
 
     @rpc
     def start(self) -> None:
@@ -54,35 +59,17 @@ class WebInput(Module):
         self._human_transport = make_transport("/human_input")
 
         audio_subject: rx.subject.Subject[AudioEvent] = rx.subject.Subject()
+        audio_end_subject: rx.subject.Subject[None] = rx.subject.Subject()
 
         self._web_interface = RobotWebInterface(
             port=5555,
             text_streams={"agent_responses": rx.subject.Subject()},
             audio_subject=audio_subject,
+            audio_end_subject=audio_end_subject,
         )
 
-        normalizer = AudioNormalizer()
-
-        # Here to prevent unwanted imports in the file.
-        from dimos.stream.audio.stt.node_whisper import WhisperNode
-
-        modelopts: dict[str, object] = {"fp16": self.config.stt_fp16}
-        if self.config.stt_language is not None:
-            modelopts["language"] = self.config.stt_language
-        if self.config.stt_initial_prompt:
-            modelopts["initial_prompt"] = self.config.stt_initial_prompt
-
-        stt_node = WhisperNode(model=self.config.stt_model, modelopts=modelopts)
-        logger.info(
-            "Configured web speech-to-text",
-            stt_model=self.config.stt_model,
-            stt_language=self.config.stt_language,
-            stt_initial_prompt=bool(self.config.stt_initial_prompt),
-        )
-
-        # Connect audio pipeline: browser audio → normalizer → whisper
-        normalizer.consume_audio(audio_subject.pipe(ops.share()))
-        stt_node.consume_audio(normalizer.emit_audio())
+        stt_node = self._build_stt_node(audio_subject, audio_end_subject)
+        self._stt_node = stt_node
 
         # Subscribe to both text input sources
         # 1. Direct text from web interface
@@ -98,6 +85,58 @@ class WebInput(Module):
 
         logger.info("Web interface started at http://localhost:5555")
 
+    def _build_stt_node(
+        self,
+        audio_subject: rx.subject.Subject["AudioEvent"],
+        audio_end_subject: rx.subject.Subject[None],
+    ):
+        audio_stream = audio_subject.pipe(ops.share())
+        if self.config.stt_backend == "qwen3_asr":
+            from dimos.stream.audio.stt.node_qwen3_asr import Qwen3AsrStreamingNode
+
+            endpoint = self.config.stt_endpoint or "http://localhost:8000"
+            stt_node = Qwen3AsrStreamingNode(
+                endpoint=endpoint,
+                model=self.config.stt_model,
+                language=self.config.stt_language or "Cantonese",
+                api_key=self.config.stt_api_key,
+                initial_prompt=self.config.stt_initial_prompt,
+                sample_rate=self.config.stt_sample_rate,
+            )
+            stt_node.consume_audio(audio_stream).consume_end(audio_end_subject)
+            logger.info(
+                "Configured web speech-to-text",
+                stt_backend=self.config.stt_backend,
+                stt_endpoint=endpoint,
+                stt_model=self.config.stt_model,
+                stt_language=self.config.stt_language,
+            )
+            return stt_node
+
+        normalizer = AudioNormalizer()
+
+        # Here to prevent unwanted imports in the file.
+        from dimos.stream.audio.stt.node_whisper import WhisperNode
+
+        modelopts: dict[str, object] = {"fp16": self.config.stt_fp16}
+        if self.config.stt_language is not None:
+            modelopts["language"] = self.config.stt_language
+        if self.config.stt_initial_prompt:
+            modelopts["initial_prompt"] = self.config.stt_initial_prompt
+
+        stt_node = WhisperNode(model=self.config.stt_model, modelopts=modelopts)
+        logger.info(
+            "Configured web speech-to-text",
+            stt_backend=self.config.stt_backend,
+            stt_model=self.config.stt_model,
+            stt_language=self.config.stt_language,
+            stt_initial_prompt=bool(self.config.stt_initial_prompt),
+        )
+
+        normalizer.consume_audio(audio_stream)
+        stt_node.consume_audio(normalizer.emit_audio())
+        return stt_node
+
     @rpc
     def stop(self) -> None:
         if self._web_interface:
@@ -106,4 +145,7 @@ class WebInput(Module):
             self._thread.join(timeout=DEFAULT_THREAD_JOIN_TIMEOUT)
         if self._human_transport:
             self._human_transport.stop()
+        if self._stt_node and hasattr(self._stt_node, "dispose"):
+            self._stt_node.dispose()  # type: ignore[attr-defined]
+            self._stt_node = None
         super().stop()

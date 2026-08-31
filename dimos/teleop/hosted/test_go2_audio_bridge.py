@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import base64
 from collections.abc import Iterator
 from io import BytesIO
 import json
@@ -150,6 +151,41 @@ def test_supported_speaker_uploads_wav_through_megaphone(
             TARGET_SAMPLE_RATE,
             2,
         )
+
+
+def test_full_sentence_audio_uses_configured_upload_blocks(
+    bridge: AudioBridgeTestModule,
+) -> None:
+    bridge.go2.publish_request.return_value = {"code": 0}
+    wav_data = Go2AudioBridgeModule._wav_bytes(
+        np.full(TARGET_SAMPLE_RATE * 7, 100, dtype=np.int16)
+    )
+    expected_chunks = -(-len(base64.b64encode(wav_data)) // bridge.config.upload_chunk_chars)
+
+    bridge._upload_wav(wav_data)
+
+    uploads = [
+        json.loads(call.args[1]["parameter"])
+        for call in bridge.go2.publish_request.call_args_list
+        if call.args[1]["api_id"] == UPLOAD_MEGAPHONE
+    ]
+    assert len(uploads) == expected_chunks
+    assert uploads[0]["total_block_number"] == len(uploads)
+    assert all(upload["current_block_size"] <= bridge.config.upload_chunk_chars for upload in uploads)
+
+
+def test_flush_can_keep_megaphone_open_for_playback(
+    bridge: AudioBridgeTestModule, mocker
+) -> None:
+    bridge._speaker_available = True
+    bridge.config.wait_for_playback = True
+    bridge.config.playback_tail_sec = 0.25
+    bridge.go2.publish_request.return_value = {"code": 0}
+    wait = mocker.patch.object(bridge._stop_event, "wait", return_value=False)
+
+    bridge._flush([np.full(TARGET_SAMPLE_RATE * 2, 100, dtype=np.int16)])
+
+    wait.assert_called_once_with(2.25)
 
 
 def test_start_and_stop_manage_audio_subscription_and_worker(
