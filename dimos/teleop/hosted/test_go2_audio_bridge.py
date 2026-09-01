@@ -87,6 +87,22 @@ def test_stereo_audio_is_mixed_and_resampled_for_go2() -> None:
     assert np.all(result == 2000)
 
 
+def test_audio_can_use_lower_configured_wav_sample_rate() -> None:
+    frame = AudioEvent(
+        np.full(4800, 1000, dtype=np.int16),
+        sample_rate=48000,
+        timestamp=1.0,
+        channels=1,
+    )
+
+    result = Go2AudioBridgeModule._to_mono_target_rate(frame, target_sample_rate=24000)
+    wav_data = Go2AudioBridgeModule._wav_bytes(result, sample_rate=24000)
+
+    assert result.shape == (2400,)
+    with wave.open(BytesIO(wav_data), "rb") as wav:
+        assert wav.getframerate() == 24000
+
+
 def test_hosted_blueprint_accepts_speaker_override() -> None:
     parser = BlueprintConfigParser(teleop_hosted_go2_transport)
 
@@ -157,9 +173,7 @@ def test_full_sentence_audio_uses_configured_upload_blocks(
     bridge: AudioBridgeTestModule,
 ) -> None:
     bridge.go2.publish_request.return_value = {"code": 0}
-    wav_data = Go2AudioBridgeModule._wav_bytes(
-        np.full(TARGET_SAMPLE_RATE * 7, 100, dtype=np.int16)
-    )
+    wav_data = Go2AudioBridgeModule._wav_bytes(np.full(TARGET_SAMPLE_RATE * 7, 100, dtype=np.int16))
     expected_chunks = -(-len(base64.b64encode(wav_data)) // bridge.config.upload_chunk_chars)
 
     bridge._upload_wav(wav_data)
@@ -171,12 +185,12 @@ def test_full_sentence_audio_uses_configured_upload_blocks(
     ]
     assert len(uploads) == expected_chunks
     assert uploads[0]["total_block_number"] == len(uploads)
-    assert all(upload["current_block_size"] <= bridge.config.upload_chunk_chars for upload in uploads)
+    assert all(
+        upload["current_block_size"] <= bridge.config.upload_chunk_chars for upload in uploads
+    )
 
 
-def test_flush_can_keep_megaphone_open_for_playback(
-    bridge: AudioBridgeTestModule, mocker
-) -> None:
+def test_flush_can_keep_megaphone_open_for_playback(bridge: AudioBridgeTestModule, mocker) -> None:
     bridge._speaker_available = True
     bridge.config.wait_for_playback = True
     bridge.config.playback_tail_sec = 0.25

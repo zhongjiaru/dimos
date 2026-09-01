@@ -17,9 +17,34 @@ from typing import Any
 from langchain_core.messages import HumanMessage
 
 from dimos.agents.annotation import skill
+from dimos.agents.mcp.mcp_client import McpClientConfig, _init_model
 from dimos.core.module import Module
 from dimos.msgs.sensor_msgs.Image import Image
 from dimos.utils.data import get_data
+
+
+def test_init_model_forwards_generation_limits_and_extra_body(mocker) -> None:  # type: ignore[no-untyped-def]
+    chat_openai = mocker.patch("dimos.agents.mcp.mcp_client.ChatOpenAI")
+
+    _init_model(
+        McpClientConfig(
+            model="provider-model",
+            api_key="test-key",
+            base_url="https://provider.example/v1",
+            max_tokens=128,
+            extra_body={"thinking": {"type": "disabled"}},
+            use_responses_api=False,
+        )
+    )
+
+    chat_openai.assert_called_once_with(
+        model="provider-model",
+        use_responses_api=False,
+        api_key="test-key",
+        base_url="https://provider.example/v1",
+        max_tokens=128,
+        extra_body={"thinking": {"type": "disabled"}},
+    )
 
 
 class Adder(Module):

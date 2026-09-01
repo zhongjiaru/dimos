@@ -15,6 +15,7 @@
 # ruff: noqa: RUF001
 
 from types import ModuleType
+from unittest.mock import MagicMock
 
 from reactivex.disposable import Disposable
 
@@ -34,14 +35,6 @@ class _FakeWebInterface:
         pass
 
     def shutdown(self) -> None:
-        pass
-
-
-class _FakeTransport:
-    def publish(self, _value: str) -> None:
-        pass
-
-    def stop(self) -> None:
         pass
 
 
@@ -78,15 +71,12 @@ def test_web_input_passes_configured_stt_options(monkeypatch) -> None:  # type: 
     )
     monkeypatch.setattr("dimos.agents.web_human_input.RobotWebInterface", _FakeWebInterface)
     monkeypatch.setattr("dimos.agents.web_human_input.AudioNormalizer", _FakeNormalizer)
-    monkeypatch.setattr(
-        "dimos.agents.web_human_input.make_transport", lambda _name: _FakeTransport()
-    )
-
     web_input = WebInput(
         stt_model="small",
         stt_language="zh",
         stt_initial_prompt="理大，EEE，电机及电子工程系",
     )
+    web_input.human_input = MagicMock()
 
     try:
         web_input.start()
@@ -130,10 +120,6 @@ def test_web_input_can_use_qwen3_asr_backend(monkeypatch) -> None:  # type: igno
         fake_qwen_module,
     )
     monkeypatch.setattr("dimos.agents.web_human_input.RobotWebInterface", _FakeWebInterface)
-    monkeypatch.setattr(
-        "dimos.agents.web_human_input.make_transport", lambda _name: _FakeTransport()
-    )
-
     web_input = WebInput(
         stt_backend="qwen3_asr",
         stt_model="Qwen/Qwen3-ASR-0.6B",
@@ -142,6 +128,7 @@ def test_web_input_can_use_qwen3_asr_backend(monkeypatch) -> None:  # type: igno
         stt_api_key="test-key",
         stt_initial_prompt="理大，EEE",
     )
+    web_input.human_input = MagicMock()
 
     try:
         web_input.start()

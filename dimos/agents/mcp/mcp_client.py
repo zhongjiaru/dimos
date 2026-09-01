@@ -65,6 +65,10 @@ def _init_model(config: "McpClientConfig") -> Any:
         kwargs["api_key"] = config.api_key
     if config.base_url is not None:
         kwargs["base_url"] = config.base_url
+    if config.max_tokens is not None:
+        kwargs["max_tokens"] = config.max_tokens
+    if config.extra_body is not None:
+        kwargs["extra_body"] = config.extra_body
     if use_responses_api and config.reasoning_effort is not None:
         kwargs["reasoning"] = {
             "effort": config.reasoning_effort,
@@ -80,6 +84,8 @@ class McpClientConfig(ModuleConfig):
     model_provider: str | None = None
     api_key: str | None = None
     base_url: str | None = None
+    max_tokens: int | None = None
+    extra_body: dict[str, Any] | None = None
     use_responses_api: bool | None = None
     reasoning_effort: Literal["minimal", "low", "medium", "high"] | None = "medium"
     reasoning_summary: str = "auto"

@@ -18,9 +18,11 @@ import os
 import queue
 import re
 import threading
+import time
 from typing import Any
 
 from openai import OpenAI
+from pydantic import Field
 
 from dimos.agents.annotation import skill
 from dimos.agents.skills.polyu_knowledge import PolyUKnowledgeSkill
@@ -43,7 +45,7 @@ Use concise spoken Cantonese phrases like 呢個、可以、如果你想知、�
 Keep official English names unchanged when needed, for example PolyU, EEE, BEng(Hons), BSc(Hons).
 Base the answer only on the provided official offline knowledge context.
 If the context is insufficient, say briefly in Cantonese that the current offline official materials do not include that detail.
-Keep the whole answer short: one or two spoken sentences.
+Answer in exactly one short spoken sentence, ideally under 50 Chinese characters.
 """.strip()
 
 INFODAY_IDENTITY_ANSWER = "我係理大 EEE 開放日嘅 Go2 機械人講解助手。"
@@ -73,6 +75,8 @@ class InfodayVoiceAnswerConfig(ModuleConfig):
     response_base_url: str | None = None
     response_api_key: str | None = None
     response_temperature: float = 0.2
+    response_max_tokens: int = Field(default=96, ge=1, le=512)
+    response_extra_body: dict[str, Any] = Field(default_factory=dict)
     tts_endpoint: str = "http://localhost:8001/v1/audio/speech/stream"
     tts_api_key: str | None = None
     tts_model: str = "CosyVoice3"
@@ -80,8 +84,9 @@ class InfodayVoiceAnswerConfig(ModuleConfig):
     tts_sample_rate: int = 24000
     tts_response_format: CosyVoiceAudioFormat = "pcm_s16le"
     tts_stream: bool = False
+    tts_speed: float = Field(default=1.0, gt=0.0, le=4.0)
     min_tts_chunk_chars: int = 24
-    max_tts_chunk_chars: int = 90
+    max_tts_chunk_chars: int = 45
     tts_queue_timeout_sec: float = 120.0
 
 
@@ -103,7 +108,9 @@ class InfodayVoiceAnswerSkill(Module):
     @rpc
     def start(self) -> None:
         super().start()
-        kwargs: dict[str, Any] = {"api_key": self.config.response_api_key or os.getenv("OPENAI_API_KEY")}
+        kwargs: dict[str, Any] = {
+            "api_key": self.config.response_api_key or os.getenv("OPENAI_API_KEY")
+        }
         if self.config.response_base_url is not None:
             kwargs["base_url"] = self.config.response_base_url
         self._client = OpenAI(**kwargs)
@@ -140,7 +147,12 @@ class InfodayVoiceAnswerSkill(Module):
                     return f"Error answering Info Day question: {exc}"
                 return f"Answered Info Day question in Cantonese: {clean_question}"
 
+            answer_started_at = time.monotonic()
             knowledge = self.polyu_knowledge.search_polyu_knowledge(clean_question)
+            logger.info(
+                "InfoDay knowledge lookup complete",
+                duration_ms=round((time.monotonic() - answer_started_at) * 1000.0, 1),
+            )
             tts_node = self._make_tts_node()
             tts_chunks: queue.Queue[str | None] = queue.Queue()
             errors: queue.Queue[Exception] = queue.Queue()
@@ -157,10 +169,31 @@ class InfodayVoiceAnswerSkill(Module):
                     min_chars=self.config.min_tts_chunk_chars,
                     max_chars=self.config.max_tts_chunk_chars,
                 )
+                first_tts_chunk = True
                 for delta in self._stream_response(clean_question, knowledge):
                     for text_chunk in chunker.feed(delta):
+                        if first_tts_chunk:
+                            logger.info(
+                                "InfoDay first TTS text ready",
+                                duration_ms=round(
+                                    (time.monotonic() - answer_started_at) * 1000.0,
+                                    1,
+                                ),
+                                text_chars=len(text_chunk),
+                            )
+                            first_tts_chunk = False
                         tts_chunks.put(text_chunk)
                 for text_chunk in chunker.flush():
+                    if first_tts_chunk:
+                        logger.info(
+                            "InfoDay first TTS text ready",
+                            duration_ms=round(
+                                (time.monotonic() - answer_started_at) * 1000.0,
+                                1,
+                            ),
+                            text_chars=len(text_chunk),
+                        )
+                        first_tts_chunk = False
                     tts_chunks.put(text_chunk)
             except Exception as exc:
                 logger.error("InfoDay response streaming failed", error=str(exc))
@@ -189,9 +222,9 @@ class InfodayVoiceAnswerSkill(Module):
     def _stream_response(self, question: str, knowledge: str):
         if self._client is None:
             raise RuntimeError("response LLM is not initialized")
-        stream = self._client.chat.completions.create(
-            model=self.config.response_model,
-            messages=[
+        request: dict[str, Any] = {
+            "model": self.config.response_model,
+            "messages": [
                 {"role": "system", "content": INFODAY_CANTONESE_RESPONSE_PROMPT},
                 {
                     "role": "user",
@@ -203,14 +236,39 @@ class InfodayVoiceAnswerSkill(Module):
                     ),
                 },
             ],
-            temperature=self.config.response_temperature,
-            stream=True,
-        )
-        for event in stream:
-            for choice in event.choices:
-                delta = choice.delta.content
-                if delta:
-                    yield delta
+            "temperature": self.config.response_temperature,
+            "max_tokens": self.config.response_max_tokens,
+            "stream": True,
+        }
+        if self.config.response_extra_body:
+            request["extra_body"] = self.config.response_extra_body
+
+        started_at = time.monotonic()
+        first_token = True
+        output_chars = 0
+        stream = self._client.chat.completions.create(**request)
+        try:
+            for event in stream:
+                for choice in event.choices:
+                    delta = choice.delta.content
+                    if delta:
+                        if first_token:
+                            logger.info(
+                                "InfoDay response first token",
+                                duration_ms=round(
+                                    (time.monotonic() - started_at) * 1000.0,
+                                    1,
+                                ),
+                            )
+                            first_token = False
+                        output_chars += len(delta)
+                        yield delta
+        finally:
+            logger.info(
+                "InfoDay response stream complete",
+                duration_ms=round((time.monotonic() - started_at) * 1000.0, 1),
+                output_chars=output_chars,
+            )
 
     def _make_tts_node(self) -> CosyVoice3TTSNode:
         return CosyVoice3TTSNode(
@@ -221,6 +279,7 @@ class InfodayVoiceAnswerSkill(Module):
             sample_rate=self.config.tts_sample_rate,
             response_format=self.config.tts_response_format,
             stream=self.config.tts_stream,
+            extra_body={"speed": self.config.tts_speed},
         )
 
     def _tts_worker(
@@ -234,8 +293,14 @@ class InfodayVoiceAnswerSkill(Module):
             if text is None:
                 return
             try:
+                started_at = time.monotonic()
                 for audio_event in tts_node.iter_audio_events(text):
                     self.operator_audio.publish(audio_event)
+                logger.info(
+                    "InfoDay TTS complete",
+                    duration_ms=round((time.monotonic() - started_at) * 1000.0, 1),
+                    text_chars=len(text),
+                )
             except Exception as exc:
                 logger.error("InfoDay TTS streaming failed", error=str(exc), text=text)
                 errors.put(exc)
@@ -275,26 +340,39 @@ class _TextChunker:
             return None
         window = text[: self.max_chars]
         sentence_matches = [
-            match for match in re.finditer(r"[\u3002\uFF01\uFF1F!?]\s*", window) if match.end() >= self.min_chars
+            match
+            for match in re.finditer(r"[\u3002\uFF01\uFF1F!?]\s*", window)
+            if match.end() >= self.min_chars
         ]
         if sentence_matches:
             return sentence_matches[-1].end()
+        natural_matches = [
+            match
+            for match in re.finditer(r"[\uFF0C,\uFF1B;\u3001]\s*|\s+", window)
+            if match.end() >= self.min_chars
+        ]
+        if natural_matches:
+            return natural_matches[0].end()
         if len(text) >= self.max_chars:
-            natural_matches = [
-                match
-                for match in re.finditer(r"[\uFF0C,\uFF1B;\u3001]\s*|\s+", window)
-                if match.end() >= self.min_chars
-            ]
-            if natural_matches:
-                return natural_matches[-1].end()
             return self.max_chars
         return None
 
 
 def _fast_infoday_answer(question: str) -> str | None:
-    normalized = question.casefold().replace(" ", "")
-    if any(term.casefold().replace(" ", "") in normalized for term in _IDENTITY_TERMS):
-        return INFODAY_IDENTITY_ANSWER
-    if any(term.casefold().replace(" ", "") in normalized for term in _GREETING_TERMS):
+    normalized = re.sub(r"[\s\W_]+", "", question.casefold(), flags=re.UNICODE)
+    identity_terms = tuple(
+        re.sub(r"[\s\W_]+", "", term.casefold(), flags=re.UNICODE) for term in _IDENTITY_TERMS
+    )
+    greeting_terms = tuple(
+        re.sub(r"[\s\W_]+", "", term.casefold(), flags=re.UNICODE) for term in _GREETING_TERMS
+    )
+    for identity in identity_terms:
+        if identity and identity in normalized:
+            remainder = normalized.replace(identity, "", 1)
+            for greeting in greeting_terms:
+                remainder = remainder.replace(greeting, "")
+            if not remainder:
+                return INFODAY_IDENTITY_ANSWER
+    if normalized in greeting_terms:
         return INFODAY_IDENTITY_ANSWER
     return None

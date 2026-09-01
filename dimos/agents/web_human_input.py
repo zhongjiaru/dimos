@@ -21,8 +21,7 @@ import reactivex.operators as ops
 from dimos.constants import DEFAULT_THREAD_JOIN_TIMEOUT
 from dimos.core.core import rpc
 from dimos.core.module import Module, ModuleConfig
-from dimos.core.transport import PubSubTransport
-from dimos.core.transport_factory import make_transport
+from dimos.core.stream import Out
 from dimos.stream.audio.node_normalizer import AudioNormalizer
 from dimos.utils.logging_config import setup_logger
 from dimos.web.robot_web_interface import RobotWebInterface
@@ -46,17 +45,15 @@ class WebInputConfig(ModuleConfig):
 
 class WebInput(Module):
     config: WebInputConfig
+    human_input: Out[str]
 
     _web_interface: RobotWebInterface | None = None
     _thread: Thread | None = None
-    _human_transport: PubSubTransport[str] | None = None
     _stt_node: object | None = None
 
     @rpc
     def start(self) -> None:
         super().start()
-
-        self._human_transport = make_transport("/human_input")
 
         audio_subject: rx.subject.Subject[AudioEvent] = rx.subject.Subject()
         audio_end_subject: rx.subject.Subject[None] = rx.subject.Subject()
@@ -73,11 +70,11 @@ class WebInput(Module):
 
         # Subscribe to both text input sources
         # 1. Direct text from web interface
-        unsub = self._web_interface.query_stream.subscribe(self._human_transport.publish)
+        unsub = self._web_interface.query_stream.subscribe(self.human_input.publish)
         self.register_disposable(unsub)
 
         # 2. Transcribed text from STT
-        unsub = stt_node.emit_text().subscribe(self._human_transport.publish)
+        unsub = stt_node.emit_text().subscribe(self.human_input.publish)
         self.register_disposable(unsub)
 
         self._thread = Thread(target=self._web_interface.run, daemon=True)
@@ -143,8 +140,6 @@ class WebInput(Module):
             self._web_interface.shutdown()
         if self._thread:
             self._thread.join(timeout=DEFAULT_THREAD_JOIN_TIMEOUT)
-        if self._human_transport:
-            self._human_transport.stop()
         if self._stt_node and hasattr(self._stt_node, "dispose"):
             self._stt_node.dispose()  # type: ignore[attr-defined]
             self._stt_node = None

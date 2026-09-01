@@ -58,6 +58,7 @@ class Go2AudioBridgeConfig(ModuleConfig):
     chunk_interval_sec: float = 0.05
     megaphone_enter_delay_sec: float = 0.2
     upload_chunk_chars: int = DEFAULT_UPLOAD_CHUNK_CHARS
+    target_sample_rate: int = TARGET_SAMPLE_RATE
     wait_for_playback: bool = False
     playback_tail_sec: float = 0.5
     target_peak: int = 12000
@@ -124,7 +125,7 @@ class Go2AudioBridgeModule(Module):
         pending: list[NDArray[np.int16]] = []
         pending_samples = 0
         last_audible_at: float | None = None
-        target_samples = max(1, TARGET_SAMPLE_RATE * self.config.batch_ms // 1000)
+        target_samples = max(1, self.config.target_sample_rate * self.config.batch_ms // 1000)
 
         while not self._stop_event.is_set():
             try:
@@ -138,7 +139,10 @@ class Go2AudioBridgeModule(Module):
                 continue
             if frame is None:
                 break
-            pcm = self._to_mono_target_rate(frame)
+            pcm = self._to_mono_target_rate(
+                frame,
+                target_sample_rate=self.config.target_sample_rate,
+            )
             if pcm.size == 0:
                 continue
             now = time.monotonic()
@@ -197,15 +201,16 @@ class Go2AudioBridgeModule(Module):
                     if self._stop_event.wait(self.config.megaphone_enter_delay_sec):
                         self._exit_megaphone()
                         return
-            wav_data = self._wav_bytes(pcm)
+            wav_data = self._wav_bytes(pcm, sample_rate=self.config.target_sample_rate)
             logger.info(
                 "Go2 speaker audio upload starting",
                 samples=pcm.size,
+                sample_rate=self.config.target_sample_rate,
                 wav_bytes=len(wav_data),
             )
             self._upload_wav(wav_data)
             if self.config.wait_for_playback:
-                audio_duration_sec = pcm.size / TARGET_SAMPLE_RATE
+                audio_duration_sec = pcm.size / self.config.target_sample_rate
                 if self._stop_event.wait(audio_duration_sec + self.config.playback_tail_sec):
                     self._exit_megaphone()
                     return
@@ -219,9 +224,7 @@ class Go2AudioBridgeModule(Module):
     def _upload_wav(self, wav_data: bytes) -> None:
         encoded = base64.b64encode(wav_data).decode("ascii")
         chunk_chars = max(1, self.config.upload_chunk_chars)
-        chunks = [
-            encoded[i : i + chunk_chars] for i in range(0, len(encoded), chunk_chars)
-        ]
+        chunks = [encoded[i : i + chunk_chars] for i in range(0, len(encoded), chunk_chars)]
         started_at = time.monotonic()
         logger.info(
             "Go2 megaphone WAV upload chunked",
@@ -310,15 +313,18 @@ class Go2AudioBridgeModule(Module):
         return amplified.astype(np.int16)
 
     @staticmethod
-    def _to_mono_target_rate(frame: AudioEvent) -> NDArray[np.int16]:
-        if frame.sample_rate <= 0 or frame.channels <= 0:
+    def _to_mono_target_rate(
+        frame: AudioEvent,
+        target_sample_rate: int = TARGET_SAMPLE_RATE,
+    ) -> NDArray[np.int16]:
+        if frame.sample_rate <= 0 or frame.channels <= 0 or target_sample_rate <= 0:
             return np.empty(0, dtype=np.int16)
         pcm = frame.to_int16().data.reshape(-1)
         if frame.channels > 1:
             usable = pcm.size - (pcm.size % frame.channels)
             pcm = pcm[:usable].reshape(-1, frame.channels).astype(np.int32).mean(axis=1)
-        if frame.sample_rate != TARGET_SAMPLE_RATE and pcm.size:
-            output_size = round(pcm.size * TARGET_SAMPLE_RATE / frame.sample_rate)
+        if frame.sample_rate != target_sample_rate and pcm.size:
+            output_size = round(pcm.size * target_sample_rate / frame.sample_rate)
             pcm = np.interp(
                 np.linspace(0, pcm.size - 1, output_size),
                 np.arange(pcm.size),
@@ -327,11 +333,14 @@ class Go2AudioBridgeModule(Module):
         return np.asarray(np.clip(pcm, INT16_MIN, INT16_MAX), dtype=np.int16)
 
     @staticmethod
-    def _wav_bytes(pcm: NDArray[np.int16]) -> bytes:
+    def _wav_bytes(
+        pcm: NDArray[np.int16],
+        sample_rate: int = TARGET_SAMPLE_RATE,
+    ) -> bytes:
         output = BytesIO()
         with wave.open(output, "wb") as wav:
             wav.setnchannels(1)
             wav.setsampwidth(2)
-            wav.setframerate(TARGET_SAMPLE_RATE)
+            wav.setframerate(sample_rate)
             wav.writeframes(pcm.tobytes())
         return output.getvalue()

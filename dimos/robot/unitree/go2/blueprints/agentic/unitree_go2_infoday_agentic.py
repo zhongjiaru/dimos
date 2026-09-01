@@ -15,6 +15,7 @@
 
 # ruff: noqa: RUF001
 
+from dimos.agents.infoday_input_router import InfodayInputRouter
 from dimos.agents.mcp.mcp_client import McpClient
 from dimos.agents.mcp.mcp_server import McpServer
 from dimos.agents.skills.infoday_voice_answer import InfodayVoiceAnswerSkill
@@ -55,7 +56,7 @@ When greeted or asked who you are in this Info Day context, call `answer_infoday
 ## Spoken Answer Length
 - Identity or greeting answers: exactly one sentence, ideally under 30 Chinese characters.
 - Simple factual answers: one sentence, ideally under 50 Chinese characters.
-- PolyU/EEE explanation answers: at most two short sentences, ideally under 80 Chinese characters total.
+- PolyU/EEE explanation answers: exactly one short sentence, ideally under 50 Chinese characters.
 - Do not speak full official English names unless the user explicitly asks for the English name.
 - If the source material contains many details, summarize the most relevant one or two points instead of reading a list aloud.
 
@@ -81,7 +82,8 @@ When greeted or asked who you are in this Info Day context, call `answer_infoday
 unitree_go2_infoday_agentic = autoconnect(
     unitree_go2_spatial,
     McpServer.blueprint(),
-    McpClient.blueprint(system_prompt=INFODAY_SYSTEM_PROMPT),
+    InfodayInputRouter.blueprint(),
+    McpClient.blueprint(system_prompt=INFODAY_SYSTEM_PROMPT, max_tokens=128),
     NavigationSkillContainer.blueprint(),
     PersonFollowSkillContainer.blueprint(camera_info=GO2Connection.camera_info_static),
     UnitreeSkillContainer.blueprint(),
@@ -98,19 +100,26 @@ unitree_go2_infoday_agentic = autoconnect(
         idle_timeout_sec=0.5,
         chunk_interval_sec=0.0,
         megaphone_enter_delay_sec=0.0,
-        upload_chunk_chars=8192,
+        upload_chunk_chars=16384,
+        target_sample_rate=24000,
         wait_for_playback=True,
-        playback_tail_sec=0.5,
+        playback_tail_sec=0.2,
     ),
-    PolyUKnowledgeSkill.blueprint(knowledge_dir="/home/jiaru/infoday/knowledge"),
+    PolyUKnowledgeSkill.blueprint(
+        knowledge_dir="/home/jiaru/infoday/knowledge",
+        max_chunks=3,
+        max_chunk_chars=500,
+    ),
     InfodayVoiceAnswerSkill.blueprint(
+        response_max_tokens=96,
         tts_endpoint="http://localhost:8001/v1/audio/speech/stream",
         tts_model="CosyVoice3",
         tts_voice="cantonese",
         tts_sample_rate=24000,
         tts_response_format="pcm_s16le",
         tts_stream=False,
+        tts_speed=1.2,
         min_tts_chunk_chars=24,
-        max_tts_chunk_chars=90,
+        max_tts_chunk_chars=45,
     ),
-)
+).remappings([(WebInput, "human_input", "infoday_input")])

@@ -13,22 +13,36 @@
 # limitations under the License.
 
 import numpy as np
+import pytest
 
-from dimos.agents.skills.infoday_voice_answer import InfodayVoiceAnswerSkill, _TextChunker
+from dimos.agents.skills.infoday_voice_answer import (
+    InfodayVoiceAnswerSkill,
+    _fast_infoday_answer,
+    _TextChunker,
+)
 from dimos.stream.audio.base import AudioEvent
 
 # ruff: noqa: RUF001
 
 
-def test_text_chunker_waits_for_sentence_boundary() -> None:
-    """Text chunking waits for complete sentences instead of comma phrases."""
+def test_text_chunker_splits_on_comma_after_minimum() -> None:
+    """Text chunking emits a natural phrase before the complete sentence arrives."""
     chunker = _TextChunker(min_chars=8, max_chars=40)
 
     chunks = chunker.feed("理大 EEE 呢個課程，")
     chunks.extend(chunker.feed("幾適合想學 AI 嘅同學。下一句"))
     chunks.extend(chunker.flush())
 
-    assert chunks == ["理大 EEE 呢個課程，幾適合想學 AI 嘅同學。", "下一句"]
+    assert chunks == ["理大 EEE 呢個課程，", "幾適合想學 AI 嘅同學。", "下一句"]
+
+
+def test_text_chunker_enforces_maximum_without_natural_boundary() -> None:
+    chunker = _TextChunker(min_chars=8, max_chars=12)
+
+    chunks = chunker.feed("甲乙丙丁戊己庚辛壬癸子丑寅卯")
+    chunks.extend(chunker.flush())
+
+    assert chunks == ["甲乙丙丁戊己庚辛壬癸子丑", "寅卯"]
 
 
 def test_infoday_voice_answer_streams_tts_audio_to_operator_audio(mocker) -> None:  # type: ignore[no-untyped-def]
@@ -38,11 +52,13 @@ def test_infoday_voice_answer_streams_tts_audio_to_operator_audio(mocker) -> Non
     skill.polyu_knowledge = mocker.Mock()
     skill.polyu_knowledge.search_polyu_knowledge.return_value = "official context"
     skill.operator_audio = mocker.Mock()
-    mocker.patch.object(skill, "_stream_response", return_value=iter(["理大 EEE 呢個課程，", "幾適合你。"]))
+    mocker.patch.object(
+        skill, "_stream_response", return_value=iter(["理大 EEE 呢個課程，", "幾適合你。"])
+    )
     frame_a = AudioEvent(np.array([1], dtype=np.int16), 24000, 1.0, 1)
     frame_b = AudioEvent(np.array([2], dtype=np.int16), 24000, 1.1, 1)
     tts_node = mocker.Mock()
-    tts_node.iter_audio_events.return_value = [frame_a, frame_b]
+    tts_node.iter_audio_events.side_effect = [[frame_a], [frame_b]]
     mocker.patch.object(skill, "_make_tts_node", return_value=tts_node)
 
     try:
@@ -52,13 +68,19 @@ def test_infoday_voice_answer_streams_tts_audio_to_operator_audio(mocker) -> Non
 
     assert result == "Answered Info Day question in Cantonese: EEE 有咩讀？"
     skill.polyu_knowledge.search_polyu_knowledge.assert_called_once_with("EEE 有咩讀？")
-    tts_node.iter_audio_events.assert_called_once_with("理大 EEE 呢個課程，幾適合你。")
-    assert [call.args[0] for call in skill.operator_audio.publish.call_args_list] == [frame_a, frame_b]
+    assert [call.args[0] for call in tts_node.iter_audio_events.call_args_list] == [
+        "理大 EEE 呢個課程，",
+        "幾適合你。",
+    ]
+    assert [call.args[0] for call in skill.operator_audio.publish.call_args_list] == [
+        frame_a,
+        frame_b,
+    ]
 
 
 def test_infoday_voice_answer_uses_complete_tts_clips(mocker) -> None:  # type: ignore[no-untyped-def]
     """InfoDay answer TTS requests complete audio clips for sentence-level playback."""
-    skill = InfodayVoiceAnswerSkill(tts_stream=False)
+    skill = InfodayVoiceAnswerSkill(tts_stream=False, tts_speed=1.2)
 
     try:
         tts_node = skill._make_tts_node()
@@ -66,6 +88,43 @@ def test_infoday_voice_answer_uses_complete_tts_clips(mocker) -> None:  # type: 
         skill.stop()
 
     assert tts_node.stream is False
+    assert tts_node.extra_body == {"speed": 1.2}
+
+
+def test_infoday_response_forwards_generation_limits_and_extra_body(mocker) -> None:  # type: ignore[no-untyped-def]
+    skill = InfodayVoiceAnswerSkill(
+        response_max_tokens=96,
+        response_extra_body={"thinking": {"type": "disabled"}},
+    )
+    skill._client = mocker.Mock()
+    choice = mocker.Mock()
+    choice.delta.content = "答案。"
+    event = mocker.Mock(choices=[choice])
+    create = skill._client.chat.completions.create
+    create.return_value = [event]
+
+    try:
+        result = list(skill._stream_response("問題", "官方資料"))
+    finally:
+        skill.stop()
+
+    assert result == ["答案。"]
+    request = create.call_args.kwargs
+    assert request["max_tokens"] == 96
+    assert request["extra_body"] == {"thinking": {"type": "disabled"}}
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "this programme",
+        "Hello, what programmes does EEE offer?",
+        "你好，EEE 有咩課程？",
+        "你是谁，EEE 有咩課程？",
+    ],
+)
+def test_fast_answer_does_not_discard_substantive_questions(question: str) -> None:
+    assert _fast_infoday_answer(question) is None
 
 
 def test_infoday_voice_answer_fast_identity_skips_response_llm(mocker) -> None:  # type: ignore[no-untyped-def]
