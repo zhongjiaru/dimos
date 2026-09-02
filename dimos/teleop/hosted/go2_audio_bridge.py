@@ -33,6 +33,7 @@ from unitree_webrtc_connect.constants import AUDIO_API, RTC_TOPIC
 from dimos.core.core import rpc
 from dimos.core.module import Module, ModuleConfig
 from dimos.core.stream import In
+from dimos.robot.unitree.audio_track import GO2_AUDIO_SAMPLE_RATE
 from dimos.robot.unitree.go2.connection_spec import GO2ConnectionSpec
 from dimos.stream.audio.base import AudioEvent
 from dimos.utils.logging_config import setup_logger
@@ -52,6 +53,7 @@ DEFAULT_UPLOAD_CHUNK_CHARS = 8192
 
 class Go2AudioBridgeConfig(ModuleConfig):
     speaker: Literal["auto", "enabled", "disabled"] = "auto"
+    speaker_backend: Literal["megaphone", "webrtc"] = "megaphone"
     batch_ms: int = 100
     idle_timeout_sec: float = 1.0
     queue_frames: int = 100
@@ -83,6 +85,11 @@ class Go2AudioBridgeModule(Module):
 
     @rpc
     def start(self) -> None:
+        if (
+            self.config.speaker_backend == "webrtc"
+            and self.config.target_sample_rate != GO2_AUDIO_SAMPLE_RATE
+        ):
+            raise ValueError(f"Go2 WebRTC speaker audio requires {GO2_AUDIO_SAMPLE_RATE} Hz PCM")
         super().start()
         self._stop_event.clear()
         if self.config.speaker == "disabled":
@@ -108,7 +115,13 @@ class Go2AudioBridgeModule(Module):
             else:
                 self._worker = None
         if self._worker is None:
-            self._exit_megaphone()
+            if self.config.speaker_backend == "webrtc":
+                try:
+                    self.go2.clear_audio()
+                except Exception:
+                    logger.warning("Failed to clear Go2 WebRTC speaker audio", exc_info=True)
+            else:
+                self._exit_megaphone()
         super().stop()
 
     def _on_audio(self, frame: AudioEvent) -> None:
@@ -173,6 +186,18 @@ class Go2AudioBridgeModule(Module):
     def _ensure_speaker(self) -> bool:
         if self._speaker_available is not None:
             return self._speaker_available
+        if self.config.speaker_backend == "webrtc":
+            try:
+                self._speaker_available = self.go2.audio_output_available()
+            except Exception as exc:
+                logger.info("Go2 WebRTC speaker audio unavailable", error=str(exc))
+                self._speaker_available = False
+            else:
+                if self._speaker_available:
+                    logger.info("Go2 WebRTC speaker audio enabled")
+                else:
+                    logger.info("Go2 WebRTC speaker audio was not negotiated")
+            return self._speaker_available
         try:
             self._request(GET_AUDIO_LIST)
         except Exception as exc:
@@ -191,6 +216,22 @@ class Go2AudioBridgeModule(Module):
         if pcm.size == 0:
             return
         try:
+            if self.config.speaker_backend == "webrtc":
+                event = AudioEvent(
+                    data=pcm,
+                    sample_rate=self.config.target_sample_rate,
+                    timestamp=time.time(),
+                    channels=1,
+                )
+                if not self.go2.enqueue_audio(event):
+                    raise RuntimeError("Go2 WebRTC speaker queue rejected audio")
+                logger.info(
+                    "Go2 WebRTC speaker audio queued",
+                    duration_ms=round(pcm.size / self.config.target_sample_rate * 1000.0, 1),
+                    sample_rate=self.config.target_sample_rate,
+                    samples=pcm.size,
+                )
+                return
             if not self._megaphone_active:
                 self._request(ENTER_MEGAPHONE)
                 self._megaphone_active = True

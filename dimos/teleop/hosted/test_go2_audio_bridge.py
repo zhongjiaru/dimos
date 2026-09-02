@@ -29,6 +29,7 @@ import pytest
 
 from dimos.core.coordination.blueprint_config.parser import BlueprintConfigParser
 from dimos.core.module import Module
+from dimos.robot.unitree.audio_track import GO2_AUDIO_FRAME_SAMPLES, GO2_AUDIO_SAMPLE_RATE
 from dimos.stream.audio.base import AudioEvent
 from dimos.teleop.hosted.blueprints.cloudflare import teleop_hosted_go2_transport
 from dimos.teleop.hosted.go2_audio_bridge import (
@@ -126,6 +127,32 @@ def test_nonzero_firmware_status_disables_auto_speaker(bridge: AudioBridgeTestMo
     bridge.go2.publish_request.return_value = {"data": {"header": {"status": {"code": 3102}}}}
 
     assert bridge._ensure_speaker() is False
+
+
+def test_webrtc_backend_queues_pcm_without_audio_hub_requests() -> None:
+    bridge = AudioBridgeTestModule(
+        speaker="auto",
+        speaker_backend="webrtc",
+        target_sample_rate=GO2_AUDIO_SAMPLE_RATE,
+        target_peak=12000,
+    )
+    bridge.go2 = MagicMock()
+    bridge.go2.audio_output_available.return_value = True
+    bridge.go2.enqueue_audio.return_value = True
+    pcm = np.full(GO2_AUDIO_FRAME_SAMPLES, 100, dtype=np.int16)
+
+    try:
+        bridge._flush([pcm])
+    finally:
+        bridge.stop()
+
+    bridge.go2.publish_request.assert_not_called()
+    queued = bridge.go2.enqueue_audio.call_args.args[0]
+    assert queued.sample_rate == GO2_AUDIO_SAMPLE_RATE
+    assert queued.channels == 1
+    np.testing.assert_array_equal(
+        queued.data, np.full(GO2_AUDIO_FRAME_SAMPLES, 12000, dtype=np.int16)
+    )
 
 
 def test_quiet_audio_is_amplified_to_target_peak(bridge: AudioBridgeTestModule) -> None:

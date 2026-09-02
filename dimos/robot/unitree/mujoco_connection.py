@@ -55,6 +55,7 @@ from dimos.simulation.mujoco.constants import (
     VIDEO_WIDTH,
 )
 from dimos.simulation.mujoco.shared_memory import ShmWriter
+from dimos.stream.audio.base import AudioEvent
 from dimos.utils.data import get_data
 from dimos.utils.logging_config import setup_logger
 
@@ -382,3 +383,15 @@ class MujocoConnection:
     def publish_request(self, topic: str, data: dict[str, Any]) -> dict[Any, Any]:
         print(f"publishing request, topic={topic}, data={data}")
         return {}
+
+    def audio_output_available(self) -> bool:
+        return False
+
+    def enqueue_audio(self, event: AudioEvent) -> bool:
+        return False
+
+    def clear_audio(self) -> None:
+        pass
+
+    def wait_audio_drained(self, timeout: float | None = None) -> bool:
+        return True

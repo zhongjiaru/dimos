@@ -24,6 +24,7 @@ import threading
 from typing import Any
 from unittest.mock import ANY, AsyncMock, MagicMock, call
 
+import numpy as np
 import pytest
 from unitree_webrtc_connect.constants import DATA_CHANNEL_TYPE, RTC_TOPIC, SPORT_CMD
 
@@ -31,7 +32,9 @@ from dimos.core.global_config import GlobalConfig
 from dimos.msgs.geometry_msgs.Twist import Twist
 from dimos.msgs.geometry_msgs.Vector3 import Vector3
 from dimos.robot.unitree import connection as conn_mod
+from dimos.robot.unitree.audio_track import GO2_AUDIO_SAMPLE_RATE
 from dimos.robot.unitree.connection import UnitreeWebRTCConnection
+from dimos.stream.audio.base import AudioEvent
 
 
 def _stub_driver(connect_exc: Exception | None = None) -> MagicMock:
@@ -74,6 +77,44 @@ def test_connect_success_completes_setup(built_connection: Any) -> None:
 
     driver.connect.assert_awaited_once()
     driver.datachannel.pub_sub.publish_request_new.assert_awaited_once()
+
+
+def test_audio_output_attaches_and_queues_on_webrtc_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    driver = _stub_driver()
+    sender = MagicMock(name="audio-sender")
+    transceiver = MagicMock(sender=sender, currentDirection="sendrecv")
+    driver.pc.addTrack.return_value = sender
+    driver.pc.getTransceivers.return_value = [transceiver]
+    track = MagicMock(name="QueuedGo2AudioTrack")
+    track.enqueue.return_value = True
+    track_factory = MagicMock(return_value=track)
+    monkeypatch.setattr(conn_mod, "LegionConnection", MagicMock(return_value=driver))
+    monkeypatch.setattr(conn_mod, "QueuedGo2AudioTrack", track_factory)
+    add_track_thread: list[int] = []
+    driver.pc.addTrack.side_effect = (
+        lambda value: add_track_thread.append(threading.get_ident()) or sender
+    )
+
+    connection = UnitreeWebRTCConnection(ip="10.0.0.99", audio_output=True)
+    try:
+        event = AudioEvent(
+            np.ones(960, dtype=np.int16),
+            sample_rate=GO2_AUDIO_SAMPLE_RATE,
+            timestamp=1.0,
+            channels=1,
+        )
+        assert connection.audio_output_available()
+        assert connection.enqueue_audio(event)
+    finally:
+        connection.stop()
+
+    track_factory.assert_called_once_with()
+    driver.pc.addTrack.assert_called_once_with(track)
+    assert add_track_thread == [connection.thread.ident]
+    track.enqueue.assert_called_once()
+    track.stop.assert_called_once_with()
 
 
 @pytest.mark.parametrize(

@@ -25,6 +25,7 @@ from dimos.agents.skills.polyu_knowledge import PolyUKnowledgeSkill
 from dimos.agents.system_prompt import SYSTEM_PROMPT
 from dimos.agents.web_human_input import WebInput
 from dimos.core.coordination.blueprints import autoconnect
+from dimos.robot.unitree.audio_track import GO2_AUDIO_SAMPLE_RATE
 from dimos.robot.unitree.go2.blueprints.smart.unitree_go2_spatial import unitree_go2_spatial
 from dimos.robot.unitree.go2.connection import GO2Connection
 from dimos.robot.unitree.unitree_skill_container import UnitreeSkillContainer
@@ -81,6 +82,7 @@ When greeted or asked who you are in this Info Day context, call `answer_infoday
 
 unitree_go2_infoday_agentic = autoconnect(
     unitree_go2_spatial,
+    GO2Connection.blueprint(audio_output=True),
     McpServer.blueprint(),
     InfodayInputRouter.blueprint(),
     McpClient.blueprint(system_prompt=INFODAY_SYSTEM_PROMPT, max_tokens=128),
@@ -96,14 +98,11 @@ unitree_go2_infoday_agentic = autoconnect(
     ),
     Go2AudioBridgeModule.blueprint(
         speaker="auto",
+        speaker_backend="webrtc",
         batch_ms=50,
         idle_timeout_sec=0.5,
-        chunk_interval_sec=0.0,
-        megaphone_enter_delay_sec=0.0,
-        upload_chunk_chars=16384,
-        target_sample_rate=24000,
-        wait_for_playback=True,
-        playback_tail_sec=0.2,
+        target_sample_rate=GO2_AUDIO_SAMPLE_RATE,
+        wait_for_playback=False,
     ),
     PolyUKnowledgeSkill.blueprint(
         knowledge_dir="/home/jiaru/infoday/knowledge",

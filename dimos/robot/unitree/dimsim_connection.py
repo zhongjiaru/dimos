@@ -31,6 +31,7 @@ from dimos.msgs.sensor_msgs.Image import Image
 from dimos.msgs.sensor_msgs.PointCloud2 import PointCloud2
 from dimos.msgs.tf2_msgs.TFMessage import TFMessage
 from dimos.simulation.dimsim.dimsim_process import DimSimProcess
+from dimos.stream.audio.base import AudioEvent
 from dimos.utils.logging_config import setup_logger
 
 logger = setup_logger()
@@ -115,6 +116,18 @@ class DimSimConnection:
 
     def publish_request(self, topic: str, data: dict[str, Any]) -> dict[Any, Any]:
         return {}
+
+    def audio_output_available(self) -> bool:
+        return False
+
+    def enqueue_audio(self, event: AudioEvent) -> bool:
+        return False
+
+    def clear_audio(self) -> None:
+        pass
+
+    def wait_audio_drained(self, timeout: float | None = None) -> bool:
+        return True
 
     def _handle_odom(self, msg: PoseStamped) -> None:
         self._tf_transport.publish(TFMessage(*_odom_to_tf(msg)))

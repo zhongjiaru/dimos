@@ -43,12 +43,14 @@ from dimos.msgs.geometry_msgs.Transform import Transform
 from dimos.msgs.geometry_msgs.Twist import Twist
 from dimos.msgs.sensor_msgs.Image import Image, ImageFormat
 from dimos.msgs.sensor_msgs.PointCloud2 import PointCloud2
+from dimos.robot.unitree.audio_track import GO2_AUDIO_SAMPLE_RATE, QueuedGo2AudioTrack
 from dimos.robot.unitree.type.lidar import (
     RawLidarMsg,
     pointcloud2_from_webrtc_lidar,
 )
 from dimos.robot.unitree.type.lowstate import LowStateMsg
 from dimos.robot.unitree.type.odometry import Odometry
+from dimos.stream.audio.base import AudioEvent
 from dimos.types.timestamped import Timestamped
 from dimos.utils.decorators.decorators import simple_mcache
 from dimos.utils.logging_config import setup_logger
@@ -108,12 +110,16 @@ class UnitreeWebRTCConnection(Resource):
         mode: str = "ai",
         aes_128_key: str | None = None,
         velocity_api: bool = False,
+        audio_output: bool = False,
     ) -> None:
         self.ip = ip
         self.mode = mode
         self.stop_timer: threading.Timer | None = None
         self.cmd_vel_timeout = 0.2
         self._velocity_api = velocity_api
+        self._audio_output_enabled = audio_output
+        self._audio_output_available = False
+        self._audio_track: QueuedGo2AudioTrack | None = None
         self._move_ids = SequentialIds()
         self._stop_lock = threading.Lock()
         self._stopped = False
@@ -128,6 +134,26 @@ class UnitreeWebRTCConnection(Resource):
 
         async def async_connect() -> None:
             await self.conn.connect()
+            if self._audio_output_enabled:
+                self._audio_track = QueuedGo2AudioTrack()
+                sender = self.conn.pc.addTrack(self._audio_track)
+                transceiver = next(
+                    (item for item in self.conn.pc.getTransceivers() if item.sender is sender),
+                    None,
+                )
+                direction = transceiver.currentDirection if transceiver is not None else None
+                self._audio_output_available = direction in ("sendonly", "sendrecv")
+                if self._audio_output_available:
+                    logger.info(
+                        "Go2 WebRTC speaker track attached",
+                        direction=direction,
+                        sample_rate=GO2_AUDIO_SAMPLE_RATE,
+                    )
+                else:
+                    logger.warning(
+                        "Go2 WebRTC peer did not negotiate speaker audio",
+                        direction=direction,
+                    )
             await self.conn.datachannel.disableTrafficSaving(True)
 
             self.conn.datachannel.set_decoder(decoder_type="native")
@@ -148,8 +174,15 @@ class UnitreeWebRTCConnection(Resource):
             asyncio.run_coroutine_threadsafe(async_connect(), self.loop).result()
         except Exception:
             # Best-effort disconnect — don't leave a half-open peer on the dog.
+            async def cleanup_failed_connect() -> None:
+                if self._audio_track is not None:
+                    self._audio_track.stop()
+                    self._audio_track = None
+                    self._audio_output_available = False
+                await self.conn.disconnect()
+
             try:
-                asyncio.run_coroutine_threadsafe(self.conn.disconnect(), self.loop).result(
+                asyncio.run_coroutine_threadsafe(cleanup_failed_connect(), self.loop).result(
                     timeout=_WEBRTC_DISCONNECT_TIMEOUT
                 )
             except Exception:
@@ -171,6 +204,10 @@ class UnitreeWebRTCConnection(Resource):
                 self.stop_timer = None
 
             async def async_disconnect() -> None:
+                if self._audio_track is not None:
+                    self._audio_track.stop()
+                    self._audio_track = None
+                    self._audio_output_available = False
                 try:
                     self._publish_movement(0, 0, 0)
                 except Exception:
@@ -189,6 +226,45 @@ class UnitreeWebRTCConnection(Resource):
                 if self.thread.is_alive():
                     self.thread.join(timeout=DEFAULT_THREAD_JOIN_TIMEOUT)
                 self._stopped = True
+
+    def audio_output_available(self) -> bool:
+        return self._audio_output_available
+
+    def enqueue_audio(self, event: AudioEvent) -> bool:
+        track = self._audio_track
+        if not self._audio_output_available or track is None or not self.loop.is_running():
+            return False
+        if event.sample_rate != GO2_AUDIO_SAMPLE_RATE or event.channels != 1:
+            logger.error(
+                "Rejected non-canonical Go2 WebRTC audio",
+                sample_rate=event.sample_rate,
+                channels=event.channels,
+            )
+            return False
+        pcm = event.to_int16().data.reshape(-1)
+
+        async def enqueue() -> bool:
+            return track.enqueue(pcm)
+
+        return bool(asyncio.run_coroutine_threadsafe(enqueue(), self.loop).result(timeout=2.0))
+
+    def clear_audio(self) -> None:
+        track = self._audio_track
+        if track is None or not self.loop.is_running():
+            return
+
+        async def clear() -> None:
+            track.clear()
+
+        asyncio.run_coroutine_threadsafe(clear(), self.loop).result(timeout=2.0)
+
+    def wait_audio_drained(self, timeout: float | None = None) -> bool:
+        track = self._audio_track
+        if track is None or not self.loop.is_running():
+            return True
+        future = asyncio.run_coroutine_threadsafe(track.wait_drained(timeout), self.loop)
+        result_timeout = None if timeout is None else timeout + 1.0
+        return bool(future.result(timeout=result_timeout))
 
     def _publish_movement(self, x: float, y: float, yaw: float) -> None:
         if self._velocity_api:

@@ -21,12 +21,15 @@ dimos/robot/unitree/test_connection.py; this pins the go2-local routing.
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import numpy as np
 import pytest
 
 from dimos.core.global_config import GlobalConfig
 from dimos.msgs.geometry_msgs.PoseStamped import PoseStamped
+from dimos.robot.unitree.audio_track import GO2_AUDIO_SAMPLE_RATE
 from dimos.robot.unitree.go2 import connection as go2_conn
 from dimos.robot.unitree.go2.connection import ConnectionConfig, GO2Connection
+from dimos.stream.audio.base import AudioEvent
 
 
 @pytest.fixture
@@ -46,6 +49,7 @@ def test_make_connection_webrtc_forwards_aes_128_key(stub_webrtc: MagicMock) -> 
         "192.168.123.161",
         aes_128_key="cafe" * 8,
         velocity_api=False,
+        audio_output=False,
     )
 
 
@@ -53,6 +57,34 @@ def test_connection_config_aes_key_defaults_from_global_config() -> None:
     """ConnectionConfig.aes_128_key defaults from GlobalConfig.unitree_aes_128_key."""
     g = GlobalConfig(robot_ip="127.0.0.1", unitree_aes_128_key="dd" * 16)
     assert ConnectionConfig(g=g).aes_128_key == "dd" * 16
+
+
+def test_go2_connection_forwards_audio_to_selected_backend(monkeypatch: pytest.MonkeyPatch) -> None:
+    connection = MagicMock(name="Go2ConnectionProtocol")
+    connection.enqueue_audio.return_value = True
+
+    def module_init(module: GO2Connection, **kwargs: object) -> None:
+        module._module_closed = False
+        module.config = ConnectionConfig(
+            g=GlobalConfig(robot_ip="127.0.0.1"),
+            ip="127.0.0.1",
+            camera=False,
+            lidar=False,
+            audio_output=True,
+        )
+
+    monkeypatch.setattr(go2_conn.Module, "__init__", module_init)
+    monkeypatch.setattr(go2_conn, "make_connection", MagicMock(return_value=connection))
+    module = GO2Connection()
+    event = AudioEvent(
+        np.ones(960, dtype=np.int16),
+        sample_rate=GO2_AUDIO_SAMPLE_RATE,
+        timestamp=1.0,
+        channels=1,
+    )
+
+    assert module.enqueue_audio(event)
+    connection.enqueue_audio.assert_called_once_with(event)
 
 
 def test_stop_disposes_module_before_disconnect_and_is_idempotent(

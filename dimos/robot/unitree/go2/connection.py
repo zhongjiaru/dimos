@@ -46,6 +46,7 @@ from dimos.msgs.tf2_msgs.TFMessage import TFMessage
 from dimos.robot.unitree.connection import UnitreeWebRTCConnection
 from dimos.robot.unitree.type.lowstate import LowStateMsg
 from dimos.spec.perception import Camera, Pointcloud
+from dimos.stream.audio.base import AudioEvent
 from dimos.utils.decorators.decorators import cached_property, simple_mcache
 from dimos.utils.logging_config import setup_logger
 
@@ -68,6 +69,7 @@ class ConnectionConfig(ModuleConfig):
     lidar: bool = True
     camera: bool = True
     velocity_api: bool = False
+    audio_output: bool = False
     # "mcf" for stair traversal, "normal" for basic, None to leave it as is
     motion_mode: str | None = None
     # Per-device AES-128 key (Go2 fw >=1.1.15); defaults from GlobalConfig.
@@ -97,6 +99,10 @@ class Go2ConnectionProtocol(Protocol):
     def set_light(self, level: int) -> bool: ...
     def switch_joystick(self, enable: bool = True) -> bool: ...
     def publish_request(self, topic: str, data: dict) -> dict: ...  # type: ignore[type-arg]
+    def audio_output_available(self) -> bool: ...
+    def enqueue_audio(self, event: AudioEvent) -> bool: ...
+    def clear_audio(self) -> None: ...
+    def wait_audio_drained(self, timeout: float | None = None) -> bool: ...
 
 
 _FRONT_CAMERA_720_YAML = resources.files("dimos.robot.unitree.go2").joinpath(
@@ -136,6 +142,7 @@ def make_connection(
     cfg: GlobalConfig,
     aes_128_key: str | None = None,
     velocity_api: bool = False,
+    audio_output: bool = False,
 ) -> Go2ConnectionProtocol:
     connection_type = cfg.unitree_connection_type.lower()
 
@@ -156,6 +163,7 @@ def make_connection(
             ip,
             aes_128_key=aes_128_key,
             velocity_api=velocity_api,
+            audio_output=audio_output,
         )
     else:
         raise ValueError(f"Unknown simulator {cfg.simulation!r}. Choose from: mujoco, dimsim")
@@ -262,6 +270,18 @@ class ReplayConnection(UnitreeWebRTCConnection, CompositeResource):
         """Fake publish request for testing."""
         return {"status": "ok", "message": "Fake publish"}
 
+    def audio_output_available(self) -> bool:
+        return False
+
+    def enqueue_audio(self, event: AudioEvent) -> bool:
+        return False
+
+    def clear_audio(self) -> None:
+        pass
+
+    def wait_audio_drained(self, timeout: float | None = None) -> bool:
+        return True
+
 
 _Config = TypeVar("_Config", bound=ConnectionConfig, default=ConnectionConfig)
 
@@ -305,6 +325,7 @@ class GO2Connection(Module, Camera, Pointcloud):
             self.config.g,
             aes_128_key=self.config.aes_128_key,
             velocity_api=self.config.velocity_api,
+            audio_output=self.config.audio_output,
         )
 
         if hasattr(self.connection, "camera_info_static"):
@@ -507,6 +528,22 @@ class GO2Connection(Module, Camera, Pointcloud):
             The result of the publish request
         """
         return self.connection.publish_request(topic, data)
+
+    @rpc
+    def audio_output_available(self) -> bool:
+        return self.connection.audio_output_available()
+
+    @rpc
+    def enqueue_audio(self, event: AudioEvent) -> bool:
+        return self.connection.enqueue_audio(event)
+
+    @rpc
+    def clear_audio(self) -> None:
+        self.connection.clear_audio()
+
+    @rpc
+    def wait_audio_drained(self, timeout: float | None = None) -> bool:
+        return self.connection.wait_audio_drained(timeout)
 
     @skill
     def observe(self) -> Image | None:
