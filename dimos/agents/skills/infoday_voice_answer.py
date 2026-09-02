@@ -214,10 +214,35 @@ class InfodayVoiceAnswerSkill(Module):
     def _stream_text_to_speaker(self, text: str) -> None:
         tts_node = self._make_tts_node()
         try:
-            for audio_event in tts_node.iter_audio_events(text):
-                self.operator_audio.publish(audio_event)
+            self._publish_tts_chunk(tts_node, text)
         finally:
             tts_node.dispose()
+
+    def _publish_tts_chunk(self, tts_node: CosyVoice3TTSNode, text: str) -> None:
+        started_at = time.monotonic()
+        audio_chunks = 0
+        audio_duration_sec = 0.0
+        for audio_event in tts_node.iter_audio_events(text):
+            channels = max(1, audio_event.channels)
+            if audio_chunks == 0:
+                logger.info(
+                    "InfoDay TTS first audio",
+                    duration_ms=round((time.monotonic() - started_at) * 1000.0, 1),
+                    text_chars=len(text),
+                    chunk_samples=audio_event.data.size // channels,
+                    sample_rate=audio_event.sample_rate,
+                )
+            self.operator_audio.publish(audio_event)
+            audio_chunks += 1
+            if audio_event.sample_rate > 0 and audio_event.channels > 0:
+                audio_duration_sec += audio_event.data.size / (audio_event.sample_rate * channels)
+        logger.info(
+            "InfoDay TTS complete",
+            duration_ms=round((time.monotonic() - started_at) * 1000.0, 1),
+            text_chars=len(text),
+            audio_chunks=audio_chunks,
+            audio_duration_ms=round(audio_duration_sec * 1000.0, 1),
+        )
 
     def _stream_response(self, question: str, knowledge: str):
         if self._client is None:
@@ -293,14 +318,7 @@ class InfodayVoiceAnswerSkill(Module):
             if text is None:
                 return
             try:
-                started_at = time.monotonic()
-                for audio_event in tts_node.iter_audio_events(text):
-                    self.operator_audio.publish(audio_event)
-                logger.info(
-                    "InfoDay TTS complete",
-                    duration_ms=round((time.monotonic() - started_at) * 1000.0, 1),
-                    text_chars=len(text),
-                )
+                self._publish_tts_chunk(tts_node, text)
             except Exception as exc:
                 logger.error("InfoDay TTS streaming failed", error=str(exc), text=text)
                 errors.put(exc)

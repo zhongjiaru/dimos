@@ -91,6 +91,36 @@ def test_infoday_voice_answer_uses_complete_tts_clips(mocker) -> None:  # type: 
     assert tts_node.extra_body == {"speed": 1.2}
 
 
+def test_infoday_tts_logs_first_audio_and_segment_summary(mocker) -> None:  # type: ignore[no-untyped-def]
+    skill = InfodayVoiceAnswerSkill(tts_stream=True)
+    skill.operator_audio = mocker.Mock()
+    frame_a = AudioEvent(np.ones(2400, dtype=np.int16), 24000, 1.0, 1)
+    frame_b = AudioEvent(np.ones(1200, dtype=np.int16), 24000, 1.1, 1)
+    tts_node = mocker.Mock()
+    tts_node.iter_audio_events.return_value = [frame_a, frame_b]
+    mocker.patch.object(skill, "_make_tts_node", return_value=tts_node)
+    logger = mocker.patch("dimos.agents.skills.infoday_voice_answer.logger")
+
+    try:
+        skill._stream_text_to_speaker("測試語音")
+    finally:
+        skill.stop()
+
+    first_audio = next(
+        call for call in logger.info.call_args_list if call.args[0] == "InfoDay TTS first audio"
+    )
+    complete = next(
+        call for call in logger.info.call_args_list if call.args[0] == "InfoDay TTS complete"
+    )
+    assert first_audio.kwargs["duration_ms"] >= 0
+    assert first_audio.kwargs["text_chars"] == 4
+    assert first_audio.kwargs["chunk_samples"] == 2400
+    assert first_audio.kwargs["sample_rate"] == 24000
+    assert complete.kwargs["text_chars"] == 4
+    assert complete.kwargs["audio_chunks"] == 2
+    assert complete.kwargs["audio_duration_ms"] == 150.0
+
+
 def test_infoday_response_forwards_generation_limits_and_extra_body(mocker) -> None:  # type: ignore[no-untyped-def]
     skill = InfodayVoiceAnswerSkill(
         response_max_tokens=96,

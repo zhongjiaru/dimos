@@ -225,7 +225,7 @@ class Go2AudioBridgeModule(Module):
                 )
                 if not self.go2.enqueue_audio(event):
                     raise RuntimeError("Go2 WebRTC speaker queue rejected audio")
-                logger.info(
+                logger.debug(
                     "Go2 WebRTC speaker audio queued",
                     duration_ms=round(pcm.size / self.config.target_sample_rate * 1000.0, 1),
                     sample_rate=self.config.target_sample_rate,
