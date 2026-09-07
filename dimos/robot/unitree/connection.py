@@ -20,6 +20,8 @@ import threading
 import time
 from typing import Any, TypeAlias, TypeVar
 
+from aiortc import RTCBundlePolicy, RTCConfiguration, RTCPeerConnection
+from aiortc.mediastreams import MediaStreamError
 import numpy as np
 from numpy.typing import NDArray
 from reactivex import operators as ops
@@ -31,8 +33,10 @@ from unitree_webrtc_connect.constants import (
     SPORT_CMD,
     VUI_COLOR,
 )
+from unitree_webrtc_connect.webrtc_audio import WebRTCAudioChannel
+import unitree_webrtc_connect.webrtc_driver as webrtc_driver
 from unitree_webrtc_connect.webrtc_driver import (
-    UnitreeWebRTCConnection as LegionConnection,
+    UnitreeWebRTCConnection as _LegionConnection,
     WebRTCConnectionMethod,
 )
 
@@ -71,6 +75,46 @@ _T = TypeVar("_T", bound=Timestamped)
 def time_is_now(x: _T) -> _T:
     x.ts = time.time()
     return x
+
+
+class _AudioFirstPeerConnection(RTCPeerConnection):
+    def __init__(self, configuration: RTCConfiguration | None = None) -> None:
+        super().__init__(configuration)
+        self.addTransceiver("audio", direction="sendrecv")
+
+
+class _ExistingAudioChannel(WebRTCAudioChannel):
+    def __init__(self, pc: RTCPeerConnection, datachannel: Any) -> None:
+        self.pc = pc
+        self.datachannel = datachannel
+        self.track_callbacks = []
+
+
+class LegionConnection(_LegionConnection):
+    """Go2 driver with an audio-first, single-transport BUNDLE offer."""
+
+    def create_webrtc_configuration(
+        self,
+        turn_server_info: Any,
+        stunEnable: bool = True,
+        turnEnable: bool = True,
+    ) -> RTCConfiguration:
+        config = super().create_webrtc_configuration(turn_server_info, stunEnable, turnEnable)
+        config.bundlePolicy = RTCBundlePolicy.MAX_BUNDLE
+        return config
+
+    async def init_webrtc(self, turn_server_info: Any = None, ip: str | None = None) -> None:
+        # The SDK creates SCTP first. Go2 firmware 1.1.15 requires the audio
+        # mid to own the bundled transport when audio, video, and data coexist.
+        original_peer_connection = webrtc_driver.RTCPeerConnection
+        original_audio_channel = webrtc_driver.WebRTCAudioChannel
+        webrtc_driver.RTCPeerConnection = _AudioFirstPeerConnection
+        webrtc_driver.WebRTCAudioChannel = _ExistingAudioChannel
+        try:
+            await super().init_webrtc(turn_server_info, ip)
+        finally:
+            webrtc_driver.RTCPeerConnection = original_peer_connection
+            webrtc_driver.WebRTCAudioChannel = original_audio_channel
 
 
 @dataclass
@@ -551,12 +595,23 @@ class UnitreeWebRTCConnection(Resource):
         from aiortc import MediaStreamTrack
 
         async def accept_track(track: MediaStreamTrack) -> None:
-            while True:
+            try:
+                while True:
+                    if stop_event.is_set():
+                        return
+                    frame = await track.recv()
+                    serializable_frame = SerializableVideoFrame.from_av_frame(frame)  # type: ignore[no-untyped-call]
+                    subject.on_next(serializable_frame)
+            except MediaStreamError:
                 if stop_event.is_set():
                     return
-                frame = await track.recv()
-                serializable_frame = SerializableVideoFrame.from_av_frame(frame)  # type: ignore[no-untyped-call]
-                subject.on_next(serializable_frame)
+                pc = self.conn.pc
+                logger.error(
+                    "Go2 WebRTC video stream ended unexpectedly",
+                    peer_state=getattr(pc, "connectionState", None),
+                    ice_state=getattr(pc, "iceConnectionState", None),
+                )
+                subject.on_completed()
 
         self.conn.video.add_track_callback(accept_track)
 

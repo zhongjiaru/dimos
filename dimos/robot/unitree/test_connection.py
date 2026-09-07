@@ -24,6 +24,7 @@ import threading
 from typing import Any
 from unittest.mock import ANY, AsyncMock, MagicMock, call
 
+from aiortc.mediastreams import MediaStreamError
 import numpy as np
 import pytest
 from unitree_webrtc_connect.constants import DATA_CHANNEL_TYPE, RTC_TOPIC, SPORT_CMD
@@ -46,6 +47,43 @@ def _stub_driver(connect_exc: Exception | None = None) -> MagicMock:
     driver.datachannel.set_decoder = MagicMock()
     driver.datachannel.pub_sub.publish_request_new = AsyncMock()
     return driver
+
+
+def test_go2_driver_uses_max_bundle() -> None:
+    driver = conn_mod.LegionConnection(
+        conn_mod.WebRTCConnectionMethod.LocalSTA,
+        ip="10.0.0.99",
+    )
+
+    config = driver.create_webrtc_configuration(None)
+
+    assert config.bundlePolicy == conn_mod.RTCBundlePolicy.MAX_BUNDLE
+
+
+def test_go2_driver_scopes_audio_first_sdk_factories(monkeypatch: pytest.MonkeyPatch) -> None:
+    original_peer_connection = conn_mod.webrtc_driver.RTCPeerConnection
+    original_audio_channel = conn_mod.webrtc_driver.WebRTCAudioChannel
+    factories_seen: list[tuple[type[Any], type[Any]]] = []
+
+    async def observe_factories(*_args: Any, **_kwargs: Any) -> None:
+        factories_seen.append(
+            (
+                conn_mod.webrtc_driver.RTCPeerConnection,
+                conn_mod.webrtc_driver.WebRTCAudioChannel,
+            )
+        )
+
+    monkeypatch.setattr(conn_mod._LegionConnection, "init_webrtc", observe_factories)
+    driver = conn_mod.LegionConnection(
+        conn_mod.WebRTCConnectionMethod.LocalSTA,
+        ip="10.0.0.99",
+    )
+
+    asyncio.run(driver.init_webrtc(ip="10.0.0.99"))
+
+    assert factories_seen == [(conn_mod._AudioFirstPeerConnection, conn_mod._ExistingAudioChannel)]
+    assert conn_mod.webrtc_driver.RTCPeerConnection is original_peer_connection
+    assert conn_mod.webrtc_driver.WebRTCAudioChannel is original_audio_channel
 
 
 def test_connect_failure_propagates_to_caller(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -77,6 +115,23 @@ def test_connect_success_completes_setup(built_connection: Any) -> None:
 
     driver.connect.assert_awaited_once()
     driver.datachannel.pub_sub.publish_request_new.assert_awaited_once()
+
+
+def test_video_track_end_completes_stream_without_callback_error(built_connection: Any) -> None:
+    connection, driver = built_connection
+    completed = threading.Event()
+    subscription = connection.raw_video_stream().subscribe(on_completed=completed.set)
+    callback = driver.video.add_track_callback.call_args.args[0]
+    track = MagicMock()
+    track.recv = AsyncMock(side_effect=MediaStreamError)
+
+    try:
+        future = asyncio.run_coroutine_threadsafe(callback(track), connection.loop)
+        future.result(timeout=1.0)
+
+        assert completed.is_set()
+    finally:
+        subscription.dispose()
 
 
 def test_audio_output_attaches_and_queues_on_webrtc_loop(
