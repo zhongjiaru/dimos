@@ -95,6 +95,7 @@ class InfodayVoiceAnswerSkill(Module):
 
     config: InfodayVoiceAnswerConfig
     polyu_knowledge: PolyUKnowledgeSkill
+    infoday_answer: Out[str]
     operator_audio: Out[AudioEvent]
 
     _audio_lock: threading.Lock
@@ -140,6 +141,7 @@ class InfodayVoiceAnswerSkill(Module):
         with self._audio_lock:
             fast_answer = _fast_infoday_answer(clean_question)
             if fast_answer is not None:
+                self.infoday_answer.publish(fast_answer)
                 try:
                     self._stream_text_to_speaker(fast_answer)
                 except Exception as exc:
@@ -169,8 +171,10 @@ class InfodayVoiceAnswerSkill(Module):
                     min_chars=self.config.min_tts_chunk_chars,
                     max_chars=self.config.max_tts_chunk_chars,
                 )
+                answer_parts: list[str] = []
                 first_tts_chunk = True
                 for delta in self._stream_response(clean_question, knowledge):
+                    answer_parts.append(delta)
                     for text_chunk in chunker.feed(delta):
                         if first_tts_chunk:
                             logger.info(
@@ -195,6 +199,9 @@ class InfodayVoiceAnswerSkill(Module):
                         )
                         first_tts_chunk = False
                     tts_chunks.put(text_chunk)
+                answer_text = "".join(answer_parts).strip()
+                if answer_text:
+                    self.infoday_answer.publish(answer_text)
             except Exception as exc:
                 logger.error("InfoDay response streaming failed", error=str(exc))
                 errors.put(exc)

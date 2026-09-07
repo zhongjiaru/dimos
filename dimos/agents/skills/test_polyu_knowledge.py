@@ -120,6 +120,52 @@ def test_polyu_knowledge_searches_cantonese_faq(tmp_path) -> None:  # type: igno
     assert "HK$23,659" in result
 
 
+def test_polyu_knowledge_matches_q5_asr_variants(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    processed = tmp_path / "processed"
+    processed.mkdir()
+    (processed / "facts.zh.json").write_text("{}", encoding="utf-8")
+    chunks = [
+        {
+            "id": "generic-programme",
+            "source_type": "web",
+            "source": "programme.html",
+            "title": "本科课程简介",
+            "audience_summary_zh": "这段资料介绍本科课程。",
+            "original_text": (
+                "AI programme curriculum subject scheme；EEE department；"
+                "人工智能课程、电子课程、学系课程结构及课程申请。"
+            ),
+            "tags": ["本科", "课程"],
+        },
+        {
+            "id": "js3180-faq-5",
+            "source_type": "docx",
+            "source": "JS3180_FAQ_for_AI_Robotic_dog_stephV1.docx",
+            "title": "常見問題（FAQ）– JS3180",
+            "audience_summary_zh": "JS3180 常见问题。",
+            "original_text": (
+                "Q5：呢個課程同電子計算學系嘅 AI 課程有咩分別？\n"
+                "JS3180 著重軟硬件結合與系統應用；電子計算學系嘅 AI 課程"
+                "通常比較偏向純軟件開發同演算法理論。"
+            ),
+            "tags": ["JS3180", "FAQ"],
+        },
+    ]
+    (processed / "chunks.zh.jsonl").write_text(
+        "\n".join(json.dumps(chunk, ensure_ascii=False) for chunk in chunks) + "\n",
+        encoding="utf-8",
+    )
+    skill = PolyUKnowledgeSkill(knowledge_dir=tmp_path, max_chunks=1)
+
+    try:
+        skill.start()
+        result = skill.search_polyu_knowledge("呢个课程同电子计算学系嘅A I课程有咩分别？")
+    finally:
+        skill.stop()
+
+    assert "JS3180 著重軟硬件結合與系統應用" in result
+
+
 def test_polyu_knowledge_reports_missing_files(tmp_path) -> None:  # type: ignore[no-untyped-def]
     skill = PolyUKnowledgeSkill(knowledge_dir=tmp_path)
 

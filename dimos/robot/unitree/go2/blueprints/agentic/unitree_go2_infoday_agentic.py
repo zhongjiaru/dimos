@@ -84,7 +84,7 @@ unitree_go2_infoday_agentic = autoconnect(
     unitree_go2_spatial,
     GO2Connection.blueprint(audio_output=True),
     McpServer.blueprint(),
-    InfodayInputRouter.blueprint(),
+    InfodayInputRouter.blueprint(asr_initial_prompt=INFODAY_STT_INITIAL_PROMPT),
     McpClient.blueprint(system_prompt=INFODAY_SYSTEM_PROMPT, max_tokens=128),
     NavigationSkillContainer.blueprint(),
     PersonFollowSkillContainer.blueprint(camera_info=GO2Connection.camera_info_static),

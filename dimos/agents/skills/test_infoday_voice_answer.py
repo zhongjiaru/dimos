@@ -51,6 +51,7 @@ def test_infoday_voice_answer_streams_tts_audio_to_operator_audio(mocker) -> Non
     skill._client = mocker.Mock()
     skill.polyu_knowledge = mocker.Mock()
     skill.polyu_knowledge.search_polyu_knowledge.return_value = "official context"
+    skill.infoday_answer = mocker.Mock()
     skill.operator_audio = mocker.Mock()
     mocker.patch.object(
         skill, "_stream_response", return_value=iter(["理大 EEE 呢個課程，", "幾適合你。"])
@@ -76,6 +77,7 @@ def test_infoday_voice_answer_streams_tts_audio_to_operator_audio(mocker) -> Non
         frame_a,
         frame_b,
     ]
+    skill.infoday_answer.publish.assert_called_once_with("理大 EEE 呢個課程，幾適合你。")
 
 
 def test_infoday_voice_answer_uses_complete_tts_clips(mocker) -> None:  # type: ignore[no-untyped-def]
@@ -162,6 +164,7 @@ def test_infoday_voice_answer_fast_identity_skips_response_llm(mocker) -> None: 
     skill = InfodayVoiceAnswerSkill(min_tts_chunk_chars=4, max_tts_chunk_chars=12)
     skill._client = mocker.Mock()
     skill.polyu_knowledge = mocker.Mock()
+    skill.infoday_answer = mocker.Mock()
     skill.operator_audio = mocker.Mock()
     stream_response = mocker.patch.object(skill, "_stream_response")
     frame = AudioEvent(np.array([1], dtype=np.int16), 24000, 1.0, 1)
@@ -179,6 +182,9 @@ def test_infoday_voice_answer_fast_identity_skips_response_llm(mocker) -> None: 
     stream_response.assert_not_called()
     tts_node.iter_audio_events.assert_called_once_with("我係理大 EEE 開放日嘅 Go2 機械人講解助手。")
     skill.operator_audio.publish.assert_called_once_with(frame)
+    skill.infoday_answer.publish.assert_called_once_with(
+        "我係理大 EEE 開放日嘅 Go2 機械人講解助手。"
+    )
 
 
 def test_infoday_voice_answer_fast_self_intro_skips_response_llm(mocker) -> None:  # type: ignore[no-untyped-def]
@@ -186,6 +192,7 @@ def test_infoday_voice_answer_fast_self_intro_skips_response_llm(mocker) -> None
     skill = InfodayVoiceAnswerSkill()
     skill._client = mocker.Mock()
     skill.polyu_knowledge = mocker.Mock()
+    skill.infoday_answer = mocker.Mock()
     skill.operator_audio = mocker.Mock()
     stream_response = mocker.patch.object(skill, "_stream_response")
     frame = AudioEvent(np.array([1], dtype=np.int16), 24000, 1.0, 1)
@@ -203,3 +210,6 @@ def test_infoday_voice_answer_fast_self_intro_skips_response_llm(mocker) -> None
     stream_response.assert_not_called()
     tts_node.iter_audio_events.assert_called_once_with("我係理大 EEE 開放日嘅 Go2 機械人講解助手。")
     skill.operator_audio.publish.assert_called_once_with(frame)
+    skill.infoday_answer.publish.assert_called_once_with(
+        "我係理大 EEE 開放日嘅 Go2 機械人講解助手。"
+    )

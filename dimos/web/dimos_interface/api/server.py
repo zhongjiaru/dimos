@@ -26,13 +26,11 @@
 
 # Fast Api & Uvicorn
 import asyncio
-
-# For audio processing
-import io
 import json
 from pathlib import Path
 from queue import Empty, Queue
 import subprocess
+import tempfile
 from threading import Lock
 import time
 
@@ -45,7 +43,6 @@ import numpy as np
 import reactivex as rx
 from reactivex import operators as ops
 from reactivex.disposable import SingleAssignmentDisposable
-import soundfile as sf  # type: ignore[import-untyped]
 from sse_starlette.sse import EventSourceResponse
 import uvicorn
 
@@ -215,31 +212,34 @@ class FastAPIServer(EdgeIO):
             self.text_clients.remove(client_id)
 
     @staticmethod
-    def _decode_audio(raw: bytes) -> tuple[np.ndarray, int]:
-        """Convert the webm/opus blob sent by the browser into mono 16-kHz PCM."""
+    def _decode_audio(raw: bytes) -> tuple[np.ndarray | None, int | None]:
+        """Convert an uploaded audio file into mono 16-kHz float32 PCM."""
         try:
-            # Use ffmpeg to convert to 16-kHz mono 16-bit PCM WAV in memory
-            out, _ = (
-                ffmpeg.input("pipe:0")
-                .output(
-                    "pipe:1",
-                    format="wav",
-                    acodec="pcm_s16le",
-                    ac=1,
-                    ar="16000",
-                    loglevel="quiet",
+            # MP4/M4A metadata can require seeking, which is impossible when
+            # ffmpeg reads stdin. A temporary input also lets ffmpeg probe all
+            # supported upload formats. Headerless output remains pipe-safe.
+            with tempfile.TemporaryDirectory() as temp_dir:
+                input_path = Path(temp_dir) / "upload"
+                input_path.write_bytes(raw)
+                out, _ = (
+                    ffmpeg.input(str(input_path))
+                    .output(
+                        "pipe:1",
+                        format="f32le",
+                        acodec="pcm_f32le",
+                        ac=1,
+                        ar="16000",
+                        loglevel="quiet",
+                    )
+                    .run(capture_stdout=True, capture_stderr=True)
                 )
-                .run(input=raw, capture_stdout=True, capture_stderr=True)
-            )
-            # Load with soundfile (returns float32 by default)
-            audio, sr = sf.read(io.BytesIO(out), dtype="float32")
-            # Ensure 1-D array (mono)
-            if audio.ndim > 1:
-                audio = audio[:, 0]
-            return np.array(audio), sr
+            audio = np.frombuffer(out, dtype="<f4").copy()
+            if audio.size == 0:
+                raise ValueError("ffmpeg decoded no audio samples")
+            return audio, 16000
         except Exception as exc:
             print(f"ffmpeg decoding failed: {exc}")
-            return None, None  # type: ignore[return-value]
+            return None, None
 
     def setup_routes(self) -> None:
         """Set up FastAPI routes."""
@@ -297,7 +297,7 @@ class FastAPIServer(EdgeIO):
             try:
                 data = await file.read()
                 audio_np, sr = self._decode_audio(data)
-                if audio_np is None:
+                if audio_np is None or sr is None:
                     return JSONResponse(
                         status_code=400,
                         content={"success": False, "message": "Unable to decode audio"},

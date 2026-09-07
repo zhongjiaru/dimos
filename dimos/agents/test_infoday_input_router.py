@@ -22,6 +22,14 @@ from dimos.agents.infoday_input_router import (
     InfodayInputRouter,
     InputRoute,
     classify_infoday_input,
+    strip_asr_prompt_prefix,
+)
+
+ASR_INITIAL_PROMPT = (
+    "香港理工大學，理大，PolyU，電機及電子工程學系，EEE，開放日，"
+    "本科，課程，入學，申請，JUPAS，BEng，BSc，IAIE，"
+    "Electrical Engineering，Information and Artificial Intelligence Engineering，"
+    "Electronic Systems and Internet-of-Things，Information Security。"
 )
 
 
@@ -29,8 +37,14 @@ from dimos.agents.infoday_input_router import (
 def router_factory():  # type: ignore[no-untyped-def]
     routers: list[InfodayInputRouter] = []
 
-    def create(queue_size: int = 2) -> InfodayInputRouter:
-        router = InfodayInputRouter(queue_size=queue_size)
+    def create(
+        queue_size: int = 2,
+        asr_initial_prompt: str | None = None,
+    ) -> InfodayInputRouter:
+        router = InfodayInputRouter(
+            queue_size=queue_size,
+            asr_initial_prompt=asr_initial_prompt,
+        )
         router.human_input = MagicMock()
         router.voice_answer = MagicMock()
         routers.append(router)
@@ -78,6 +92,39 @@ def test_classifier_drops_empty_input() -> None:
     assert classify_infoday_input("  ") is InputRoute.DROP
 
 
+@pytest.mark.parametrize(
+    ("transcript", "expected"),
+    [
+        (
+            f"{ASR_INITIAL_PROMPT}我中學冇讀 M1 或 M2，入唔入到？",
+            "我中學冇讀 M1 或 M2，入唔入到？",
+        ),
+        (
+            ASR_INITIAL_PROMPT[ASR_INITIAL_PROMPT.index("PolyU") :]
+            + "資訊及人工智能工程學課程主要係讀啲咩？",
+            "資訊及人工智能工程學課程主要係讀啲咩？",
+        ),
+    ],
+)
+def test_strip_asr_prompt_prefix_removes_exact_full_or_truncated_prompt(
+    transcript: str,
+    expected: str,
+) -> None:
+    assert strip_asr_prompt_prefix(transcript, ASR_INITIAL_PROMPT) == expected
+
+
+@pytest.mark.parametrize(
+    "transcript",
+    [
+        "我中學冇讀 M1 或 M2，入唔入到？",
+        "PolyU 嘅資訊及人工智能工程學課程主要係讀啲咩？",
+        "Information Security。呢個方向主要讀啲咩？",
+    ],
+)
+def test_strip_asr_prompt_prefix_preserves_normal_questions(transcript: str) -> None:
+    assert strip_asr_prompt_prefix(transcript, ASR_INITIAL_PROMPT) == transcript
+
+
 def test_router_directly_calls_voice_answer_once(router_factory) -> None:  # type: ignore[no-untyped-def]
     router = router_factory()
 
@@ -86,6 +133,20 @@ def test_router_directly_calls_voice_answer_once(router_factory) -> None:  # typ
     router._run_answers()
 
     router.voice_answer.answer_infoday_question.assert_called_once_with("EEE 有咩課程？")
+    router.human_input.publish.assert_not_called()
+
+
+def test_router_sends_question_without_asr_prompt_to_voice_answer(
+    router_factory,
+) -> None:  # type: ignore[no-untyped-def]
+    router = router_factory(asr_initial_prompt=ASR_INITIAL_PROMPT)
+    question = "我中學冇讀 M1 或 M2，入唔入到？"
+
+    router._on_input(f"{ASR_INITIAL_PROMPT}{question}")
+    router._answer_queue.put_nowait(None)
+    router._run_answers()
+
+    router.voice_answer.answer_infoday_question.assert_called_once_with(question)
     router.human_input.publish.assert_not_called()
 
 

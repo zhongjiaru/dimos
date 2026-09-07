@@ -44,6 +44,7 @@ class InputRoute(Enum):
 
 class InfodayInputRouterConfig(ModuleConfig):
     queue_size: int = Field(default=8, ge=1, le=100)
+    asr_initial_prompt: str | None = None
 
 
 class InfodayInputRouter(Module):
@@ -93,8 +94,15 @@ class InfodayInputRouter(Module):
         super().stop()
 
     def _on_input(self, text: str) -> None:
-        cleaned = text.strip()
-        route = classify_infoday_input(cleaned)
+        original = text.strip()
+        cleaned = strip_asr_prompt_prefix(original, self.config.asr_initial_prompt)
+        if cleaned != original:
+            logger.info(
+                "Removed ASR initial prompt from InfoDay input",
+                original_text=original,
+                text=cleaned,
+            )
+        route = classify_infoday_input(original) if cleaned else InputRoute.DROP
         logger.info("Routed human input", route=route.value, text=cleaned)
         if route is InputRoute.DROP:
             return
@@ -132,6 +140,24 @@ def classify_infoday_input(text: str) -> InputRoute:
     if _matches_any(normalized, _INFODAY_PATTERNS):
         return InputRoute.INFODAY
     return InputRoute.AGENT
+
+
+def strip_asr_prompt_prefix(text: str, initial_prompt: str | None) -> str:
+    """Remove an exact, sufficiently long initial-prompt prefix from an ASR result."""
+    cleaned = text.strip()
+    if not initial_prompt:
+        return cleaned
+
+    prompt = initial_prompt.strip()
+    item_starts = [0, *(match.end() for match in re.finditer(r"[，,]", prompt))]
+    minimum_remaining_items = 4
+    for index, start in enumerate(item_starts):
+        if len(item_starts) - index < minimum_remaining_items:
+            break
+        candidate = prompt[start:].lstrip()
+        if cleaned.startswith(candidate):
+            return cleaned[len(candidate) :].lstrip()
+    return cleaned
 
 
 def _normalize(text: str) -> str:
