@@ -150,6 +150,30 @@ def test_router_sends_question_without_asr_prompt_to_voice_answer(
     router.human_input.publish.assert_not_called()
 
 
+def test_router_asks_user_to_repeat_when_asr_returns_only_prompt(
+    router_factory,
+) -> None:  # type: ignore[no-untyped-def]
+    router = router_factory(asr_initial_prompt=ASR_INITIAL_PROMPT)
+
+    router._on_input(ASR_INITIAL_PROMPT)
+    router._answer_queue.put_nowait(None)
+    router._run_answers()
+
+    router.voice_answer.ask_user_to_repeat.assert_called_once_with()
+    router.voice_answer.answer_infoday_question.assert_not_called()
+    router.human_input.publish.assert_not_called()
+
+
+def test_router_still_drops_empty_asr_input(router_factory) -> None:  # type: ignore[no-untyped-def]
+    router = router_factory(asr_initial_prompt=ASR_INITIAL_PROMPT)
+
+    router._on_input("  ")
+
+    assert router._answer_queue.empty()
+    router.voice_answer.ask_user_to_repeat.assert_not_called()
+    router.human_input.publish.assert_not_called()
+
+
 def test_router_forwards_action_without_waiting_for_answer_worker(router_factory) -> None:  # type: ignore[no-untyped-def]
     router = router_factory()
 

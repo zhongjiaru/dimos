@@ -38,6 +38,7 @@ logger = setup_logger()
 
 class InputRoute(Enum):
     DROP = "drop"
+    REPEAT = "repeat"
     INFODAY = "infoday"
     AGENT = "agent"
 
@@ -102,9 +103,20 @@ class InfodayInputRouter(Module):
                 original_text=original,
                 text=cleaned,
             )
-        route = classify_infoday_input(original) if cleaned else InputRoute.DROP
+        if not original:
+            route = InputRoute.DROP
+        elif not cleaned:
+            route = InputRoute.REPEAT
+        else:
+            route = classify_infoday_input(original)
         logger.info("Routed human input", route=route.value, text=cleaned)
         if route is InputRoute.DROP:
+            return
+        if route is InputRoute.REPEAT:
+            try:
+                self._answer_queue.put_nowait("")
+            except queue.Full:
+                logger.warning("InfoDay answer queue full; dropping repeat request")
             return
         if route is InputRoute.AGENT:
             self.human_input.publish(cleaned)
@@ -124,9 +136,15 @@ class InfodayInputRouter(Module):
             if question is None:
                 return
             try:
-                self.voice_answer.answer_infoday_question(question)
+                if question:
+                    self.voice_answer.answer_infoday_question(question)
+                else:
+                    self.voice_answer.ask_user_to_repeat()
             except Exception:
-                logger.exception("Direct InfoDay answer failed", question=question)
+                logger.exception(
+                    "Direct InfoDay answer failed",
+                    question=question or "<repeat request>",
+                )
 
 
 def classify_infoday_input(text: str) -> InputRoute:

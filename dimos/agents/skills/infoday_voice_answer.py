@@ -51,6 +51,7 @@ Answer in exactly one short spoken sentence, ideally under 50 Chinese characters
 """.strip()
 
 INFODAY_IDENTITY_ANSWER = "我係理大 EEE 開放日嘅 Go2 機械人講解助手。"
+INFODAY_REPEAT_REQUEST = "唔好意思，我啱啱聽唔清楚，可以麻煩你再講一次嗎？"  # noqa: RUF001
 _IDENTITY_TERMS = (
     "你是誰",
     "你是谁",
@@ -238,6 +239,22 @@ class InfodayVoiceAnswerSkill(Module):
             except queue.Empty:
                 return f"Answered Info Day question in Cantonese: {clean_question}"
             return f"Error answering Info Day question: {error}"
+
+    @rpc
+    def ask_user_to_repeat(self) -> str:
+        """Ask the user to repeat an Info Day question that ASR did not capture."""
+        with self._audio_lock:
+            self.infoday_answer.publish(INFODAY_REPEAT_REQUEST)
+            try:
+                self._stream_text_to_speaker(INFODAY_REPEAT_REQUEST)
+            except Exception as exc:
+                logger.error(
+                    "InfoDay repeat request TTS failed",
+                    error=str(exc),
+                    text=INFODAY_REPEAT_REQUEST,
+                )
+                return f"Error asking user to repeat: {exc}"
+        return "Asked user to repeat the Info Day question"
 
     def _stream_text_to_speaker(self, text: str) -> None:
         self._publish_tts_chunk(self._get_tts_node(), text)

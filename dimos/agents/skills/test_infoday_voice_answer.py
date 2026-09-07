@@ -16,6 +16,7 @@ import numpy as np
 import pytest
 
 from dimos.agents.skills.infoday_voice_answer import (
+    INFODAY_REPEAT_REQUEST,
     InfodayVoiceAnswerSkill,
     _fast_infoday_answer,
     _TextChunker,
@@ -78,6 +79,28 @@ def test_infoday_voice_answer_streams_tts_audio_to_operator_audio(mocker) -> Non
         frame_b,
     ]
     skill.infoday_answer.publish.assert_called_once_with("理大 EEE 呢個課程，幾適合你。")
+
+
+def test_infoday_voice_answer_asks_user_to_repeat_without_llm(mocker) -> None:  # type: ignore[no-untyped-def]
+    skill = InfodayVoiceAnswerSkill()
+    skill.polyu_knowledge = mocker.Mock()
+    skill.infoday_answer = mocker.Mock()
+    skill.operator_audio = mocker.Mock()
+    frame = AudioEvent(np.array([1], dtype=np.int16), 24000, 1.0, 1)
+    tts_node = mocker.Mock()
+    tts_node.iter_audio_events.return_value = [frame]
+    mocker.patch.object(skill, "_make_tts_node", return_value=tts_node)
+
+    try:
+        result = skill.ask_user_to_repeat()
+    finally:
+        skill.stop()
+
+    assert result == "Asked user to repeat the Info Day question"
+    skill.polyu_knowledge.search_polyu_knowledge.assert_not_called()
+    skill.infoday_answer.publish.assert_called_once_with(INFODAY_REPEAT_REQUEST)
+    tts_node.iter_audio_events.assert_called_once_with(INFODAY_REPEAT_REQUEST)
+    skill.operator_audio.publish.assert_called_once_with(frame)
 
 
 def test_infoday_voice_answer_uses_complete_tts_clips(mocker) -> None:  # type: ignore[no-untyped-def]
