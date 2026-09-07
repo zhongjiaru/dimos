@@ -93,6 +93,25 @@ def test_infoday_voice_answer_uses_complete_tts_clips(mocker) -> None:  # type: 
     assert tts_node.extra_body == {"speed": 1.2}
 
 
+def test_infoday_voice_answer_can_select_canto_tts(mocker) -> None:  # type: ignore[no-untyped-def]
+    """The local canto-tts backend is selected and reused between answer segments."""
+    tts_node = mocker.Mock()
+    tts_node_cls = mocker.patch(
+        "dimos.agents.skills.infoday_voice_answer.CantoTTSNode",
+        return_value=tts_node,
+    )
+    skill = InfodayVoiceAnswerSkill(tts_backend="canto-tts")
+
+    try:
+        assert skill._get_tts_node() is tts_node
+        assert skill._get_tts_node() is tts_node
+    finally:
+        skill.stop()
+
+    tts_node_cls.assert_called_once_with(checkpoint=None)
+    tts_node.dispose.assert_called_once_with()
+
+
 def test_infoday_tts_logs_first_audio_and_segment_summary(mocker) -> None:  # type: ignore[no-untyped-def]
     skill = InfodayVoiceAnswerSkill(tts_stream=True)
     skill.operator_audio = mocker.Mock()

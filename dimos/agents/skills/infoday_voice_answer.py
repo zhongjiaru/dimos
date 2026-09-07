@@ -14,12 +14,13 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 import os
 import queue
 import re
 import threading
 import time
-from typing import Any
+from typing import Any, Literal, Protocol
 
 from openai import OpenAI
 from pydantic import Field
@@ -30,6 +31,7 @@ from dimos.core.core import rpc
 from dimos.core.module import Module, ModuleConfig
 from dimos.core.stream import Out
 from dimos.stream.audio.base import AudioEvent
+from dimos.stream.audio.tts.node_canto_tts import CantoTTSNode
 from dimos.stream.audio.tts.node_cosyvoice3 import CosyVoice3TTSNode, CosyVoiceAudioFormat
 from dimos.utils.logging_config import setup_logger
 
@@ -70,6 +72,12 @@ _IDENTITY_TERMS = (
 _GREETING_TERMS = ("你好", "hello", "hi", "早晨", "午安", "晚上好")
 
 
+class _TTSNode(Protocol):
+    def iter_audio_events(self, text: str) -> Iterator[AudioEvent]: ...
+
+    def dispose(self) -> None: ...
+
+
 class InfodayVoiceAnswerConfig(ModuleConfig):
     response_model: str = "gpt-4o-mini"
     response_base_url: str | None = None
@@ -77,6 +85,7 @@ class InfodayVoiceAnswerConfig(ModuleConfig):
     response_temperature: float = 0.2
     response_max_tokens: int = Field(default=96, ge=1, le=512)
     response_extra_body: dict[str, Any] = Field(default_factory=dict)
+    tts_backend: Literal["cosyvoice3", "canto-tts"] = "cosyvoice3"
     tts_endpoint: str = "http://localhost:8001/v1/audio/speech/stream"
     tts_api_key: str | None = None
     tts_model: str = "CosyVoice3"
@@ -88,6 +97,9 @@ class InfodayVoiceAnswerConfig(ModuleConfig):
     min_tts_chunk_chars: int = 24
     max_tts_chunk_chars: int = 45
     tts_queue_timeout_sec: float = 120.0
+    # canto-tts 0.1.x treats this as a local ONNX bundle path. None activates
+    # the SDK's Hugging Face download for typangaa/canto-tts-nano.
+    canto_tts_checkpoint: str | None = None
 
 
 class InfodayVoiceAnswerSkill(Module):
@@ -100,15 +112,22 @@ class InfodayVoiceAnswerSkill(Module):
 
     _audio_lock: threading.Lock
     _client: OpenAI | None
+    _tts_node: _TTSNode | None
 
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
         self._audio_lock = threading.Lock()
         self._client = None
+        self._tts_node = None
 
     @rpc
     def start(self) -> None:
         super().start()
+        if self.config.tts_backend == "canto-tts":
+            tts_node = self._get_tts_node()
+            if not isinstance(tts_node, CantoTTSNode):
+                raise TypeError("canto-tts backend did not create a CantoTTSNode")
+            tts_node.prepare()
         kwargs: dict[str, Any] = {
             "api_key": self.config.response_api_key or os.getenv("OPENAI_API_KEY")
         }
@@ -118,6 +137,9 @@ class InfodayVoiceAnswerSkill(Module):
 
     @rpc
     def stop(self) -> None:
+        if self._tts_node is not None:
+            self._tts_node.dispose()
+            self._tts_node = None
         if self._client is not None:
             self._client.close()
             self._client = None
@@ -155,7 +177,7 @@ class InfodayVoiceAnswerSkill(Module):
                 "InfoDay knowledge lookup complete",
                 duration_ms=round((time.monotonic() - answer_started_at) * 1000.0, 1),
             )
-            tts_node = self._make_tts_node()
+            tts_node = self._get_tts_node()
             tts_chunks: queue.Queue[str | None] = queue.Queue()
             errors: queue.Queue[Exception] = queue.Queue()
             worker = threading.Thread(
@@ -208,7 +230,6 @@ class InfodayVoiceAnswerSkill(Module):
             finally:
                 tts_chunks.put(None)
                 worker.join(timeout=self.config.tts_queue_timeout_sec)
-                tts_node.dispose()
 
             if worker.is_alive():
                 return "Error: timed out while streaming Info Day answer"
@@ -219,13 +240,9 @@ class InfodayVoiceAnswerSkill(Module):
             return f"Error answering Info Day question: {error}"
 
     def _stream_text_to_speaker(self, text: str) -> None:
-        tts_node = self._make_tts_node()
-        try:
-            self._publish_tts_chunk(tts_node, text)
-        finally:
-            tts_node.dispose()
+        self._publish_tts_chunk(self._get_tts_node(), text)
 
-    def _publish_tts_chunk(self, tts_node: CosyVoice3TTSNode, text: str) -> None:
+    def _publish_tts_chunk(self, tts_node: _TTSNode, text: str) -> None:
         started_at = time.monotonic()
         audio_chunks = 0
         audio_duration_sec = 0.0
@@ -302,7 +319,14 @@ class InfodayVoiceAnswerSkill(Module):
                 output_chars=output_chars,
             )
 
-    def _make_tts_node(self) -> CosyVoice3TTSNode:
+    def _get_tts_node(self) -> _TTSNode:
+        if self._tts_node is None:
+            self._tts_node = self._make_tts_node()
+        return self._tts_node
+
+    def _make_tts_node(self) -> _TTSNode:
+        if self.config.tts_backend == "canto-tts":
+            return CantoTTSNode(checkpoint=self.config.canto_tts_checkpoint)
         return CosyVoice3TTSNode(
             endpoint=self.config.tts_endpoint,
             model=self.config.tts_model,
@@ -316,7 +340,7 @@ class InfodayVoiceAnswerSkill(Module):
 
     def _tts_worker(
         self,
-        tts_node: CosyVoice3TTSNode,
+        tts_node: _TTSNode,
         tts_chunks: queue.Queue[str | None],
         errors: queue.Queue[Exception],
     ) -> None:

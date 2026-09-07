@@ -23,6 +23,7 @@ from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
+from unitree_webrtc_connect.constants import RTC_TOPIC
 
 from dimos.core.global_config import GlobalConfig
 from dimos.msgs.geometry_msgs.PoseStamped import PoseStamped
@@ -57,6 +58,63 @@ def test_connection_config_aes_key_defaults_from_global_config() -> None:
     """ConnectionConfig.aes_128_key defaults from GlobalConfig.unitree_aes_128_key."""
     g = GlobalConfig(robot_ip="127.0.0.1", unitree_aes_128_key="dd" * 16)
     assert ConnectionConfig(g=g).aes_128_key == "dd" * 16
+
+
+@pytest.mark.parametrize("volume", [-1, 11])
+def test_connection_config_rejects_invalid_go2_volume(volume: int) -> None:
+    with pytest.raises(ValueError, match="go2_volume"):
+        ConnectionConfig(g=GlobalConfig(robot_ip="127.0.0.1"), go2_volume=volume)
+
+
+def test_go2_connection_applies_configured_hardware_volume(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connection = MagicMock(name="Go2ConnectionProtocol")
+    connection.publish_request.return_value = {"status": "ok"}
+
+    def module_init(module: GO2Connection, **kwargs: object) -> None:
+        module._module_closed = False
+        module.config = ConnectionConfig(
+            g=GlobalConfig(robot_ip="127.0.0.1"),
+            ip="127.0.0.1",
+            camera=False,
+            lidar=False,
+            go2_volume=8,
+        )
+
+    monkeypatch.setattr(go2_conn.Module, "__init__", module_init)
+    monkeypatch.setattr(go2_conn, "make_connection", MagicMock(return_value=connection))
+
+    GO2Connection()
+
+    connection.publish_request.assert_called_once_with(
+        RTC_TOPIC["VUI"],
+        {"api_id": 1003, "parameter": {"volume": 8}},
+    )
+
+
+def test_go2_connection_rejects_invalid_runtime_volume(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connection = MagicMock(name="Go2ConnectionProtocol")
+
+    def module_init(module: GO2Connection, **kwargs: object) -> None:
+        module._module_closed = False
+        module.config = ConnectionConfig(
+            g=GlobalConfig(robot_ip="127.0.0.1"),
+            ip="127.0.0.1",
+            camera=False,
+            lidar=False,
+        )
+
+    monkeypatch.setattr(go2_conn.Module, "__init__", module_init)
+    monkeypatch.setattr(go2_conn, "make_connection", MagicMock(return_value=connection))
+    module = GO2Connection()
+
+    with pytest.raises(ValueError, match="between 0 and 10"):
+        module.set_volume(11)
+
+    connection.publish_request.assert_not_called()
 
 
 def test_go2_connection_forwards_audio_to_selected_backend(monkeypatch: pytest.MonkeyPatch) -> None:

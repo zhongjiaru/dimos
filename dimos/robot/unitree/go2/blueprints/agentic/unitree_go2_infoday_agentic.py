@@ -82,7 +82,7 @@ When greeted or asked who you are in this Info Day context, call `answer_infoday
 
 unitree_go2_infoday_agentic = autoconnect(
     unitree_go2_spatial,
-    GO2Connection.blueprint(audio_output=True),
+    GO2Connection.blueprint(audio_output=True, go2_volume=8),
     McpServer.blueprint(),
     InfodayInputRouter.blueprint(asr_initial_prompt=INFODAY_STT_INITIAL_PROMPT),
     McpClient.blueprint(system_prompt=INFODAY_SYSTEM_PROMPT, max_tokens=128),
@@ -102,6 +102,8 @@ unitree_go2_infoday_agentic = autoconnect(
         batch_ms=50,
         idle_timeout_sec=0.5,
         target_sample_rate=GO2_AUDIO_SAMPLE_RATE,
+        target_peak=15000,
+        max_gain=3.0,
         wait_for_playback=False,
     ),
     PolyUKnowledgeSkill.blueprint(
@@ -111,6 +113,7 @@ unitree_go2_infoday_agentic = autoconnect(
     ),
     InfodayVoiceAnswerSkill.blueprint(
         response_max_tokens=96,
+        tts_backend="cosyvoice3",
         tts_endpoint="http://localhost:8001/v1/audio/speech/stream",
         tts_model="CosyVoice3",
         tts_voice="cantonese",

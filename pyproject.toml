@@ -227,6 +227,7 @@ agents = [
     "ollama>=0.6.0",
 
     # Audio
+    "canto-tts>=0.1.4,<0.2",
     "openai",
     "sounddevice",
     "faster-whisper>=1.0.0",

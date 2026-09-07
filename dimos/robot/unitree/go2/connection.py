@@ -24,6 +24,7 @@ from pydantic import Field
 from reactivex import empty
 from reactivex.disposable import Disposable
 from reactivex.observable import Observable
+from unitree_webrtc_connect.constants import RTC_TOPIC
 
 from dimos.agents.annotation import skill
 from dimos.constants import DEFAULT_THREAD_JOIN_TIMEOUT
@@ -70,6 +71,12 @@ class ConnectionConfig(ModuleConfig):
     camera: bool = True
     velocity_api: bool = False
     audio_output: bool = False
+    go2_volume: int | None = Field(
+        default=None,
+        ge=0,
+        le=10,
+        description="Go2 hardware speaker volume (0-10); leave unset to preserve it",
+    )
     # "mcf" for stair traversal, "normal" for basic, None to leave it as is
     motion_mode: str | None = None
     # Per-device AES-128 key (Go2 fw >=1.1.15); defaults from GlobalConfig.
@@ -328,6 +335,20 @@ class GO2Connection(Module, Camera, Pointcloud):
             audio_output=self.config.audio_output,
         )
 
+        if self.config.go2_volume is not None:
+            try:
+                applied = self.set_volume(self.config.go2_volume)
+            except Exception:
+                logger.warning("Failed to set Go2 hardware speaker volume", exc_info=True)
+            else:
+                if applied:
+                    logger.info("Go2 hardware speaker volume set", level=self.config.go2_volume)
+                else:
+                    logger.warning(
+                        "Go2 hardware speaker volume request was not acknowledged",
+                        level=self.config.go2_volume,
+                    )
+
         if hasattr(self.connection, "camera_info_static"):
             self.camera_info_static = self.connection.camera_info_static
 
@@ -480,6 +501,18 @@ class GO2Connection(Module, Camera, Pointcloud):
     def set_light(self, level: int) -> bool:
         """Head-LED brightness level 0-10 (0 = off)."""
         return self.connection.set_light(level)
+
+    @rpc
+    def set_volume(self, level: int) -> bool:
+        """Set the Go2 hardware speaker volume from 0 (mute) to 10 (maximum)."""
+        if not 0 <= level <= 10:
+            raise ValueError("Go2 hardware speaker volume must be between 0 and 10")
+        return bool(
+            self.connection.publish_request(
+                RTC_TOPIC["VUI"],
+                {"api_id": 1003, "parameter": {"volume": level}},
+            )
+        )
 
     @rpc
     def set_obstacle_avoidance(self, enabled: bool = True) -> bool:
