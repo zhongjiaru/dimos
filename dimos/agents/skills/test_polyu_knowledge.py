@@ -92,6 +92,34 @@ def test_polyu_knowledge_searches_chunks(tmp_path) -> None:  # type: ignore[no-u
     assert "https://www.polyu.edu.hk/eee/research/research-themes-and-strength/" in result
 
 
+def test_polyu_knowledge_searches_cantonese_faq(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    processed = tmp_path / "processed"
+    processed.mkdir()
+    (processed / "facts.zh.json").write_text("{}", encoding="utf-8")
+    chunk = {
+        "id": "js3180-faq-9",
+        "source_type": "docx",
+        "source": "JS3180_FAQ_for_AI_Robotic_dog_stephV1.docx",
+        "title": "常見問題（FAQ）– JS3180",
+        "audience_summary_zh": "JS3180 常见问题。",
+        "original_text": "Q9：畢業生平均起薪點同就業率大概係點？\n平均起薪點每月達 HK$23,659。",
+        "tags": ["JS3180", "FAQ"],
+    }
+    (processed / "chunks.zh.jsonl").write_text(
+        json.dumps(chunk, ensure_ascii=False) + "\n", encoding="utf-8"
+    )
+    skill = PolyUKnowledgeSkill(knowledge_dir=tmp_path)
+
+    try:
+        skill.start()
+        result = skill.search_polyu_knowledge("JS3180 畢業生起薪係幾多？")
+    finally:
+        skill.stop()
+
+    assert "JS3180_FAQ_for_AI_Robotic_dog_stephV1.docx" in result
+    assert "HK$23,659" in result
+
+
 def test_polyu_knowledge_reports_missing_files(tmp_path) -> None:  # type: ignore[no-untyped-def]
     skill = PolyUKnowledgeSkill(knowledge_dir=tmp_path)
 

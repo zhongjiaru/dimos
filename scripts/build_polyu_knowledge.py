@@ -34,6 +34,7 @@ import requests
 
 DEFAULT_KNOWLEDGE_DIR = Path("/home/jiaru/infoday/knowledge")
 POLYU_HOST_SUFFIX = "polyu.edu.hk"
+FAQ_QUESTION_RE = re.compile(r"^Q\d+\s*[:：]", re.IGNORECASE)
 
 POLYU_URLS = [
     "https://www.polyu.edu.hk/",
@@ -169,6 +170,12 @@ def _extract_docx_text(path: Path) -> str:
     return "\n".join(paragraphs)
 
 
+def _document_title(text: str, fallback: str) -> str:
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    faq_title = next((line for line in lines[:5] if "faq" in line.casefold()), None)
+    return faq_title or (lines[0] if lines else fallback)
+
+
 def _copy_docx_sources(knowledge_dir: Path) -> list[Document]:
     raw_docx_dir = knowledge_dir / "raw" / "docx"
     raw_docx_dir.mkdir(parents=True, exist_ok=True)
@@ -179,13 +186,12 @@ def _copy_docx_sources(knowledge_dir: Path) -> list[Document]:
         if src.resolve() != dst.resolve():
             shutil.copy2(src, dst)
         text = _extract_docx_text(src)
-        first_line = next((line for line in text.splitlines() if line.strip()), src.stem)
         documents.append(
             Document(
                 source_id=f"docx:{src.name}",
                 source_type="docx",
                 source=src.name,
-                title=first_line,
+                title=_document_title(text, src.stem),
                 text=text,
             )
         )
@@ -257,10 +263,12 @@ def _is_boilerplate(text: str) -> bool:
 
 def _chunk_document(document: Document, max_chars: int = 1800) -> list[dict[str, Any]]:
     paragraphs = _split_paragraphs(document.text)
+    is_faq = any(FAQ_QUESTION_RE.match(paragraph) for paragraph in paragraphs)
     chunks: list[dict[str, Any]] = []
     current: list[str] = []
     current_len = 0
     chunk_index = 1
+    seen_faq_question = False
 
     def flush() -> None:
         nonlocal chunk_index, current, current_len
@@ -283,6 +291,10 @@ def _chunk_document(document: Document, max_chars: int = 1800) -> list[dict[str,
         current_len = 0
 
     for para in paragraphs:
+        if is_faq and FAQ_QUESTION_RE.match(para):
+            if seen_faq_question:
+                flush()
+            seen_faq_question = True
         if current and current_len + len(para) > max_chars:
             flush()
         current.append(para)
@@ -293,6 +305,8 @@ def _chunk_document(document: Document, max_chars: int = 1800) -> list[dict[str,
 
 def _summary_zh(title: str, text: str) -> str:
     lower = f"{title}\n{text}".lower()
+    if "faq" in lower or "js3180" in lower:
+        return "这段资料来自 JS3180 资讯及人工智能工程课程常见问题，可用于回答课程、入学、就业、专业认可、实习或交流问题。"
     if "contact us" in lower:
         return "这段资料提供 EEE 学系办公室地址、电话、电邮和官方网站等联系方式。"
     if "vision" in lower and "mission" in lower:
@@ -314,6 +328,8 @@ def _tags_for(title: str, text: str) -> list[str]:
     lower = f"{title}\n{text}".lower()
     tags: list[str] = []
     candidates = [
+        ("JS3180", ["js3180"]),
+        ("FAQ", ["faq", "常見問題", "常见问题"]),
         ("PolyU", ["polyu", "hong kong polytechnic university"]),
         ("EEE", ["electrical and electronic engineering", "eee"]),
         ("本科", ["undergraduate", "bachelor", "beng", "bsc", "jupas"]),
@@ -484,6 +500,14 @@ def _qa_seed() -> list[dict[str, str]]:
         "EEE 的愿景是什么？",
         "EEE 的使命是什么？",
         "理大本科招生页面在哪里？",
+        "JS3180 主要学习什么？",
+        "没有读 M1、M2 或 ICT 可以申请 JS3180 吗？",
+        "JS3180 有哪些主修方向？",
+        "JS3180 的收生要求和参考分数是多少？",
+        "JS3180 毕业后有哪些就业出路？",
+        "JS3180 是否获得 HKIE 专业认可？",
+        "JS3180 有没有实习和海外交流机会？",
+        "JS3180 毕业生的起薪和就业率如何？",
     ]
     return [{"question": question} for question in questions]
 

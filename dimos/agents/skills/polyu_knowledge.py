@@ -229,6 +229,8 @@ def _has_any(text: str, needles: Iterable[str]) -> bool:
 def _query_tokens(query: str) -> list[str]:
     normalized = _normalize(query)
     tokens = set(re.findall(r"[a-z0-9][a-z0-9+&.-]*", normalized))
+    for segment in re.findall(r"[\u3400-\u9fff]+", normalized):
+        tokens.update(segment[index : index + 2] for index in range(len(segment) - 1))
     for alias, expansions in _ALIASES.items():
         if alias in normalized:
             tokens.update(expansions)
@@ -267,6 +269,21 @@ _ALIASES = {
     "人工智能": ["artificial", "intelligence", "iaie", "aie"],
     "信息安全": ["information", "security", "ins"],
     "物联网": ["internet-of-things", "iot", "esi"],
+    "課程": ["programme", "program", "curriculum", "scheme"],
+    "入學": ["admission", "entrance", "jupas", "applicant", "收生"],
+    "申請": ["admission", "application", "applicant", "jupas", "報"],
+    "資訊安全": ["information", "security", "ins", "資訊安全"],
+    "物聯網": ["internet-of-things", "iot", "esi", "物聯網"],
+    "毕业": ["畢業", "畢業生", "就業", "出路"],
+    "就业": ["就業", "出路", "僱主"],
+    "工作": ["做咩工", "出路", "就業", "僱主"],
+    "实习": ["實習", "校外實習", "交流"],
+    "交流": ["交流", "海外", "歐美", "亞洲"],
+    "认证": ["認可", "hkie", "scheme"],
+    "认可": ["認可", "hkie", "scheme"],
+    "工程师": ["工程師", "hkie", "scheme"],
+    "区别": ["分別", "軟硬件", "電子計算"],
+    "分数": ["分數", "收生", "最佳", "加權"],
 }
 
 _CHINESE_PHRASES = [
@@ -284,4 +301,20 @@ _CHINESE_PHRASES = [
     "人工智能",
     "信息安全",
     "物联网",
+    "課程",
+    "入學",
+    "申請",
+    "資訊安全",
+    "物聯網",
+    "收生",
+    "分數",
+    "出路",
+    "畢業",
+    "就業",
+    "起薪",
+    "實習",
+    "交流",
+    "認可",
+    "工程師",
+    "分別",
 ]
