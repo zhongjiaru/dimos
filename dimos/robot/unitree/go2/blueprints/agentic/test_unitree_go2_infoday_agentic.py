@@ -1,0 +1,88 @@
+# Copyright 2025-2026 Dimensional Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from dimos.agents.mcp.mcp_client import McpClient
+from dimos.agents.mcp.mcp_server import McpServer
+from dimos.agents.skills.infoday_voice_answer import InfodayVoiceAnswerSkill
+from dimos.robot.unitree.go2.blueprints.agentic.unitree_go2_infoday_agentic import (
+    INFODAY_AGENT_TOOLS,
+    INFODAY_SYSTEM_PROMPT,
+    unitree_go2_infoday_agentic,
+)
+from dimos.robot.unitree.go2.connection import GO2Connection
+from dimos.teleop.hosted.go2_audio_bridge import Go2AudioBridgeModule
+
+
+def test_infoday_blueprint_uses_minimal_sensor_free_go2_connection() -> None:
+    connection = next(
+        atom for atom in unitree_go2_infoday_agentic.blueprints if atom.module is GO2Connection
+    )
+
+    assert connection.kwargs == {
+        "camera": False,
+        "lidar": False,
+        "odom": False,
+        "lowstate": True,
+        "audio_output": True,
+        "go2_volume": 8,
+    }
+    module_names = {atom.module.__name__ for atom in unitree_go2_infoday_agentic.blueprints}
+    assert module_names.isdisjoint(
+        {
+            "NavigationSkillContainer",
+            "PersonFollowSkillContainer",
+            "UnitreeSkillContainer",
+            "SpatialMemory",
+            "VoxelGridMapper",
+        }
+    )
+
+
+def test_infoday_agent_receives_only_two_business_tools() -> None:
+    client = next(
+        atom for atom in unitree_go2_infoday_agentic.blueprints if atom.module is McpClient
+    )
+
+    assert client.kwargs["allowed_tools"] == INFODAY_AGENT_TOOLS
+    assert client.kwargs["require_tool_call"] is True
+    assert INFODAY_AGENT_TOOLS == ["answer_infoday_question", "perform_robot_action"]
+    server = next(
+        atom for atom in unitree_go2_infoday_agentic.blueprints if atom.module is McpServer
+    )
+    assert server.kwargs["exposed_tools"] == INFODAY_AGENT_TOOLS
+
+
+def test_infoday_prompt_keeps_capability_speech_and_action_in_one_tool() -> None:
+    assert "call only\n  `perform_robot_action` with the user's complete original words" in (
+        INFODAY_SYSTEM_PROMPT
+    )
+    assert "Do not emit both tool calls in one assistant" in INFODAY_SYSTEM_PROMPT
+    assert "Never substitute a different physical action" in INFODAY_SYSTEM_PROMPT
+
+
+def test_infoday_blueprint_streams_audio_to_go2_without_local_debug_playback() -> None:
+    bridge = next(
+        atom
+        for atom in unitree_go2_infoday_agentic.blueprints
+        if atom.module is Go2AudioBridgeModule
+    )
+
+    assert bridge.kwargs["debug_local_playback"] is False
+    voice_answer = next(
+        atom
+        for atom in unitree_go2_infoday_agentic.blueprints
+        if atom.module is InfodayVoiceAnswerSkill
+    )
+    assert voice_answer.kwargs["wait_for_audio_playback"] is False
+    assert voice_answer.kwargs["stream_audio_playback"] is True

@@ -15,6 +15,7 @@
 
 # ruff: noqa: RUF001
 
+from dataclasses import dataclass
 from enum import Enum
 import queue
 import re
@@ -25,6 +26,8 @@ import unicodedata
 from pydantic import Field
 from reactivex.disposable import Disposable
 
+from dimos.agents.skills.infoday_action import is_robot_action_request
+from dimos.agents.skills.infoday_action_spec import InfodayActionSpec
 from dimos.agents.skills.infoday_voice_answer_spec import InfodayVoiceAnswerSpec
 from dimos.constants import DEFAULT_THREAD_JOIN_TIMEOUT
 from dimos.core.core import rpc
@@ -40,7 +43,23 @@ class InputRoute(Enum):
     DROP = "drop"
     REPEAT = "repeat"
     INFODAY = "infoday"
+    ACTION = "action"
     AGENT = "agent"
+
+
+class _VoiceRequest(Enum):
+    REPEAT = "repeat"
+    AGENT_ERROR = "agent_error"
+
+
+@dataclass(frozen=True)
+class _ActionRequest:
+    text: str
+
+
+INFODAY_AGENT_ERROR_RESPONSE = (
+    "唔好意思，我頭先處理唔到你嘅要求。你可以再講一次，或者問我 EEE 嘅課程。"
+)
 
 
 class InfodayInputRouterConfig(ModuleConfig):
@@ -53,12 +72,16 @@ class InfodayInputRouter(Module):
 
     config: InfodayInputRouterConfig
     infoday_input: In[str]
+    agent_error: In[str]
     human_input: Out[str]
     voice_answer: InfodayVoiceAnswerSpec
+    action: InfodayActionSpec
 
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
-        self._answer_queue: queue.Queue[str | None] = queue.Queue(maxsize=self.config.queue_size)
+        self._answer_queue: queue.Queue[str | _VoiceRequest | _ActionRequest | None] = queue.Queue(
+            maxsize=self.config.queue_size
+        )
         self._stop_event = threading.Event()
         self._worker: threading.Thread | None = None
 
@@ -67,6 +90,7 @@ class InfodayInputRouter(Module):
         super().start()
         self._stop_event.clear()
         self.register_disposable(Disposable(self.infoday_input.subscribe(self._on_input)))
+        self.register_disposable(Disposable(self.agent_error.subscribe(self._on_agent_error)))
 
     @rpc
     def on_system_modules(self, _modules: list[RPCClient]) -> None:
@@ -114,18 +138,32 @@ class InfodayInputRouter(Module):
             return
         if route is InputRoute.REPEAT:
             try:
-                self._answer_queue.put_nowait("")
+                self._answer_queue.put_nowait(_VoiceRequest.REPEAT)
             except queue.Full:
                 logger.warning("InfoDay answer queue full; dropping repeat request")
             return
         if route is InputRoute.AGENT:
             self.human_input.publish(cleaned)
             return
+        if route is InputRoute.ACTION:
+            try:
+                self._answer_queue.put_nowait(_ActionRequest(cleaned))
+            except queue.Full:
+                logger.warning("InfoDay action queue full; forwarding input to agent")
+                self.human_input.publish(cleaned)
+            return
         try:
             self._answer_queue.put_nowait(cleaned)
         except queue.Full:
             logger.warning("InfoDay answer queue full; forwarding input to agent")
             self.human_input.publish(cleaned)
+
+    def _on_agent_error(self, error: str) -> None:
+        logger.error("InfoDay agent processing failed", error=error)
+        try:
+            self._answer_queue.put_nowait(_VoiceRequest.AGENT_ERROR)
+        except queue.Full:
+            logger.error("InfoDay answer queue full; cannot announce agent failure")
 
     def _run_answers(self) -> None:
         while not self._stop_event.is_set():
@@ -136,10 +174,14 @@ class InfodayInputRouter(Module):
             if question is None:
                 return
             try:
-                if question:
-                    self.voice_answer.answer_infoday_question(question)
-                else:
+                if question is _VoiceRequest.REPEAT:
                     self.voice_answer.ask_user_to_repeat()
+                elif question is _VoiceRequest.AGENT_ERROR:
+                    self.voice_answer.speak_message(INFODAY_AGENT_ERROR_RESPONSE)
+                elif isinstance(question, _ActionRequest):
+                    self.action.perform_robot_action(question.text)
+                else:
+                    self.voice_answer.answer_infoday_question(question)
             except Exception:
                 logger.exception(
                     "Direct InfoDay answer failed",
@@ -151,11 +193,15 @@ def classify_infoday_input(text: str) -> InputRoute:
     normalized = _normalize(text)
     if not normalized:
         return InputRoute.DROP
-    if _matches_any(normalized, _ACTION_PATTERNS):
+    has_action = is_robot_action_request(normalized)
+    has_infoday_question = _matches_any(normalized, _INFODAY_PATTERNS)
+    if has_action and has_infoday_question:
         return InputRoute.AGENT
+    if has_action:
+        return InputRoute.ACTION
     if _matches_any(normalized, _GREETING_PATTERNS):
         return InputRoute.INFODAY
-    if _matches_any(normalized, _INFODAY_PATTERNS):
+    if has_infoday_question:
         return InputRoute.INFODAY
     return InputRoute.AGENT
 
@@ -185,16 +231,6 @@ def _normalize(text: str) -> str:
 def _matches_any(text: str, patterns: tuple[str, ...]) -> bool:
     return any(re.search(pattern, text) for pattern in patterns)
 
-
-_ACTION_PATTERNS = (
-    r"\b(?:move|walk|turn|stop|follow|dance|wave|jump|navigate|come here)\b",
-    r"\b(?:go|take me)\s+to\b",
-    r"\bwhat can you do\b",
-    r"向前|向後|向后|後退|后退|轉左|转左|轉右|转右|停低|停止|唔好郁|不要动",
-    r"跟住|跟隨|跟随|揮手|挥手|跳舞|坐低|企起身|站起來|站起来|瞓低|躺下",
-    r"導航|导航|帶我去|带我去|過去|过去|行去|望下|睇下|看看|影相|拍照|搵人|找人",
-    r"你識做咩|你识做咩|你會做咩|你会做什么",
-)
 
 _GREETING_PATTERNS = (
     r"^(?:你好|您好|早晨|午安|晚上好)[!！。,.， ]*$",

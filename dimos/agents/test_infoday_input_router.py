@@ -19,6 +19,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from dimos.agents.infoday_input_router import (
+    INFODAY_AGENT_ERROR_RESPONSE,
     InfodayInputRouter,
     InputRoute,
     classify_infoday_input,
@@ -47,6 +48,7 @@ def router_factory():  # type: ignore[no-untyped-def]
         )
         router.human_input = MagicMock()
         router.voice_answer = MagicMock()
+        router.action = MagicMock()
         routers.append(router)
         return router
 
@@ -73,19 +75,22 @@ def test_classifier_routes_clear_infoday_questions_directly(text: str) -> None:
 
 
 @pytest.mark.parametrize(
-    "text",
+    ("text", "expected"),
     [
-        "向前行兩米",
-        "stop",
-        "follow that person",
-        "帶我去 EEE office",
-        "介紹 EEE 然後揮手",
-        "what can you do?",
-        "research the person in front of you",
+        ("向前行兩米", InputRoute.ACTION),
+        ("stop", InputRoute.ACTION),
+        ("follow that person", InputRoute.ACTION),
+        ("帶我去 EEE office", InputRoute.AGENT),
+        ("介紹 EEE 然後揮手", InputRoute.AGENT),
+        ("what can you do?", InputRoute.ACTION),
+        ("research the person in front of you", InputRoute.AGENT),
     ],
 )
-def test_classifier_keeps_actions_and_ambiguous_input_on_agent_path(text: str) -> None:
-    assert classify_infoday_input(text) is InputRoute.AGENT
+def test_classifier_separates_direct_actions_from_mixed_or_ambiguous_input(
+    text: str,
+    expected: InputRoute,
+) -> None:
+    assert classify_infoday_input(text) is expected
 
 
 def test_classifier_drops_empty_input() -> None:
@@ -174,13 +179,48 @@ def test_router_still_drops_empty_asr_input(router_factory) -> None:  # type: ig
     router.human_input.publish.assert_not_called()
 
 
-def test_router_forwards_action_without_waiting_for_answer_worker(router_factory) -> None:  # type: ignore[no-untyped-def]
+def test_router_directly_runs_action_through_worker(router_factory) -> None:  # type: ignore[no-untyped-def]
     router = router_factory()
 
     router._on_input("立即停低")
+    router._answer_queue.put_nowait(None)
+    router._run_answers()
 
-    router.human_input.publish.assert_called_once_with("立即停低")
+    router.action.perform_robot_action.assert_called_once_with("立即停低")
+    router.human_input.publish.assert_not_called()
     router.voice_answer.answer_infoday_question.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "user_text",
+    [
+        "你會握手嗎，做個我看看",
+        "你會唔會唱歌？表演俾我睇",
+        "Can you roll over? Show me.",
+    ],
+)
+def test_router_directly_handles_generic_capability_demo_without_llm(
+    router_factory,
+    user_text: str,
+) -> None:  # type: ignore[no-untyped-def]
+    router = router_factory()
+
+    router._on_input(user_text)
+    router._answer_queue.put_nowait(None)
+    router._run_answers()
+
+    router.action.perform_robot_action.assert_called_once_with(user_text)
+    router.human_input.publish.assert_not_called()
+
+
+def test_router_speaks_when_agent_processing_fails(router_factory) -> None:  # type: ignore[no-untyped-def]
+    router = router_factory()
+
+    router._on_agent_error("model failed")
+    router._answer_queue.put_nowait(None)
+    router._run_answers()
+
+    router.voice_answer.speak_message.assert_called_once_with(INFODAY_AGENT_ERROR_RESPONSE)
 
 
 def test_router_queue_overflow_forwards_input_once_to_agent(router_factory) -> None:  # type: ignore[no-untyped-def]

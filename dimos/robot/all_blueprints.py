@@ -217,6 +217,7 @@ all_modules = {
     "grasping-module": "dimos.manipulation.grasping.grasping.GraspingModule",
     "gstreamer-camera-module": "dimos.hardware.sensors.camera.gstreamer.gstreamer_camera.GstreamerCameraModule",
     "hosted-stats-module": "dimos.teleop.hosted.hosted_stats.HostedStatsModule",
+    "infoday-action-skill": "dimos.agents.skills.infoday_action.InfodayActionSkill",
     "infoday-input-router": "dimos.agents.infoday_input_router.InfodayInputRouter",
     "infoday-voice-answer-skill": "dimos.agents.skills.infoday_voice_answer.InfodayVoiceAnswerSkill",
     "joint-trajectory-controller": "dimos.manipulation.control.trajectory_controller.joint_trajectory_controller.JointTrajectoryController",

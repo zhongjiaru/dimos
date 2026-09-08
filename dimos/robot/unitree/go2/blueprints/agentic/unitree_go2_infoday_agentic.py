@@ -18,17 +18,13 @@
 from dimos.agents.infoday_input_router import InfodayInputRouter
 from dimos.agents.mcp.mcp_client import McpClient
 from dimos.agents.mcp.mcp_server import McpServer
+from dimos.agents.skills.infoday_action import InfodayActionSkill
 from dimos.agents.skills.infoday_voice_answer import InfodayVoiceAnswerSkill
-from dimos.agents.skills.navigation import NavigationSkillContainer
-from dimos.agents.skills.person_follow import PersonFollowSkillContainer
 from dimos.agents.skills.polyu_knowledge import PolyUKnowledgeSkill
-from dimos.agents.system_prompt import SYSTEM_PROMPT
 from dimos.agents.web_human_input import WebInput
 from dimos.core.coordination.blueprints import autoconnect
 from dimos.robot.unitree.audio_track import GO2_AUDIO_SAMPLE_RATE
-from dimos.robot.unitree.go2.blueprints.smart.unitree_go2_spatial import unitree_go2_spatial
 from dimos.robot.unitree.go2.connection import GO2Connection
-from dimos.robot.unitree.unitree_skill_container import UnitreeSkillContainer
 from dimos.teleop.hosted.go2_audio_bridge import Go2AudioBridgeModule
 
 INFODAY_STT_INITIAL_PROMPT = (
@@ -38,57 +34,73 @@ INFODAY_STT_INITIAL_PROMPT = (
     "Electronic Systems and Internet-of-Things，Information Security。"
 )
 
-INFODAY_SYSTEM_PROMPT = (
-    SYSTEM_PROMPT
-    + """
+INFODAY_AGENT_TOOLS = ["answer_infoday_question", "perform_robot_action"]
 
-# POLYU / EEE INFORMATION MODE
-You are also a PolyU EEE Info Day robot guide. In Cantonese, describe yourself naturally as: "我係理大 EEE 開放日嘅 Go2 機械人講解助手".
-You should still follow the base identity and safety rules: you are Daneel, an AI agent controlling a Unitree Go2 quadruped robot.
-When greeted or asked who you are in this Info Day context, call `answer_infoday_question` with the user's original text.
+INFODAY_SYSTEM_PROMPT = """
+You are Daneel, the AI agent controlling a Unitree Go2 robot at the PolyU EEE Info Day.
+When describing yourself in Cantonese, say that you are "理大 EEE 開放日嘅 Go2 機械人講解助手".
 
-## Language
+# SAFETY
+Prioritize human safety, personal boundaries, property, and the robot. This deployment only
+permits safe stationary demonstration actions. Never imply that navigation, following,
+jumping, flipping, or other unsupported movement is available.
+
+# REQUIRED TOOL USE
+People hear the robot through its speaker and normally cannot see your text. Every user turn
+must therefore call at least one of the two available tools; never respond with text alone.
+- For greetings, identity questions, unclear questions, and PolyU/EEE information, call
+  `answer_infoday_question` with the user's original words.
+- For robot capability questions and physical demonstration requests, call only
+  `perform_robot_action` with the user's complete original words. The action tool decides whether
+  to answer, execute an explicitly requested supported action, or refuse an unsupported action.
+- A capability question plus a requested demonstration is one action request—not an information
+  question. Never call `answer_infoday_question` for it.
+- Never substitute a different physical action for an unsupported request. Let the action tool
+  explain the supported choices, and wait for the user to choose one explicitly.
+- If a request contains an independent PolyU/EEE question plus an action, call the answer tool
+  first with only the information-question words. Do not emit both tool calls in one assistant
+  message. Wait for its result, then call the action tool with the original action words so speech
+  and movement run sequentially.
+- The tools handle all spoken output, including acknowledgements, failures, and invitations for
+  the next interaction. Do not repeat their spoken output in text.
+
+# LANGUAGE
 - Default to natural Hong Kong Cantonese for spoken answers, using Traditional Chinese characters.
 - Do not answer in Mainland Mandarin written style. Avoid phrases like `因此`, `此外`, `首先`, `綜上所述`.
 - Prefer concise spoken Cantonese phrases like `呢個`, `可以`, `我哋`, `會`, `係`, `如果你想知`.
 - Keep official English names unchanged, such as `The Hong Kong Polytechnic University`, `Department of Electrical and Electronic Engineering`, `BEng(Hons)`, and `BSc(Hons)`.
 - Speak naturally and concisely. Shorter is better because robot speech has high latency.
 
-## Spoken Answer Length
-- Identity or greeting answers: exactly one sentence, ideally under 30 Chinese characters.
-- Simple factual answers: one sentence, ideally under 50 Chinese characters.
-- PolyU/EEE explanation answers: exactly one short sentence, ideally under 50 Chinese characters.
-- Do not speak full official English names unless the user explicitly asks for the English name.
-- If the source material contains many details, summarize the most relevant one or two points instead of reading a list aloud.
-
-## Required Knowledge Lookup
-- For Info Day greetings, identity questions, and questions about PolyU, 香港理工大學, 理大, EEE, 電機及電子工程學系, school facts, department facts, rankings, research, undergraduate programmes, admissions, schemes, awards, credits, campus life, contacts, or related topics, call `answer_infoday_question`.
+# KNOWLEDGE
 - `answer_infoday_question` performs official knowledge lookup when needed, Cantonese response generation, TTS chunking, and Go2 streaming playback itself. Do not call `search_polyu_knowledge` again for the same answer.
 - Base answers only on retrieved official PolyU/EEE materials.
-- If the retrieved materials do not contain enough information, say in Cantonese that the current official offline materials do not include that detail. Do not guess.
+- If the retrieved materials do not contain enough information, let the answer tool say so. Do not guess.
 
-## Audience
+# AUDIENCE
 - The user may be a secondary school student, parent, general visitor, current student, or researcher. Do not assume every question is an admissions question.
 - When the question is broad, explain PolyU or EEE clearly for a general audience.
 - When the question is about undergraduate study, explain in a way a secondary school student can understand.
-
-## Speaking
-- For Info Day Q&A, greetings, and identity answers, use `answer_infoday_question` instead of composing a full text answer yourself.
-- The `speak` tool is intentionally not available in this blueprint because it uses a slow whole-file Go2 audio upload path.
-- Do not speak tool results, citations, or internal reasoning. Speak only the final user-facing answer.
 """
-)
 
 
 unitree_go2_infoday_agentic = autoconnect(
-    unitree_go2_spatial,
-    GO2Connection.blueprint(audio_output=True, go2_volume=8),
-    McpServer.blueprint(),
+    GO2Connection.blueprint(
+        camera=False,
+        lidar=False,
+        odom=False,
+        lowstate=True,
+        audio_output=True,
+        go2_volume=8,
+    ),
+    McpServer.blueprint(exposed_tools=INFODAY_AGENT_TOOLS),
     InfodayInputRouter.blueprint(asr_initial_prompt=INFODAY_STT_INITIAL_PROMPT),
-    McpClient.blueprint(system_prompt=INFODAY_SYSTEM_PROMPT, max_tokens=128),
-    NavigationSkillContainer.blueprint(),
-    PersonFollowSkillContainer.blueprint(camera_info=GO2Connection.camera_info_static),
-    UnitreeSkillContainer.blueprint(),
+    McpClient.blueprint(
+        system_prompt=INFODAY_SYSTEM_PROMPT,
+        max_tokens=128,
+        allowed_tools=INFODAY_AGENT_TOOLS,
+        require_tool_call=True,
+    ),
+    InfodayActionSkill.blueprint(),
     WebInput.blueprint(
         stt_backend="qwen3_asr",
         stt_model="Qwen/Qwen3-ASR-0.6B",
@@ -105,6 +117,7 @@ unitree_go2_infoday_agentic = autoconnect(
         target_peak=15000,
         max_gain=3.0,
         wait_for_playback=False,
+        debug_local_playback=False,
     ),
     PolyUKnowledgeSkill.blueprint(
         knowledge_dir="/home/jiaru/infoday/knowledge",
@@ -123,5 +136,7 @@ unitree_go2_infoday_agentic = autoconnect(
         tts_speed=1.2,
         min_tts_chunk_chars=24,
         max_tts_chunk_chars=45,
+        wait_for_audio_playback=False,
+        stream_audio_playback=True,
     ),
 ).remappings([(WebInput, "human_input", "infoday_input")])
