@@ -1,5 +1,4 @@
-#!/usr/bin/env python3
-# Copyright 2025-2026 Dimensional Inc.
+# Copyright 2026 Dimensional Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,14 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Protocol
+"""Shared event contracts for the Info Day audio pipeline."""
 
-from dimos.spec.utils import Spec
+from __future__ import annotations
+
+from typing import TypedDict
+
+INFODAY_AUDIO_COMPLETE_TOPIC = "/infoday_audio_complete"
 
 
-class InfodayVoiceAnswerSpec(Spec, Protocol):
-    def answer_infoday_question(self, question: str) -> str: ...
+class InfodayAudioComplete(TypedDict):
+    """Successful completion of one complete spoken Info Day message."""
 
-    def ask_user_to_repeat(self) -> str: ...
-
-    def speak_message(self, text: str) -> str: ...
+    audio_chunks: int
+    audio_duration_sec: float

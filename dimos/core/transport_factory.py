@@ -62,6 +62,7 @@ _NEVER_DROP_CHANNELS = (
     "human_input",
     "infoday_input",
     "infoday_answer",
+    "infoday_audio_complete",
     "agent",
     "agent_idle",
     "command",

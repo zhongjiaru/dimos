@@ -24,10 +24,14 @@ import queue
 import re
 import sys
 import time
-from typing import Any
+from typing import Any, Literal, TypeAlias
 
 import requests
 
+from dimos.agents.infoday_events import (
+    INFODAY_AUDIO_COMPLETE_TOPIC,
+    InfodayAudioComplete,
+)
 from dimos.core.global_config import global_config
 from dimos.core.transport import PubSubTransport
 from dimos.core.transport_factory import make_transport
@@ -41,6 +45,9 @@ DEFAULT_UPLOAD_TIMEOUT_SEC = 30.0
 DEFAULT_TRANSCRIPT_TIMEOUT_SEC = 60.0
 DEFAULT_ANSWER_TIMEOUT_SEC = 120.0
 DEFAULT_AUDIO_IDLE_SEC = 8.0
+AudioActivity: TypeAlias = (
+    tuple[Literal["audio"], AudioEvent] | tuple[Literal["complete"], InfodayAudioComplete]
+)
 
 
 class PipelineTimeoutError(TimeoutError):
@@ -48,14 +55,17 @@ class PipelineTimeoutError(TimeoutError):
 
 
 class PipelineObserver:
-    """Observe ASR text and generated answer audio on DimOS transports."""
+    """Observe ASR text and completed answer playback on DimOS transports."""
 
     def __init__(self) -> None:
         self._transcripts: queue.Queue[str] = queue.Queue()
         self._answers: queue.Queue[str] = queue.Queue()
-        self._audio: queue.Queue[AudioEvent] = queue.Queue()
+        self._audio_activity: queue.Queue[AudioActivity] = queue.Queue()
         self._transcript_transport: PubSubTransport[Any] = make_transport("/infoday_input")
         self._answer_transport: PubSubTransport[Any] = make_transport("/infoday_answer")
+        self._audio_complete_transport: PubSubTransport[Any] = make_transport(
+            INFODAY_AUDIO_COMPLETE_TOPIC
+        )
         self._audio_transport: PubSubTransport[Any] = make_transport("/operator_audio", AudioEvent)
         self._unsubscribe: list[Callable[[], None]] = []
 
@@ -63,7 +73,12 @@ class PipelineObserver:
         self._unsubscribe = [
             self._transcript_transport.subscribe(self._transcripts.put),
             self._answer_transport.subscribe(self._answers.put),
-            self._audio_transport.subscribe(self._audio.put),
+            self._audio_complete_transport.subscribe(
+                lambda event: self._audio_activity.put(("complete", event))
+            ),
+            self._audio_transport.subscribe(
+                lambda event: self._audio_activity.put(("audio", event))
+            ),
         ]
         return self
 
@@ -76,13 +91,14 @@ class PipelineObserver:
         for unsubscribe in self._unsubscribe:
             unsubscribe()
         self._audio_transport.stop()
+        self._audio_complete_transport.stop()
         self._answer_transport.stop()
         self._transcript_transport.stop()
 
     def reset(self) -> None:
         _drain_queue(self._transcripts)
         _drain_queue(self._answers)
-        _drain_queue(self._audio)
+        _drain_queue(self._audio_activity)
 
     def wait_for_transcript(self, timeout_sec: float) -> str:
         try:
@@ -106,23 +122,11 @@ class PipelineObserver:
         first_chunk_timeout_sec: float,
         idle_sec: float,
     ) -> tuple[int, float]:
-        try:
-            first = self._audio.get(timeout=first_chunk_timeout_sec)
-        except queue.Empty as exc:
-            raise PipelineTimeoutError(
-                "No answer audio was published to /operator_audio within "
-                f"{first_chunk_timeout_sec:g}s"
-            ) from exc
-
-        chunks = 1
-        duration_sec = _audio_duration(first)
-        while True:
-            try:
-                event = self._audio.get(timeout=idle_sec)
-            except queue.Empty:
-                return chunks, duration_sec
-            chunks += 1
-            duration_sec += _audio_duration(event)
+        return _wait_for_answer_audio(
+            self._audio_activity,
+            first_chunk_timeout_sec=first_chunk_timeout_sec,
+            idle_sec=idle_sec,
+        )
 
 
 def _drain_queue(items: queue.Queue[Any]) -> None:
@@ -137,6 +141,48 @@ def _audio_duration(event: AudioEvent) -> float:
     if event.sample_rate <= 0 or event.channels <= 0:
         return 0.0
     return event.data.size / (event.sample_rate * event.channels)
+
+
+def _completion_metrics(event: InfodayAudioComplete) -> tuple[int, float]:
+    try:
+        chunks = int(event["audio_chunks"])
+        duration_sec = float(event["audio_duration_sec"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RuntimeError(f"Invalid {INFODAY_AUDIO_COMPLETE_TOPIC} event: {event!r}") from exc
+    if chunks <= 0 or duration_sec < 0:
+        raise RuntimeError(f"Invalid {INFODAY_AUDIO_COMPLETE_TOPIC} event: {event!r}")
+    return chunks, duration_sec
+
+
+def _wait_for_answer_audio(
+    activity: queue.Queue[AudioActivity],
+    *,
+    first_chunk_timeout_sec: float,
+    idle_sec: float,
+) -> tuple[int, float]:
+    """Wait for explicit completion, with legacy streamed-audio compatibility."""
+    try:
+        item = activity.get(timeout=first_chunk_timeout_sec)
+    except queue.Empty as exc:
+        raise PipelineTimeoutError(
+            f"No playback completion was published to {INFODAY_AUDIO_COMPLETE_TOPIC} "
+            f"within {first_chunk_timeout_sec:g}s"
+        ) from exc
+
+    if item[0] == "complete":
+        return _completion_metrics(item[1])
+
+    chunks = 1
+    duration_sec = _audio_duration(item[1])
+    while True:
+        try:
+            item = activity.get(timeout=idle_sec)
+        except queue.Empty:
+            return chunks, duration_sec
+        if item[0] == "complete":
+            return _completion_metrics(item[1])
+        chunks += 1
+        duration_sec += _audio_duration(item[1])
 
 
 def _natural_sort_key(path: Path) -> tuple[str, ...]:
@@ -292,7 +338,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=DEFAULT_AUDIO_IDLE_SEC,
         help=(
-            "Seconds without /operator_audio before an answer is considered complete "
+            "Legacy /operator_audio idle timeout when no explicit completion event is available "
             f"(default: {DEFAULT_AUDIO_IDLE_SEC:g})."
         ),
     )

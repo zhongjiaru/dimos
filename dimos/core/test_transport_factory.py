@@ -85,6 +85,7 @@ def test_default_zenoh_qos_agent_channels_never_drop() -> None:
     assert default_zenoh_qos("/human_input") == QOS_NEVER_DROP
     assert default_zenoh_qos("/infoday_input") == QOS_NEVER_DROP
     assert default_zenoh_qos("/infoday_answer") == QOS_NEVER_DROP
+    assert default_zenoh_qos("/infoday_audio_complete") == QOS_NEVER_DROP
     assert default_zenoh_qos("/agent") == QOS_NEVER_DROP
     assert default_zenoh_qos("/agent_idle") == QOS_NEVER_DROP
 

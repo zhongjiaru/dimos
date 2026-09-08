@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# ruff: noqa: RUF001
+
 from __future__ import annotations
 
 from collections.abc import Iterator
@@ -26,6 +28,7 @@ from openai import OpenAI
 from pydantic import Field
 
 from dimos.agents.annotation import skill
+from dimos.agents.infoday_events import InfodayAudioComplete
 from dimos.agents.skills.polyu_knowledge import PolyUKnowledgeSkill
 from dimos.core.core import rpc
 from dimos.core.module import Module, ModuleConfig
@@ -33,6 +36,7 @@ from dimos.core.stream import Out
 from dimos.stream.audio.base import AudioEvent
 from dimos.stream.audio.tts.node_canto_tts import CantoTTSNode
 from dimos.stream.audio.tts.node_cosyvoice3 import CosyVoice3TTSNode, CosyVoiceAudioFormat
+from dimos.teleop.hosted.go2_audio_bridge_spec import Go2AudioBridgeSpec
 from dimos.utils.logging_config import setup_logger
 
 logger = setup_logger()
@@ -46,12 +50,17 @@ Do not use Mainland Mandarin written style. Avoid phrases like 因此、此外�
 Use concise spoken Cantonese phrases like 呢個、可以、如果你想知、我哋、會、係.
 Keep official English names unchanged when needed, for example PolyU, EEE, BEng(Hons), BSc(Hons).
 Base the answer only on the provided official offline knowledge context.
-If the context is insufficient, say briefly in Cantonese that the current offline official materials do not include that detail.
-Answer in exactly one short spoken sentence, ideally under 50 Chinese characters.
+If the context is insufficient, say briefly in Cantonese that the current official offline materials do not include that detail, then suggest a topic you can answer.
+Answer in exactly two short spoken sentences, ideally under 80 Chinese characters in total.
+The first sentence must answer the question directly. The second must invite one relevant next interaction with at most two concrete choices.
+Avoid generic endings such as 仲有咩可以幫你. Vary the invitation to fit the topic.
 """.strip()
 
-INFODAY_IDENTITY_ANSWER = "我係理大 EEE 開放日嘅 Go2 機械人講解助手。"
-INFODAY_REPEAT_REQUEST = "唔好意思，我啱啱聽唔清楚，可以麻煩你再講一次嗎？"  # noqa: RUF001
+INFODAY_IDENTITY_ANSWER = (
+    "我係理大 EEE 開放日嘅 Go2 機械人講解助手。你想問下 EEE 嘅課程，定係睇我做個動作？"
+)
+INFODAY_REPEAT_REQUEST = "唔好意思，我啱啱聽唔清楚，可以麻煩你再講一次嗎？"
+INFODAY_ERROR_RESPONSE = "唔好意思，我而家答唔到呢條問題。你可以再講一次，或者問我 EEE 嘅課程。"
 _IDENTITY_TERMS = (
     "你是誰",
     "你是谁",
@@ -71,6 +80,12 @@ _IDENTITY_TERMS = (
     "introduce yourself",
 )
 _GREETING_TERMS = ("你好", "hello", "hi", "早晨", "午安", "晚上好")
+
+
+def _audio_duration(event: AudioEvent) -> float:
+    if event.sample_rate <= 0 or event.channels <= 0:
+        return 0.0
+    return event.data.size / (event.sample_rate * event.channels)
 
 
 class _TTSNode(Protocol):
@@ -98,6 +113,11 @@ class InfodayVoiceAnswerConfig(ModuleConfig):
     min_tts_chunk_chars: int = 24
     max_tts_chunk_chars: int = 45
     tts_queue_timeout_sec: float = 120.0
+    # Whole-answer mode is useful when comparing a complete local preview with Go2.
+    wait_for_audio_playback: bool = False
+    # Low-latency mode enqueues each TTS event immediately, then waits only at the end.
+    stream_audio_playback: bool = False
+    playback_completion_margin_sec: float = 5.0
     # canto-tts 0.1.x treats this as a local ONNX bundle path. None activates
     # the SDK's Hugging Face download for typangaa/canto-tts-nano.
     canto_tts_checkpoint: str | None = None
@@ -108,7 +128,9 @@ class InfodayVoiceAnswerSkill(Module):
 
     config: InfodayVoiceAnswerConfig
     polyu_knowledge: PolyUKnowledgeSkill
+    audio_bridge: Go2AudioBridgeSpec
     infoday_answer: Out[str]
+    infoday_audio_complete: Out[InfodayAudioComplete]
     operator_audio: Out[AudioEvent]
 
     _audio_lock: threading.Lock
@@ -155,25 +177,33 @@ class InfodayVoiceAnswerSkill(Module):
         Args:
             question: The user's original question.
         """
-        if self._client is None:
-            return "Error: response LLM is not initialized"
         clean_question = question.strip()
         if not clean_question:
-            return "Error: question is empty"
+            return self.ask_user_to_repeat()
+        if self._client is None:
+            self.speak_message(INFODAY_ERROR_RESPONSE)
+            return "Error: response LLM is not initialized"
 
         with self._audio_lock:
             fast_answer = _fast_infoday_answer(clean_question)
             if fast_answer is not None:
-                self.infoday_answer.publish(fast_answer)
                 try:
-                    self._stream_text_to_speaker(fast_answer)
+                    self._speak_locked(fast_answer)
                 except Exception as exc:
                     logger.error("InfoDay fast answer TTS failed", error=str(exc), text=fast_answer)
                     return f"Error answering Info Day question: {exc}"
                 return f"Answered Info Day question in Cantonese: {clean_question}"
 
             answer_started_at = time.monotonic()
-            knowledge = self.polyu_knowledge.search_polyu_knowledge(clean_question)
+            try:
+                knowledge = self.polyu_knowledge.search_polyu_knowledge(clean_question)
+            except Exception as exc:
+                logger.exception("InfoDay knowledge lookup failed", question=clean_question)
+                try:
+                    self._speak_locked(INFODAY_ERROR_RESPONSE)
+                except Exception:
+                    logger.exception("InfoDay fallback speech failed")
+                return f"Error answering Info Day question: {exc}"
             logger.info(
                 "InfoDay knowledge lookup complete",
                 duration_ms=round((time.monotonic() - answer_started_at) * 1000.0, 1),
@@ -181,14 +211,16 @@ class InfodayVoiceAnswerSkill(Module):
             tts_node = self._get_tts_node()
             tts_chunks: queue.Queue[str | None] = queue.Queue()
             errors: queue.Queue[Exception] = queue.Queue()
+            playback_events: list[AudioEvent] = []
             worker = threading.Thread(
                 target=self._tts_worker,
-                args=(tts_node, tts_chunks, errors),
+                args=(tts_node, tts_chunks, errors, playback_events),
                 daemon=True,
                 name="InfodayVoiceAnswerSkill-tts",
             )
             worker.start()
 
+            answer_text = ""
             try:
                 chunker = _TextChunker(
                     min_chars=self.config.min_tts_chunk_chars,
@@ -224,7 +256,14 @@ class InfodayVoiceAnswerSkill(Module):
                     tts_chunks.put(text_chunk)
                 answer_text = "".join(answer_parts).strip()
                 if answer_text:
+                    logger.info(
+                        "InfoDay LLM answer",
+                        answer=answer_text,
+                        text_chars=len(answer_text),
+                    )
                     self.infoday_answer.publish(answer_text)
+                else:
+                    errors.put(RuntimeError("response LLM returned an empty answer"))
             except Exception as exc:
                 logger.error("InfoDay response streaming failed", error=str(exc))
                 errors.put(exc)
@@ -234,19 +273,32 @@ class InfodayVoiceAnswerSkill(Module):
 
             if worker.is_alive():
                 return "Error: timed out while streaming Info Day answer"
+            if self.config.stream_audio_playback and errors.empty():
+                try:
+                    self._finish_streamed_audio(playback_events)
+                except Exception as exc:
+                    errors.put(exc)
+            elif self.config.wait_for_audio_playback and errors.empty():
+                try:
+                    self._play_audio_and_wait(playback_events)
+                except Exception as exc:
+                    errors.put(exc)
             try:
                 error = errors.get_nowait()
             except queue.Empty:
                 return f"Answered Info Day question in Cantonese: {clean_question}"
+            try:
+                self._speak_locked(INFODAY_ERROR_RESPONSE)
+            except Exception:
+                logger.exception("InfoDay fallback speech failed")
             return f"Error answering Info Day question: {error}"
 
     @rpc
     def ask_user_to_repeat(self) -> str:
         """Ask the user to repeat an Info Day question that ASR did not capture."""
         with self._audio_lock:
-            self.infoday_answer.publish(INFODAY_REPEAT_REQUEST)
             try:
-                self._stream_text_to_speaker(INFODAY_REPEAT_REQUEST)
+                self._speak_locked(INFODAY_REPEAT_REQUEST)
             except Exception as exc:
                 logger.error(
                     "InfoDay repeat request TTS failed",
@@ -256,13 +308,50 @@ class InfodayVoiceAnswerSkill(Module):
                 return f"Error asking user to repeat: {exc}"
         return "Asked user to repeat the Info Day question"
 
-    def _stream_text_to_speaker(self, text: str) -> None:
-        self._publish_tts_chunk(self._get_tts_node(), text)
+    @rpc
+    def speak_message(self, text: str) -> str:
+        """Speak one Info Day interaction message through the Go2 speaker."""
+        clean_text = text.strip()
+        if not clean_text:
+            return "Error: no text to speak"
+        with self._audio_lock:
+            try:
+                self._speak_locked(clean_text)
+            except Exception as exc:
+                logger.error("InfoDay message TTS failed", error=str(exc), text=clean_text)
+                return f"Error speaking Info Day message: {exc}"
+        return f"Spoke Info Day message: {clean_text}"
 
-    def _publish_tts_chunk(self, tts_node: _TTSNode, text: str) -> None:
+    def _speak_locked(self, text: str) -> None:
+        self.infoday_answer.publish(text)
+        self._stream_text_to_speaker(text)
+
+    def _stream_text_to_speaker(self, text: str) -> None:
+        audio_events = self._publish_tts_chunk(
+            self._get_tts_node(),
+            text,
+            publish_audio=not (
+                self.config.wait_for_audio_playback or self.config.stream_audio_playback
+            ),
+            play_audio_immediately=self.config.stream_audio_playback,
+        )
+        if self.config.stream_audio_playback:
+            self._finish_streamed_audio(audio_events)
+        elif self.config.wait_for_audio_playback:
+            self._play_audio_and_wait(audio_events)
+
+    def _publish_tts_chunk(
+        self,
+        tts_node: _TTSNode,
+        text: str,
+        *,
+        publish_audio: bool = True,
+        play_audio_immediately: bool = False,
+    ) -> list[AudioEvent]:
         started_at = time.monotonic()
         audio_chunks = 0
         audio_duration_sec = 0.0
+        audio_events: list[AudioEvent] = []
         for audio_event in tts_node.iter_audio_events(text):
             channels = max(1, audio_event.channels)
             if audio_chunks == 0:
@@ -273,10 +362,14 @@ class InfodayVoiceAnswerSkill(Module):
                     chunk_samples=audio_event.data.size // channels,
                     sample_rate=audio_event.sample_rate,
                 )
-            self.operator_audio.publish(audio_event)
+            audio_events.append(audio_event)
+            if play_audio_immediately:
+                if not self.audio_bridge.play_audio([audio_event], wait_for_playback=False):
+                    raise RuntimeError("Go2 audio bridge failed to enqueue streaming audio")
+            elif publish_audio:
+                self.operator_audio.publish(audio_event)
             audio_chunks += 1
-            if audio_event.sample_rate > 0 and audio_event.channels > 0:
-                audio_duration_sec += audio_event.data.size / (audio_event.sample_rate * channels)
+            audio_duration_sec += _audio_duration(audio_event)
         logger.info(
             "InfoDay TTS complete",
             duration_ms=round((time.monotonic() - started_at) * 1000.0, 1),
@@ -284,8 +377,35 @@ class InfodayVoiceAnswerSkill(Module):
             audio_chunks=audio_chunks,
             audio_duration_ms=round(audio_duration_sec * 1000.0, 1),
         )
+        return audio_events
 
-    def _stream_response(self, question: str, knowledge: str):
+    def _play_audio_and_wait(self, audio_events: list[AudioEvent]) -> None:
+        if not audio_events:
+            raise RuntimeError("TTS returned no audio to play")
+        if not self.audio_bridge.play_audio(audio_events, wait_for_playback=True):
+            raise RuntimeError("Go2 audio bridge failed to complete playback")
+        completion = InfodayAudioComplete(
+            audio_chunks=len(audio_events),
+            audio_duration_sec=sum(_audio_duration(event) for event in audio_events),
+        )
+        self.infoday_audio_complete.publish(completion)
+        logger.info("InfoDay answer audio playback complete", **completion)
+
+    def _finish_streamed_audio(self, audio_events: list[AudioEvent]) -> None:
+        if not audio_events:
+            raise RuntimeError("TTS returned no audio to play")
+        audio_duration_sec = sum(_audio_duration(event) for event in audio_events)
+        timeout = audio_duration_sec + self.config.playback_completion_margin_sec
+        if not self.audio_bridge.finish_audio_playback(timeout):
+            raise RuntimeError("Go2 audio bridge failed to complete streaming playback")
+        completion = InfodayAudioComplete(
+            audio_chunks=len(audio_events),
+            audio_duration_sec=audio_duration_sec,
+        )
+        self.infoday_audio_complete.publish(completion)
+        logger.info("InfoDay answer audio playback complete", **completion)
+
+    def _stream_response(self, question: str, knowledge: str) -> Iterator[str]:
         if self._client is None:
             raise RuntimeError("response LLM is not initialized")
         request: dict[str, Any] = {
@@ -360,13 +480,23 @@ class InfodayVoiceAnswerSkill(Module):
         tts_node: _TTSNode,
         tts_chunks: queue.Queue[str | None],
         errors: queue.Queue[Exception],
+        playback_events: list[AudioEvent],
     ) -> None:
         while True:
             text = tts_chunks.get()
             if text is None:
                 return
             try:
-                self._publish_tts_chunk(tts_node, text)
+                playback_events.extend(
+                    self._publish_tts_chunk(
+                        tts_node,
+                        text,
+                        publish_audio=not (
+                            self.config.wait_for_audio_playback or self.config.stream_audio_playback
+                        ),
+                        play_audio_immediately=self.config.stream_audio_playback,
+                    )
+                )
             except Exception as exc:
                 logger.error("InfoDay TTS streaming failed", error=str(exc), text=text)
                 errors.put(exc)
