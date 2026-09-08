@@ -28,12 +28,13 @@ import wave
 import numpy as np
 from numpy.typing import NDArray
 from reactivex.disposable import Disposable
+import sounddevice as sd  # type: ignore[import-untyped]
 from unitree_webrtc_connect.constants import AUDIO_API, RTC_TOPIC
 
 from dimos.core.core import rpc
 from dimos.core.module import Module, ModuleConfig
 from dimos.core.stream import In
-from dimos.robot.unitree.audio_track import GO2_AUDIO_SAMPLE_RATE
+from dimos.robot.unitree.audio_track import GO2_AUDIO_FRAME_SAMPLES, GO2_AUDIO_SAMPLE_RATE
 from dimos.robot.unitree.go2.connection_spec import GO2ConnectionSpec
 from dimos.stream.audio.base import AudioEvent
 from dimos.utils.logging_config import setup_logger
@@ -66,6 +67,10 @@ class Go2AudioBridgeConfig(ModuleConfig):
     target_peak: int = 12000
     max_gain: float = 128.0
     noise_gate_peak: int = 32
+    debug_local_playback: bool = False
+    debug_local_device: int | None = None
+    debug_robot_playback_timeout_sec: float = 5.0
+    webrtc_rpc_chunk_ms: int = 250
 
 
 class Go2AudioBridgeModule(Module):
@@ -208,40 +213,100 @@ class Go2AudioBridgeModule(Module):
             self._speaker_available = True
         return self._speaker_available
 
-    def _flush(self, frames: list[NDArray[np.int16]]) -> None:
-        if not frames or not self._ensure_speaker():
-            return
+    @rpc
+    def play_audio(
+        self,
+        audio_events: list[AudioEvent],
+        wait_for_playback: bool = True,
+    ) -> bool:
+        """Play complete audio locally for debugging, then send it to Go2."""
+        frames = [
+            self._to_mono_target_rate(
+                audio_event,
+                target_sample_rate=self.config.target_sample_rate,
+            )
+            for audio_event in audio_events
+        ]
+        return self._flush(
+            [frame for frame in frames if frame.size],
+            wait_for_playback=wait_for_playback,
+        )
+
+    @rpc
+    def finish_audio_playback(self, timeout: float) -> bool:
+        """Wait until all previously queued Go2 WebRTC audio has played."""
+        if not self._ensure_speaker():
+            return False
+        if self.config.speaker_backend != "webrtc":
+            return True
+        logger.info("Waiting for Go2 audio playback to finish", timeout_sec=round(timeout, 1))
+        try:
+            if not self.go2.wait_audio_drained(timeout=timeout):
+                logger.warning(
+                    "Timed out waiting for Go2 audio playback",
+                    timeout_sec=round(timeout, 1),
+                )
+                return False
+            logger.info("Go2 audio playback finished")
+            return True
+        finally:
+            if self.config.speaker == "auto":
+                # SDP direction alone does not reflect whether Go2 firmware has
+                # since closed its audio channel. Re-arm it on the next turn.
+                self._speaker_available = None
+
+    def _flush(
+        self,
+        frames: list[NDArray[np.int16]],
+        *,
+        wait_for_playback: bool = False,
+    ) -> bool:
+        if not frames:
+            return False
         pcm = np.concatenate(frames).astype(np.int16, copy=False)
         pcm = self._normalize_level(pcm)
         if pcm.size == 0:
-            return
+            return False
+        if self.config.debug_local_playback:
+            self._play_debug_audio_locally(pcm)
+        if not self._ensure_speaker():
+            return False
         try:
             if self.config.speaker_backend == "webrtc":
-                event = AudioEvent(
-                    data=pcm,
-                    sample_rate=self.config.target_sample_rate,
-                    timestamp=time.time(),
-                    channels=1,
-                )
-                if not self.go2.enqueue_audio(event):
+                if not self._enqueue_webrtc_pcm(pcm):
                     raise RuntimeError("Go2 WebRTC speaker queue rejected audio")
+                if self.config.debug_local_playback or wait_for_playback:
+                    audio_duration_sec = pcm.size / self.config.target_sample_rate
+                    timeout = audio_duration_sec + self.config.debug_robot_playback_timeout_sec
+                    logger.info(
+                        "Go2 audio playback starting",
+                        duration_sec=round(audio_duration_sec, 2),
+                        timeout_sec=round(timeout, 1),
+                    )
+                    if not self.go2.wait_audio_drained(timeout=timeout):
+                        logger.warning(
+                            "Timed out waiting for Go2 audio playback",
+                            timeout_sec=round(timeout, 1),
+                        )
+                        return False
+                    logger.info("Go2 audio playback finished")
                 logger.debug(
                     "Go2 WebRTC speaker audio queued",
                     duration_ms=round(pcm.size / self.config.target_sample_rate * 1000.0, 1),
                     sample_rate=self.config.target_sample_rate,
                     samples=pcm.size,
                 )
-                return
+                return True
             if not self._megaphone_active:
                 self._request(ENTER_MEGAPHONE)
                 self._megaphone_active = True
                 if self._stop_event.is_set():
                     self._exit_megaphone()
-                    return
+                    return False
                 if self.config.megaphone_enter_delay_sec > 0:
                     if self._stop_event.wait(self.config.megaphone_enter_delay_sec):
                         self._exit_megaphone()
-                        return
+                        return False
             wav_data = self._wav_bytes(pcm, sample_rate=self.config.target_sample_rate)
             logger.info(
                 "Go2 speaker audio upload starting",
@@ -250,17 +315,75 @@ class Go2AudioBridgeModule(Module):
                 wav_bytes=len(wav_data),
             )
             self._upload_wav(wav_data)
-            if self.config.wait_for_playback:
+            if self.config.wait_for_playback or wait_for_playback:
                 audio_duration_sec = pcm.size / self.config.target_sample_rate
                 if self._stop_event.wait(audio_duration_sec + self.config.playback_tail_sec):
                     self._exit_megaphone()
-                    return
+                    return False
             logger.info("Go2 speaker audio upload finished")
+            return True
         except Exception:
             logger.warning("Go2 speaker audio send failed", exc_info=True)
             self._exit_megaphone()
             if self.config.speaker == "auto":
                 self._speaker_available = False
+            return False
+
+    def _enqueue_webrtc_pcm(self, pcm: NDArray[np.int16]) -> bool:
+        """Send bounded RPC payloads while keeping one continuous Go2 queue."""
+        chunk_samples = max(
+            GO2_AUDIO_FRAME_SAMPLES,
+            self.config.target_sample_rate * self.config.webrtc_rpc_chunk_ms // 1000,
+        )
+        chunk_count = (pcm.size + chunk_samples - 1) // chunk_samples
+        started_at = time.time()
+        logger.info(
+            "Go2 WebRTC audio enqueue starting",
+            audio_chunks=chunk_count,
+            chunk_samples=chunk_samples,
+            total_samples=pcm.size,
+        )
+        for index, offset in enumerate(range(0, pcm.size, chunk_samples), start=1):
+            event = AudioEvent(
+                data=pcm[offset : offset + chunk_samples],
+                sample_rate=self.config.target_sample_rate,
+                timestamp=started_at + offset / self.config.target_sample_rate,
+                channels=1,
+            )
+            if not self.go2.enqueue_audio(event):
+                logger.warning(
+                    "Go2 WebRTC audio enqueue rejected",
+                    audio_chunk=index,
+                    audio_chunks=chunk_count,
+                    chunk_samples=event.data.size,
+                )
+                return False
+        logger.info(
+            "Go2 WebRTC audio enqueue complete",
+            audio_chunks=chunk_count,
+            total_samples=pcm.size,
+        )
+        return True
+
+    def _play_debug_audio_locally(self, pcm: NDArray[np.int16]) -> None:
+        duration_sec = pcm.size / self.config.target_sample_rate
+        logger.info(
+            "Local debug audio playback starting",
+            duration_sec=round(duration_sec, 2),
+            sample_rate=self.config.target_sample_rate,
+            samples=pcm.size,
+        )
+        try:
+            sd.play(
+                pcm,
+                samplerate=self.config.target_sample_rate,
+                device=self.config.debug_local_device,
+                blocking=True,
+            )
+        except Exception:
+            logger.warning("Local debug audio playback failed; continuing to Go2", exc_info=True)
+        else:
+            logger.info("Local debug audio playback finished")
 
     def _upload_wav(self, wav_data: bytes) -> None:
         encoded = base64.b64encode(wav_data).decode("ascii")

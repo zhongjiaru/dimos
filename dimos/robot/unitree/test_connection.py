@@ -114,7 +114,21 @@ def test_connect_success_completes_setup(built_connection: Any) -> None:
     _conn, driver = built_connection
 
     driver.connect.assert_awaited_once()
+    driver.datachannel.disableTrafficSaving.assert_awaited_once_with(True)
     driver.datachannel.pub_sub.publish_request_new.assert_awaited_once()
+
+
+def test_connect_keeps_traffic_saving_enabled_when_lidar_is_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    driver = _stub_driver()
+    monkeypatch.setattr(conn_mod, "LegionConnection", MagicMock(return_value=driver))
+
+    connection = UnitreeWebRTCConnection(ip="10.0.0.99", lidar_enabled=False)
+    try:
+        driver.datachannel.disableTrafficSaving.assert_awaited_once_with(False)
+    finally:
+        connection.stop()
 
 
 def test_video_track_end_completes_stream_without_callback_error(built_connection: Any) -> None:
@@ -167,6 +181,11 @@ def test_audio_output_attaches_and_queues_on_webrtc_loop(
 
     track_factory.assert_called_once_with()
     driver.pc.addTrack.assert_called_once_with(track)
+    assert driver.audio.switchAudioChannel.call_args_list == [
+        call(True),
+        call(True),
+        call(False),
+    ]
     assert add_track_thread == [connection.thread.ident]
     track.enqueue.assert_called_once()
     track.stop.assert_called_once_with()

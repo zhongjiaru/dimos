@@ -155,6 +155,7 @@ class UnitreeWebRTCConnection(Resource):
         aes_128_key: str | None = None,
         velocity_api: bool = False,
         audio_output: bool = False,
+        lidar_enabled: bool = True,
     ) -> None:
         self.ip = ip
         self.mode = mode
@@ -162,7 +163,9 @@ class UnitreeWebRTCConnection(Resource):
         self.cmd_vel_timeout = 0.2
         self._velocity_api = velocity_api
         self._audio_output_enabled = audio_output
+        self._lidar_enabled = lidar_enabled
         self._audio_output_available = False
+        self._audio_channel_enabled = False
         self._audio_track: QueuedGo2AudioTrack | None = None
         self._move_ids = SequentialIds()
         self._stop_lock = threading.Lock()
@@ -188,8 +191,10 @@ class UnitreeWebRTCConnection(Resource):
                 direction = transceiver.currentDirection if transceiver is not None else None
                 self._audio_output_available = direction in ("sendonly", "sendrecv")
                 if self._audio_output_available:
+                    self.conn.audio.switchAudioChannel(True)
+                    self._audio_channel_enabled = True
                     logger.info(
-                        "Go2 WebRTC speaker track attached",
+                        "Go2 WebRTC speaker track attached and audio channel enabled",
                         direction=direction,
                         sample_rate=GO2_AUDIO_SAMPLE_RATE,
                     )
@@ -198,7 +203,7 @@ class UnitreeWebRTCConnection(Resource):
                         "Go2 WebRTC peer did not negotiate speaker audio",
                         direction=direction,
                     )
-            await self.conn.datachannel.disableTrafficSaving(True)
+            await self.conn.datachannel.disableTrafficSaving(self._lidar_enabled)
 
             self.conn.datachannel.set_decoder(decoder_type="native")
 
@@ -248,6 +253,12 @@ class UnitreeWebRTCConnection(Resource):
                 self.stop_timer = None
 
             async def async_disconnect() -> None:
+                if self._audio_channel_enabled:
+                    try:
+                        self.conn.audio.switchAudioChannel(False)
+                    except Exception:
+                        logger.warning("Failed to disable Go2 WebRTC audio channel", exc_info=True)
+                    self._audio_channel_enabled = False
                 if self._audio_track is not None:
                     self._audio_track.stop()
                     self._audio_track = None
@@ -272,7 +283,21 @@ class UnitreeWebRTCConnection(Resource):
                 self._stopped = True
 
     def audio_output_available(self) -> bool:
-        return self._audio_output_available
+        if not self._audio_output_available or not self.loop.is_running():
+            return False
+
+        async def reenable_audio_channel() -> None:
+            self.conn.audio.switchAudioChannel(True)
+
+        try:
+            future = asyncio.run_coroutine_threadsafe(reenable_audio_channel(), self.loop)
+            future.result(timeout=2.0)
+        except Exception:
+            logger.warning("Failed to re-enable Go2 WebRTC audio channel", exc_info=True)
+            return False
+        self._audio_channel_enabled = True
+        logger.info("Go2 WebRTC audio channel re-enabled for playback")
+        return True
 
     def enqueue_audio(self, event: AudioEvent) -> bool:
         track = self._audio_track

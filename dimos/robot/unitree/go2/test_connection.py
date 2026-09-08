@@ -51,6 +51,7 @@ def test_make_connection_webrtc_forwards_aes_128_key(stub_webrtc: MagicMock) -> 
         aes_128_key="cafe" * 8,
         velocity_api=False,
         audio_output=False,
+        lidar_enabled=True,
     )
 
 

@@ -69,6 +69,8 @@ class ConnectionConfig(ModuleConfig):
     mode: Go2Mode = Go2Mode.DEFAULT
     lidar: bool = True
     camera: bool = True
+    odom: bool = True
+    lowstate: bool = True
     velocity_api: bool = False
     audio_output: bool = False
     go2_volume: int | None = Field(
@@ -150,6 +152,7 @@ def make_connection(
     aes_128_key: str | None = None,
     velocity_api: bool = False,
     audio_output: bool = False,
+    lidar_enabled: bool = True,
 ) -> Go2ConnectionProtocol:
     connection_type = cfg.unitree_connection_type.lower()
 
@@ -171,6 +174,7 @@ def make_connection(
             aes_128_key=aes_128_key,
             velocity_api=velocity_api,
             audio_output=audio_output,
+            lidar_enabled=lidar_enabled,
         )
     else:
         raise ValueError(f"Unknown simulator {cfg.simulation!r}. Choose from: mujoco, dimsim")
@@ -333,6 +337,7 @@ class GO2Connection(Module, Camera, Pointcloud):
             aes_128_key=self.config.aes_128_key,
             velocity_api=self.config.velocity_api,
             audio_output=self.config.audio_output,
+            lidar_enabled=self.config.lidar,
         )
 
         if self.config.go2_volume is not None:
@@ -373,8 +378,10 @@ class GO2Connection(Module, Camera, Pointcloud):
 
         if self.config.lidar:
             self.register_disposable(self.connection.lidar_stream().subscribe(self.lidar.publish))
-        self.register_disposable(self.connection.odom_stream().subscribe(self._publish_tf))
-        self.register_disposable(self.connection.lowstate_stream().subscribe(self._on_lowstate))
+        if self.config.odom:
+            self.register_disposable(self.connection.odom_stream().subscribe(self._publish_tf))
+        if self.config.lowstate:
+            self.register_disposable(self.connection.lowstate_stream().subscribe(self._on_lowstate))
         self.register_disposable(Disposable(self.cmd_vel.subscribe(self.move)))
 
         if self.config.camera:
