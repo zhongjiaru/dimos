@@ -33,7 +33,7 @@ from dimos.agents.annotation import skill
 from dimos.agents.capabilities import CapabilityRegistry
 from dimos.agents.mcp import tool_stream
 from dimos.core.core import rpc
-from dimos.core.module import Module
+from dimos.core.module import Module, ModuleConfig
 from dimos.core.rpc_client import RpcCall, RPCClient
 from dimos.core.transport_factory import make_transport
 from dimos.utils.logging_config import setup_logger
@@ -51,6 +51,7 @@ _SSE_KEEPALIVE_INTERVAL = 20.0  # seconds
 # Background holders run until stopped, so they are never waited on (see
 # `_can_wait` in `_handle_tools_call`).
 DEFAULT_CAP_ACQUIRE_TIMEOUT = 30.0  # seconds
+_ADMIN_TOOL_NAMES = frozenset({"server_status", "list_modules", "agent_send"})
 
 app = FastAPI()
 app.add_middleware(
@@ -344,7 +345,12 @@ async def mcp_sse_endpoint() -> StreamingResponse:
     )
 
 
+class McpServerConfig(ModuleConfig):
+    exposed_tools: list[str] | None = None
+
+
 class McpServer(Module):
+    config: McpServerConfig
     _uvicorn_server: uvicorn.Server | None = None
     _serve_future: concurrent.futures.Future[None] | None = None
     _tool_stream_cleanup: Callable[[], None] | None = None
@@ -381,15 +387,32 @@ class McpServer(Module):
     def on_system_modules(self, modules: list[RPCClient]) -> None:
         # TODO: this is a bit hacky, also not thread-safe
         assert self.rpc is not None
-        app.state.skills = [
+        all_skills = [
             skill_info for module in modules for skill_info in (module.get_skills() or [])
         ]
-        app.state.skills_by_name = {s.func_name: s for s in app.state.skills}
+        skills_by_name = {skill_info.func_name: skill_info for skill_info in all_skills}
+        if self.config.exposed_tools is None:
+            exposed_skills = all_skills
+            callable_skills = all_skills
+        else:
+            missing = [name for name in self.config.exposed_tools if name not in skills_by_name]
+            if missing:
+                raise RuntimeError(f"Required MCP tools were not found: {missing}")
+            exposed_skills = [skills_by_name[name] for name in self.config.exposed_tools]
+            callable_skills = [
+                skill_info
+                for skill_info in all_skills
+                if skill_info.func_name in self.config.exposed_tools
+                or skill_info.func_name in _ADMIN_TOOL_NAMES
+            ]
+
+        app.state.skills = exposed_skills
+        app.state.skills_by_name = {s.func_name: s for s in callable_skills}
         app.state.rpc_calls = {
             skill_info.func_name: RpcCall(
                 None, self.rpc, skill_info.func_name, skill_info.class_name, []
             )
-            for skill_info in app.state.skills
+            for skill_info in callable_skills
         }
 
     @skill

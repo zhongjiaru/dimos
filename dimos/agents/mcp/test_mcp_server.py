@@ -15,12 +15,15 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Iterator
 import json
 import threading
 from unittest.mock import MagicMock
 
+import pytest
+
 from dimos.agents.capabilities import CapabilityRegistry
-from dimos.agents.mcp.mcp_server import app, handle_request
+from dimos.agents.mcp.mcp_server import McpServer, app, handle_request
 from dimos.core.module import SkillInfo
 
 
@@ -37,6 +40,48 @@ def _make_rpc_calls(
             mock_call.return_value = None
         rpc_calls[skill.func_name] = mock_call
     return rpc_calls
+
+
+@pytest.fixture
+def filtered_mcp_server() -> Iterator[McpServer]:
+    saved_skills = app.state.skills
+    saved_skills_by_name = app.state.skills_by_name
+    saved_rpc_calls = app.state.rpc_calls
+    server = McpServer(exposed_tools=["answer", "perform"])
+    try:
+        yield server
+    finally:
+        server.stop()
+        app.state.skills = saved_skills
+        app.state.skills_by_name = saved_skills_by_name
+        app.state.rpc_calls = saved_rpc_calls
+
+
+def test_mcp_server_lists_only_exposed_tools_but_keeps_admin_calls(
+    filtered_mcp_server: McpServer,
+) -> None:
+    schema = json.dumps({"type": "object", "properties": {}})
+    skills = [
+        SkillInfo(class_name="AnswerSkill", func_name="answer", args_schema=schema),
+        SkillInfo(class_name="ActionSkill", func_name="perform", args_schema=schema),
+        SkillInfo(class_name="HiddenSkill", func_name="hidden", args_schema=schema),
+        SkillInfo(class_name="McpServer", func_name="server_status", args_schema=schema),
+        SkillInfo(class_name="McpServer", func_name="list_modules", args_schema=schema),
+        SkillInfo(class_name="McpServer", func_name="agent_send", args_schema=schema),
+    ]
+    module = MagicMock()
+    module.get_skills.return_value = skills
+
+    filtered_mcp_server.on_system_modules([module])
+
+    assert [skill.func_name for skill in app.state.skills] == ["answer", "perform"]
+    assert set(app.state.rpc_calls) == {
+        "answer",
+        "perform",
+        "server_status",
+        "list_modules",
+        "agent_send",
+    }
 
 
 def test_mcp_module_request_flow() -> None:

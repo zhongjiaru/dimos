@@ -18,7 +18,7 @@ from queue import Empty
 from threading import RLock
 from unittest.mock import MagicMock, create_autospec, patch
 
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.messages.base import BaseMessage
 from langchain_openai import ChatOpenAI
 import pytest
@@ -118,6 +118,22 @@ def test_fetch_tools_from_mcp_server(mcp_client: McpClient) -> None:
     assert tools[1].name == "greet"
 
 
+def test_fetch_tools_applies_agent_allowlist(mcp_client: McpClient) -> None:
+    mcp_client.config.allowed_tools = ["greet"]
+
+    tools = mcp_client._fetch_tools()
+
+    assert [tool.name for tool in tools] == ["greet"]
+    assert set(mcp_client._tool_registry) == {"greet"}
+
+
+def test_fetch_tools_rejects_missing_required_tool(mcp_client: McpClient) -> None:
+    mcp_client.config.allowed_tools = ["missing"]
+
+    with pytest.raises(RuntimeError, match=r"Required MCP tools were not found: \['missing'\]"):
+        mcp_client._fetch_tools()
+
+
 def test_tool_invocation_via_mcp(mcp_client: McpClient) -> None:
     tools = mcp_client._fetch_tools()
     add_tool = next(t for t in tools if t.name == "add")
@@ -196,6 +212,61 @@ def test_tool_stream_progress_frame_becomes_human_message(mcp_client: McpClient)
     msg: BaseMessage = mcp_client._message_queue.get_nowait()
     assert isinstance(msg, HumanMessage)
     assert str(msg.content) == "[tool:follow_person] Found a person"
+
+
+def test_agent_processing_error_is_published_for_recovery(mcp_client: McpClient, mocker) -> None:  # type: ignore[no-untyped-def]
+    mcp_client._state_graph = MagicMock()
+    mcp_client.agent_error = MagicMock()
+    mcp_client.agent_idle = MagicMock()
+    mocker.patch.object(mcp_client, "_process_message", side_effect=RuntimeError("model failed"))
+
+    mcp_client._handle_queued_message(HumanMessage(content="hello"))
+
+    mcp_client.agent_error.publish.assert_called_once_with("model failed")
+    mcp_client.agent_idle.publish.assert_called_once_with(True)
+
+
+def test_required_tool_call_publishes_recovery_when_model_only_returns_text(
+    mcp_client: McpClient,
+) -> None:
+    mcp_client.config.require_tool_call = True
+    mcp_client.agent = MagicMock()
+    mcp_client.agent_error = MagicMock()
+    mcp_client.agent_idle = MagicMock()
+    state_graph = MagicMock()
+    state_graph.stream.return_value = [
+        {"model": {"messages": [AIMessage(content="text-only response")]}}
+    ]
+
+    mcp_client._process_message(state_graph, HumanMessage(content="hello"))
+
+    mcp_client.agent_error.publish.assert_called_once_with(
+        "Agent completed without calling an interaction tool"
+    )
+
+
+def test_required_tool_call_accepts_model_tool_invocation(mcp_client: McpClient) -> None:
+    mcp_client.config.require_tool_call = True
+    mcp_client.agent = MagicMock()
+    mcp_client.agent_error = MagicMock()
+    mcp_client.agent_idle = MagicMock()
+    state_graph = MagicMock()
+    state_graph.stream.return_value = [
+        {
+            "model": {
+                "messages": [
+                    AIMessage(
+                        content="",
+                        tool_calls=[{"name": "greet", "args": {"name": "visitor"}, "id": "call-1"}],
+                    )
+                ]
+            }
+        }
+    ]
+
+    mcp_client._process_message(state_graph, HumanMessage(content="hello"))
+
+    mcp_client.agent_error.publish.assert_not_called()
 
 
 def test_mcp_tool_call_sends_progress_token(mcp_client: McpClient) -> None:

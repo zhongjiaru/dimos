@@ -91,11 +91,14 @@ class McpClientConfig(ModuleConfig):
     reasoning_summary: str = "auto"
     model_fixture: str | None = None
     mcp_server_url: str = "http://localhost:9990/mcp"
+    allowed_tools: list[str] | None = None
+    require_tool_call: bool = False
 
 
 class McpClient(Module):
     config: McpClientConfig
     agent: Out[BaseMessage]
+    agent_error: Out[str]
     human_input: In[str]
     agent_idle: Out[bool]
 
@@ -183,6 +186,12 @@ class McpClient(Module):
             )
 
         raw_tools = result.get("tools", [])
+        if self.config.allowed_tools is not None:
+            tools_by_name = {tool["name"]: tool for tool in raw_tools}
+            missing = [name for name in self.config.allowed_tools if name not in tools_by_name]
+            if missing:
+                raise RuntimeError(f"Required MCP tools were not found: {missing}")
+            raw_tools = [tools_by_name[name] for name in self.config.allowed_tools]
         self._tool_registry = {t["name"]: t for t in raw_tools}
         tools = [self._mcp_tool_to_langchain(t) for t in raw_tools]
 
@@ -356,10 +365,18 @@ class McpClient(Module):
             except Empty:
                 continue
 
+            self._handle_queued_message(message)
+
+    def _handle_queued_message(self, message: BaseMessage) -> None:
+        try:
             with self._lock:
                 if not self._state_graph:
                     raise ValueError("No state graph initialized")
                 self._process_message(self._state_graph, message)
+        except Exception as exc:
+            logger.exception("Agent failed to process message")
+            self.agent_error.publish(str(exc))
+            self.agent_idle.publish(True)
 
     def _process_message(
         self, state_graph: CompiledStateGraph[Any, Any, Any, Any], message: BaseMessage
@@ -369,13 +386,18 @@ class McpClient(Module):
         pretty_print_langchain_message(message)
         self.agent.publish(message)
 
+        tool_called = False
         for update in state_graph.stream({"messages": self._history}, stream_mode="updates"):
             for node_output in update.values():
                 for msg in node_output.get("messages", []):
+                    if getattr(msg, "tool_calls", None):
+                        tool_called = True
                     self._history.append(msg)
                     pretty_print_langchain_message(msg)
                     self.agent.publish(msg)
 
+        if self.config.require_tool_call and not tool_called:
+            self.agent_error.publish("Agent completed without calling an interaction tool")
         if self._message_queue.empty():
             self.agent_idle.publish(True)
 
