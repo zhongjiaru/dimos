@@ -79,6 +79,7 @@ def test_infoday_blueprint_streams_audio_to_go2_without_local_debug_playback() -
     )
 
     assert bridge.kwargs["debug_local_playback"] is False
+    assert bridge.kwargs["webrtc_channel_warmup_sec"] == 0.15
     voice_answer = next(
         atom
         for atom in unitree_go2_infoday_agentic.blueprints

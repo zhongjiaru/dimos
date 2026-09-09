@@ -389,7 +389,7 @@ class InfodayVoiceAnswerSkill(Module):
             audio_duration_sec=sum(_audio_duration(event) for event in audio_events),
         )
         self.infoday_audio_complete.publish(completion)
-        logger.info("InfoDay answer audio playback complete", **completion)
+        logger.info("InfoDay answer audio delivery complete", **completion)
 
     def _finish_streamed_audio(self, audio_events: list[AudioEvent]) -> None:
         if not audio_events:
@@ -403,7 +403,7 @@ class InfodayVoiceAnswerSkill(Module):
             audio_duration_sec=audio_duration_sec,
         )
         self.infoday_audio_complete.publish(completion)
-        logger.info("InfoDay answer audio playback complete", **completion)
+        logger.info("InfoDay answer audio delivery complete", **completion)
 
     def _stream_response(self, question: str, knowledge: str) -> Iterator[str]:
         if self._client is None:

@@ -118,6 +118,7 @@ unitree_go2_infoday_agentic = autoconnect(
         max_gain=3.0,
         wait_for_playback=False,
         debug_local_playback=False,
+        webrtc_channel_warmup_sec=0.15,
     ),
     PolyUKnowledgeSkill.blueprint(
         knowledge_dir="/home/jiaru/infoday/knowledge",

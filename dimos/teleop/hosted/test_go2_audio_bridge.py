@@ -193,6 +193,46 @@ def test_auto_webrtc_speaker_is_rechecked_after_each_completed_turn() -> None:
     assert bridge.go2.audio_output_available.call_count == 2
 
 
+def test_auto_webrtc_speaker_retries_transient_unavailable_state() -> None:
+    bridge = AudioBridgeTestModule(
+        speaker="auto",
+        speaker_backend="webrtc",
+        target_sample_rate=GO2_AUDIO_SAMPLE_RATE,
+    )
+    bridge.go2 = MagicMock()
+    bridge.go2.audio_output_available.side_effect = [False, True]
+
+    try:
+        assert bridge._ensure_speaker() is False
+        assert bridge._speaker_available is None
+        assert bridge._ensure_speaker() is True
+    finally:
+        bridge.stop()
+
+    assert bridge.go2.audio_output_available.call_count == 2
+
+
+def test_auto_webrtc_speaker_retries_after_enqueue_failure() -> None:
+    bridge = AudioBridgeTestModule(
+        speaker="auto",
+        speaker_backend="webrtc",
+        target_sample_rate=GO2_AUDIO_SAMPLE_RATE,
+    )
+    bridge.go2 = MagicMock()
+    bridge.go2.audio_output_available.return_value = True
+    bridge.go2.enqueue_audio.side_effect = [False, True]
+    pcm = np.full(GO2_AUDIO_FRAME_SAMPLES, 100, dtype=np.int16)
+
+    try:
+        assert bridge._flush([pcm]) is False
+        assert bridge._speaker_available is None
+        assert bridge._flush([pcm]) is True
+    finally:
+        bridge.stop()
+
+    assert bridge.go2.audio_output_available.call_count == 2
+
+
 def test_debug_playback_plays_final_pcm_locally_before_go2(mocker) -> None:  # type: ignore[no-untyped-def]
     bridge = AudioBridgeTestModule(
         speaker="enabled",

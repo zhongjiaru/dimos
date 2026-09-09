@@ -71,6 +71,7 @@ class Go2AudioBridgeConfig(ModuleConfig):
     debug_local_device: int | None = None
     debug_robot_playback_timeout_sec: float = 5.0
     webrtc_rpc_chunk_ms: int = 250
+    webrtc_channel_warmup_sec: float = 0.0
 
 
 class Go2AudioBridgeModule(Module):
@@ -193,16 +194,23 @@ class Go2AudioBridgeModule(Module):
             return self._speaker_available
         if self.config.speaker_backend == "webrtc":
             try:
-                self._speaker_available = self.go2.audio_output_available()
+                available = self.go2.audio_output_available()
             except Exception as exc:
                 logger.info("Go2 WebRTC speaker audio unavailable", error=str(exc))
-                self._speaker_available = False
+                available = False
             else:
-                if self._speaker_available:
+                if available:
                     logger.info("Go2 WebRTC speaker audio enabled")
                 else:
                     logger.info("Go2 WebRTC speaker audio was not negotiated")
-            return self._speaker_available
+            if available and self.config.webrtc_channel_warmup_sec > 0:
+                if self._stop_event.wait(self.config.webrtc_channel_warmup_sec):
+                    return False
+            # Auto mode retries transient detection failures on the next message.
+            self._speaker_available = (
+                available if available or self.config.speaker != "auto" else None
+            )
+            return available
         try:
             self._request(GET_AUDIO_LIST)
         except Exception as exc:
@@ -239,7 +247,7 @@ class Go2AudioBridgeModule(Module):
             return False
         if self.config.speaker_backend != "webrtc":
             return True
-        logger.info("Waiting for Go2 audio playback to finish", timeout_sec=round(timeout, 1))
+        logger.info("Waiting for local Go2 WebRTC audio queue", timeout_sec=round(timeout, 1))
         try:
             if not self.go2.wait_audio_drained(timeout=timeout):
                 logger.warning(
@@ -247,7 +255,7 @@ class Go2AudioBridgeModule(Module):
                     timeout_sec=round(timeout, 1),
                 )
                 return False
-            logger.info("Go2 audio playback finished")
+            logger.info("Local Go2 WebRTC audio queue drained")
             return True
         finally:
             if self.config.speaker == "auto":
@@ -289,7 +297,7 @@ class Go2AudioBridgeModule(Module):
                             timeout_sec=round(timeout, 1),
                         )
                         return False
-                    logger.info("Go2 audio playback finished")
+                    logger.info("Local Go2 WebRTC audio queue drained")
                 logger.debug(
                     "Go2 WebRTC speaker audio queued",
                     duration_ms=round(pcm.size / self.config.target_sample_rate * 1000.0, 1),
@@ -326,7 +334,7 @@ class Go2AudioBridgeModule(Module):
             logger.warning("Go2 speaker audio send failed", exc_info=True)
             self._exit_megaphone()
             if self.config.speaker == "auto":
-                self._speaker_available = False
+                self._speaker_available = None if self.config.speaker_backend == "webrtc" else False
             return False
 
     def _enqueue_webrtc_pcm(self, pcm: NDArray[np.int16]) -> bool:
