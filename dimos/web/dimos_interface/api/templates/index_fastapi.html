@@ -368,8 +368,11 @@
         let silentOutput;
         let audioSocket;
         let isRecording = false;
+        let isVoiceTransitioning = false;
         const voiceBtn = document.getElementById('voiceButton');
         const queryResponse = document.getElementById('queryResponse');
+        const AUDIO_SOCKET_TIMEOUT_MS = 5000;
+        const AUDIO_STOP_TAIL_MS = 100;
 
         function audioSocketUrl() {
             const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -377,11 +380,12 @@
         }
 
         function cleanupAudio() {
+            if (processor) processor.onaudioprocess = null;
             if (processor) processor.disconnect();
             if (silentOutput) silentOutput.disconnect();
             if (mediaSource) mediaSource.disconnect();
             if (microphoneStream) microphoneStream.getTracks().forEach(track => track.stop());
-            if (audioSocket && audioSocket.readyState === WebSocket.OPEN) audioSocket.close();
+            if (audioSocket && audioSocket.readyState < WebSocket.CLOSING) audioSocket.close();
             if (audioContext) audioContext.close();
             processor = null;
             silentOutput = null;
@@ -391,67 +395,147 @@
             audioContext = null;
         }
 
+        function waitForSocketOpen(socket, timeoutMs = AUDIO_SOCKET_TIMEOUT_MS) {
+            if (socket.readyState === WebSocket.OPEN) return Promise.resolve();
+            return new Promise((resolve, reject) => {
+                const timer = setTimeout(() => finish(new Error('Voice connection timed out')), timeoutMs);
+                const onOpen = () => finish();
+                const onError = () => finish(new Error('Voice connection failed'));
+                const onClose = () => finish(new Error('Voice connection closed'));
+                function finish(error) {
+                    clearTimeout(timer);
+                    socket.removeEventListener('open', onOpen);
+                    socket.removeEventListener('error', onError);
+                    socket.removeEventListener('close', onClose);
+                    if (error) reject(error); else resolve();
+                }
+                socket.addEventListener('open', onOpen);
+                socket.addEventListener('error', onError);
+                socket.addEventListener('close', onClose);
+            });
+        }
+
+        function waitForSocketMessage(socket, expectedType, timeoutMs = AUDIO_SOCKET_TIMEOUT_MS) {
+            return new Promise((resolve, reject) => {
+                const timer = setTimeout(
+                    () => finish(new Error(`Voice ${expectedType} acknowledgement timed out`)),
+                    timeoutMs,
+                );
+                const onMessage = event => {
+                    let payload;
+                    try {
+                        payload = JSON.parse(event.data);
+                    } catch (_error) {
+                        return;
+                    }
+                    if (payload.type !== expectedType) return;
+                    if (payload.success) finish();
+                    else finish(new Error(payload.message || `Voice ${expectedType} failed`));
+                };
+                const onError = () => finish(new Error('Voice connection failed'));
+                const onClose = () => finish(new Error('Voice connection closed before acknowledgement'));
+                function finish(error) {
+                    clearTimeout(timer);
+                    socket.removeEventListener('message', onMessage);
+                    socket.removeEventListener('error', onError);
+                    socket.removeEventListener('close', onClose);
+                    if (error) reject(error); else resolve();
+                }
+                socket.addEventListener('message', onMessage);
+                socket.addEventListener('error', onError);
+                socket.addEventListener('close', onClose);
+            });
+        }
+
+        function showVoiceStatus(message, isError = false) {
+            queryResponse.textContent = message;
+            queryResponse.className = `query-response ${isError ? 'error' : 'success'}`;
+            queryResponse.style.display = 'block';
+        }
+
         async function startVoiceStreaming() {
-            microphoneStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+            microphoneStream = await navigator.mediaDevices.getUserMedia({
+                audio: {
+                    channelCount: 1,
+                    echoCancellation: true,
+                    noiseSuppression: true,
+                    autoGainControl: true,
+                },
+            });
             audioContext = new AudioContext();
+            await audioContext.resume();
             mediaSource = audioContext.createMediaStreamSource(microphoneStream);
-            processor = audioContext.createScriptProcessor(4096, 1, 1);
+            processor = audioContext.createScriptProcessor(2048, 1, 1);
             silentOutput = audioContext.createGain();
             silentOutput.gain.value = 0;
             audioSocket = new WebSocket(audioSocketUrl());
             audioSocket.binaryType = 'arraybuffer';
-            audioSocket.onopen = () => {
-                audioSocket.send(JSON.stringify({
-                    type: 'start',
-                    sample_rate: audioContext.sampleRate,
-                    channels: 1,
-                }));
-            };
-            audioSocket.onerror = () => {
-                queryResponse.textContent = 'Streaming voice connection failed';
-                queryResponse.className = 'query-response error';
-                queryResponse.style.display = 'block';
-                cleanupAudio();
-                voiceBtn.classList.remove('recording');
-                isRecording = false;
-            };
+            const socket = audioSocket;
+            await waitForSocketOpen(socket);
+            const started = waitForSocketMessage(socket, 'started');
+            socket.send(JSON.stringify({
+                type: 'start',
+                sample_rate: audioContext.sampleRate,
+                channels: 1,
+            }));
+            await started;
             processor.onaudioprocess = event => {
-                if (!isRecording || audioSocket.readyState !== WebSocket.OPEN) return;
+                if (!isRecording || socket.readyState !== WebSocket.OPEN) return;
                 const input = event.inputBuffer.getChannelData(0);
-                audioSocket.send(new Float32Array(input).buffer);
+                socket.send(new Float32Array(input).buffer);
             };
             mediaSource.connect(processor);
             processor.connect(silentOutput);
             silentOutput.connect(audioContext.destination);
             isRecording = true;
             voiceBtn.classList.add('recording');
+            socket.addEventListener('close', () => {
+                if (socket !== audioSocket || !isRecording) return;
+                isRecording = false;
+                voiceBtn.classList.remove('recording');
+                showVoiceStatus('Voice connection closed unexpectedly', true);
+                cleanupAudio();
+            });
         }
 
-        function stopVoiceStreaming() {
+        async function stopVoiceStreaming() {
+            // Keep one short tail so the final phoneme reaches ScriptProcessor.
+            await new Promise(resolve => setTimeout(resolve, AUDIO_STOP_TAIL_MS));
             isRecording = false;
-            if (audioSocket && audioSocket.readyState === WebSocket.OPEN) {
-                audioSocket.send(JSON.stringify({ type: 'stop' }));
+            if (!audioSocket || audioSocket.readyState !== WebSocket.OPEN) {
+                throw new Error('Voice connection is not open');
             }
+            const socket = audioSocket;
+            const stopped = waitForSocketMessage(socket, 'stopped');
+            socket.send(JSON.stringify({ type: 'stop' }));
+            await stopped;
             cleanupAudio();
             voiceBtn.classList.remove('recording');
-            queryResponse.textContent = 'Voice command received!';
-            queryResponse.className = 'query-response success';
-            queryResponse.style.display = 'block';
+            showVoiceStatus('Voice command received!');
             setTimeout(() => {
                 queryResponse.style.display = 'none';
             }, 3000);
         }
 
         voiceBtn.addEventListener('click', async () => {
-            if (isRecording) {
-                stopVoiceStreaming();
-            } else {
-                try {
+            if (isVoiceTransitioning) return;
+            isVoiceTransitioning = true;
+            voiceBtn.disabled = true;
+            try {
+                if (isRecording) {
+                    await stopVoiceStreaming();
+                } else {
                     await startVoiceStreaming();
-                } catch (err) {
-                    alert('Microphone access denied. Please allow microphone access to use voice commands.');
-                    cleanupAudio();
                 }
+            } catch (err) {
+                console.error(err);
+                isRecording = false;
+                voiceBtn.classList.remove('recording');
+                showVoiceStatus('Voice input failed. Please try again.', true);
+                cleanupAudio();
+            } finally {
+                isVoiceTransitioning = false;
+                voiceBtn.disabled = false;
             }
         });
         {% endif %}

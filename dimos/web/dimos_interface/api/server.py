@@ -33,6 +33,7 @@ import subprocess
 import tempfile
 from threading import Lock
 import time
+from uuid import uuid4
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
@@ -48,9 +49,12 @@ import uvicorn
 
 from dimos.core.global_config import global_config
 from dimos.stream.audio.base import AudioEvent
+from dimos.utils.logging_config import setup_logger
 from dimos.web.edge_io import EdgeIO
 
 # TODO: Resolve threading, start/stop stream functionality.
+
+logger = setup_logger()
 
 
 class FastAPIServer(EdgeIO):
@@ -186,6 +190,99 @@ class FastAPIServer(EdgeIO):
             )
 
         return video_feed
+
+    async def _receive_streamed_audio(self, websocket: WebSocket) -> None:
+        """Receive exactly one microphone utterance and always finalize it once."""
+        audio_subject = self.audio_subject
+        if audio_subject is None:
+            raise RuntimeError("Voice input is not configured")
+        await websocket.accept()
+        sample_rate = 48000
+        channels = 1
+        utterance_id = uuid4().hex[:8]
+        started = False
+        ended = False
+        audio_chunks = 0
+        audio_samples = 0
+
+        def finish_utterance(reason: str) -> None:
+            nonlocal ended
+            if ended or not started:
+                return
+            ended = True
+            if self.audio_end_subject is not None:
+                self.audio_end_subject.on_next(None)
+            duration_sec = audio_samples / max(1, sample_rate * channels)
+            logger.info(
+                "Browser microphone utterance finished",
+                utterance_id=utterance_id,
+                reason=reason,
+                audio_chunks=audio_chunks,
+                audio_samples=audio_samples,
+                duration_sec=round(duration_sec, 3),
+                sample_rate=sample_rate,
+                channels=channels,
+            )
+
+        try:
+            while True:
+                message = await websocket.receive()
+                if message.get("type") == "websocket.disconnect":
+                    finish_utterance("disconnect")
+                    return
+                if message.get("text") is not None:
+                    payload = json.loads(message["text"])
+                    event_type = payload.get("type")
+                    if event_type == "start":
+                        if started:
+                            logger.warning(
+                                "Ignoring duplicate browser microphone start",
+                                utterance_id=utterance_id,
+                            )
+                            continue
+                        sample_rate = max(1, int(payload.get("sample_rate") or sample_rate))
+                        channels = max(1, int(payload.get("channels") or channels))
+                        started = True
+                        logger.info(
+                            "Browser microphone utterance started",
+                            utterance_id=utterance_id,
+                            sample_rate=sample_rate,
+                            channels=channels,
+                        )
+                        await websocket.send_json({"success": True, "type": "started"})
+                    elif event_type == "stop":
+                        finish_utterance("stop")
+                        await websocket.send_json({"success": True, "type": "stopped"})
+                        return
+                elif message.get("bytes") is not None:
+                    if not started:
+                        logger.warning(
+                            "Ignoring browser microphone audio before start",
+                            utterance_id=utterance_id,
+                        )
+                        continue
+                    audio = np.frombuffer(message["bytes"], dtype=np.float32).copy()
+                    if audio.size == 0:
+                        continue
+                    audio_chunks += 1
+                    audio_samples += audio.size
+                    audio_subject.on_next(
+                        AudioEvent(
+                            data=audio,
+                            sample_rate=sample_rate,
+                            timestamp=time.time(),
+                            channels=channels,
+                        )
+                    )
+        except Exception:
+            logger.warning(
+                "Browser microphone websocket failed",
+                utterance_id=utterance_id,
+                exc_info=True,
+            )
+            finish_utterance("error")
+        finally:
+            finish_utterance("closed")
 
     async def text_stream_generator(self, key):  # type: ignore[no-untyped-def]
         """Generate SSE events for text stream."""
@@ -327,42 +424,7 @@ class FastAPIServer(EdgeIO):
                 await websocket.close(code=1008, reason="Voice input not configured")
                 return
 
-            await websocket.accept()
-            sample_rate = 48000
-            channels = 1
-            try:
-                while True:
-                    message = await websocket.receive()
-                    if message.get("type") == "websocket.disconnect":
-                        break
-                    if message.get("text") is not None:
-                        payload = json.loads(message["text"])
-                        event_type = payload.get("type")
-                        if event_type == "start":
-                            sample_rate = int(payload.get("sample_rate") or sample_rate)
-                            channels = int(payload.get("channels") or channels)
-                            await websocket.send_json({"success": True, "type": "started"})
-                        elif event_type == "stop":
-                            if self.audio_end_subject is not None:
-                                self.audio_end_subject.on_next(None)
-                            await websocket.send_json({"success": True, "type": "stopped"})
-                            break
-                    elif message.get("bytes") is not None:
-                        audio = np.frombuffer(message["bytes"], dtype=np.float32).copy()
-                        if audio.size == 0:
-                            continue
-                        self.audio_subject.on_next(
-                            AudioEvent(
-                                data=audio,
-                                sample_rate=sample_rate,
-                                timestamp=time.time(),
-                                channels=channels,
-                            )
-                        )
-            except Exception as exc:
-                print(f"Streaming audio websocket closed: {exc}")
-                if self.audio_end_subject is not None:
-                    self.audio_end_subject.on_next(None)
+            await self._receive_streamed_audio(websocket)
 
         # Unitree API endpoints
         @self.app.get("/unitree/status")

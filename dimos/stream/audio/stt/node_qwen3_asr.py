@@ -20,6 +20,7 @@ import threading
 
 import numpy as np
 from reactivex import Observable, Subject
+from reactivex.abc import DisposableBase
 from reactivex.disposable import CompositeDisposable
 import requests
 
@@ -60,29 +61,33 @@ class Qwen3AsrStreamingNode(AbstractAudioConsumer, AbstractTextEmitter):
 
         self._text_subject: Subject[str] = Subject()
         self._partial_text_subject: Subject[str] = Subject()
-        self._audio_subscription = None
-        self._end_subscription = None
+        self._audio_subscription: DisposableBase | None = None
+        self._end_subscription: DisposableBase | None = None
         self._disposables = CompositeDisposable()
         self._lock = threading.Lock()
+        self._session_lock = threading.Lock()
         self._utterance_queue: queue.Queue[bytes | None] | None = None
+        self._utterance_sequence = 0
         self._workers: list[threading.Thread] = []
         self._session = requests.Session()
         self._closed = False
 
     def consume_audio(self, audio_observable: Observable) -> Qwen3AsrStreamingNode:  # type: ignore[type-arg]
-        self._audio_subscription = audio_observable.subscribe(
+        subscription = audio_observable.subscribe(
             on_next=self._on_audio_event,
             on_error=lambda error: self._text_subject.on_error(error),
         )
-        self._disposables.add(self._audio_subscription)
+        self._audio_subscription = subscription
+        self._disposables.add(subscription)
         return self
 
     def consume_end(self, end_observable: Observable) -> Qwen3AsrStreamingNode:  # type: ignore[type-arg]
-        self._end_subscription = end_observable.subscribe(
+        subscription = end_observable.subscribe(
             on_next=lambda _value: self.end_utterance(),
             on_error=lambda error: self._text_subject.on_error(error),
         )
-        self._disposables.add(self._end_subscription)
+        self._end_subscription = subscription
+        self._disposables.add(subscription)
         return self
 
     def emit_text(self) -> Observable:  # type: ignore[type-arg]
@@ -117,29 +122,56 @@ class Qwen3AsrStreamingNode(AbstractAudioConsumer, AbstractTextEmitter):
         with self._lock:
             if self._utterance_queue is None:
                 self._utterance_queue = queue.Queue()
-                self._start_worker(self._utterance_queue)
+                self._utterance_sequence += 1
+                self._start_worker(self._utterance_queue, self._utterance_sequence)
             utterance_queue = self._utterance_queue
         utterance_queue.put(pcm)
 
-    def _start_worker(self, utterance_queue: queue.Queue[bytes | None]) -> None:
+    def _start_worker(
+        self,
+        utterance_queue: queue.Queue[bytes | None],
+        utterance_id: int,
+    ) -> None:
         worker = threading.Thread(
             target=self._run_session,
-            args=(utterance_queue,),
+            args=(utterance_queue, utterance_id),
             daemon=True,
             name="Qwen3AsrStreamingNode-session",
         )
         self._workers.append(worker)
         worker.start()
 
-    def _run_session(self, utterance_queue: queue.Queue[bytes | None]) -> None:
+    def _run_session(
+        self,
+        utterance_queue: queue.Queue[bytes | None],
+        utterance_id: int,
+    ) -> None:
+        with self._session_lock:
+            self._run_session_locked(utterance_queue, utterance_id)
+
+    def _run_session_locked(
+        self,
+        utterance_queue: queue.Queue[bytes | None],
+        utterance_id: int,
+    ) -> None:
         session_id: str | None = None
         latest_partial = ""
+        audio_chunks = 0
+        audio_bytes = 0
         try:
             session_id = self._start_session()
+            logger.info(
+                "Qwen3-ASR utterance started",
+                utterance_id=utterance_id,
+                session_id=session_id,
+                sample_rate=self.sample_rate,
+            )
             while True:
                 chunk = utterance_queue.get()
                 if chunk is None:
                     break
+                audio_chunks += 1
+                audio_bytes += len(chunk)
                 text = self._push_chunk(session_id, chunk)
                 if text and text != latest_partial:
                     latest_partial = text
@@ -148,8 +180,23 @@ class Qwen3AsrStreamingNode(AbstractAudioConsumer, AbstractTextEmitter):
             final_text = self._finish_session(session_id)
             if final_text:
                 self._text_subject.on_next(final_text)
+            logger.info(
+                "Qwen3-ASR utterance finished",
+                utterance_id=utterance_id,
+                session_id=session_id,
+                audio_chunks=audio_chunks,
+                audio_duration_sec=round(audio_bytes / (4 * self.sample_rate), 3),
+                final_text=final_text or "<empty>",
+            )
         except Exception as exc:
-            logger.error("Qwen3-ASR streaming session failed", error=str(exc))
+            logger.error(
+                "Qwen3-ASR streaming session failed",
+                utterance_id=utterance_id,
+                session_id=session_id,
+                audio_chunks=audio_chunks,
+                audio_duration_sec=round(audio_bytes / (4 * self.sample_rate), 3),
+                error=str(exc),
+            )
             self._text_subject.on_error(exc)
         finally:
             try:

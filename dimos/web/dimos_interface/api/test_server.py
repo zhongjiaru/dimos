@@ -12,9 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
+import json
 from pathlib import Path
 
 import numpy as np
+import reactivex as rx
 
 from dimos.web.dimos_interface.api.server import FastAPIServer
 
@@ -57,3 +60,70 @@ def test_decode_audio_rejects_empty_ffmpeg_output(mocker) -> None:  # type: igno
 
     assert audio is None
     assert sample_rate is None
+
+
+def test_streamed_audio_stop_waits_for_complete_utterance(mocker) -> None:  # type: ignore[no-untyped-def]
+    audio_subject = rx.subject.Subject()
+    audio_end_subject = rx.subject.Subject()
+    server = FastAPIServer(
+        audio_subject=audio_subject,
+        audio_end_subject=audio_end_subject,
+    )
+    audio_events = []
+    audio_ends = []
+    audio_subscription = audio_subject.subscribe(audio_events.append)
+    end_subscription = audio_end_subject.subscribe(audio_ends.append)
+    websocket = mocker.Mock()
+    websocket.accept = mocker.AsyncMock()
+    websocket.send_json = mocker.AsyncMock()
+    pcm = np.array([0.25, -0.25], dtype=np.float32)
+    websocket.receive = mocker.AsyncMock(
+        side_effect=[
+            {"text": json.dumps({"type": "start", "sample_rate": 48000, "channels": 1})},
+            {"bytes": pcm.tobytes()},
+            {"text": json.dumps({"type": "stop"})},
+        ]
+    )
+
+    try:
+        asyncio.run(server._receive_streamed_audio(websocket))
+    finally:
+        audio_subscription.dispose()
+        end_subscription.dispose()
+        server.shutdown()
+
+    assert len(audio_events) == 1
+    np.testing.assert_array_equal(audio_events[0].data, pcm)
+    assert audio_ends == [None]
+    assert [call.args[0] for call in websocket.send_json.await_args_list] == [
+        {"success": True, "type": "started"},
+        {"success": True, "type": "stopped"},
+    ]
+
+
+def test_streamed_audio_disconnect_still_finalizes_utterance_once(mocker) -> None:  # type: ignore[no-untyped-def]
+    audio_subject = rx.subject.Subject()
+    audio_end_subject = rx.subject.Subject()
+    server = FastAPIServer(
+        audio_subject=audio_subject,
+        audio_end_subject=audio_end_subject,
+    )
+    audio_ends = []
+    end_subscription = audio_end_subject.subscribe(audio_ends.append)
+    websocket = mocker.Mock()
+    websocket.accept = mocker.AsyncMock()
+    websocket.send_json = mocker.AsyncMock()
+    websocket.receive = mocker.AsyncMock(
+        side_effect=[
+            {"text": json.dumps({"type": "start"})},
+            {"type": "websocket.disconnect"},
+        ]
+    )
+
+    try:
+        asyncio.run(server._receive_streamed_audio(websocket))
+    finally:
+        end_subscription.dispose()
+        server.shutdown()
+
+    assert audio_ends == [None]
