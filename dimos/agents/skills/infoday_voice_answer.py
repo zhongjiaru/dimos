@@ -35,6 +35,12 @@ from dimos.core.module import Module, ModuleConfig
 from dimos.core.stream import Out
 from dimos.stream.audio.base import AudioEvent
 from dimos.stream.audio.tts.node_canto_tts import CantoTTSNode
+from dimos.stream.audio.tts.node_cosyvoice2_yue import (
+    COSYVOICE2_YUE_MODEL,
+    COSYVOICE2_YUE_SPEAKER,
+    CosyVoice2YueHTTPNode,
+    CosyVoice2YueTTSNode,
+)
 from dimos.stream.audio.tts.node_cosyvoice3 import CosyVoice3TTSNode, CosyVoiceAudioFormat
 from dimos.teleop.hosted.go2_audio_bridge_spec import Go2AudioBridgeSpec
 from dimos.utils.logging_config import setup_logger
@@ -101,7 +107,11 @@ class InfodayVoiceAnswerConfig(ModuleConfig):
     response_temperature: float = 0.2
     response_max_tokens: int = Field(default=96, ge=1, le=512)
     response_extra_body: dict[str, Any] = Field(default_factory=dict)
-    tts_backend: Literal["cosyvoice3", "canto-tts"] = "cosyvoice3"
+    tts_backend: Literal[
+        "cosyvoice3",
+        "canto-tts",
+        "cosyvoice2-yue-zoengjyutgaai",
+    ] = "cosyvoice3"
     tts_endpoint: str = "http://localhost:8001/v1/audio/speech/stream"
     tts_api_key: str | None = None
     tts_model: str = "CosyVoice3"
@@ -121,6 +131,20 @@ class InfodayVoiceAnswerConfig(ModuleConfig):
     # canto-tts 0.1.x treats this as a local ONNX bundle path. None activates
     # the SDK's Hugging Face download for typangaa/canto-tts-nano.
     canto_tts_checkpoint: str | None = None
+    cosyvoice2_model_dir: str = COSYVOICE2_YUE_MODEL
+    cosyvoice2_endpoint: str | None = "http://127.0.0.1:50000"
+    cosyvoice2_prompt_audio: str | None = None
+    cosyvoice2_speaker_id: str = COSYVOICE2_YUE_SPEAKER
+    cosyvoice2_instruct_text: str = "用粤语以热情、亲切、有活力嘅语气说这句话"
+    cosyvoice2_repo_path: str | None = None
+    cosyvoice2_text_frontend: bool = True
+    cosyvoice2_load_jit: bool = False
+    cosyvoice2_load_trt: bool = False
+    cosyvoice2_load_vllm: bool = False
+    cosyvoice2_fp16: bool = False
+    cosyvoice2_trt_concurrent: int = Field(default=1, ge=1)
+    cosyvoice2_sample_rate: int = Field(default=24000, gt=0)
+    cosyvoice2_timeout_sec: float | None = Field(default=None, gt=0)
 
 
 class InfodayVoiceAnswerSkill(Module):
@@ -150,6 +174,13 @@ class InfodayVoiceAnswerSkill(Module):
             tts_node = self._get_tts_node()
             if not isinstance(tts_node, CantoTTSNode):
                 raise TypeError("canto-tts backend did not create a CantoTTSNode")
+            tts_node.prepare()
+        elif self.config.tts_backend == "cosyvoice2-yue-zoengjyutgaai":
+            tts_node = self._get_tts_node()
+            if not isinstance(tts_node, (CosyVoice2YueHTTPNode, CosyVoice2YueTTSNode)):
+                raise TypeError(
+                    "cosyvoice2-yue-zoengjyutgaai backend created an unexpected TTS node"
+                )
             tts_node.prepare()
         kwargs: dict[str, Any] = {
             "api_key": self.config.response_api_key or os.getenv("OPENAI_API_KEY")
@@ -464,6 +495,34 @@ class InfodayVoiceAnswerSkill(Module):
     def _make_tts_node(self) -> _TTSNode:
         if self.config.tts_backend == "canto-tts":
             return CantoTTSNode(checkpoint=self.config.canto_tts_checkpoint)
+        if self.config.tts_backend == "cosyvoice2-yue-zoengjyutgaai":
+            if self.config.cosyvoice2_endpoint is not None:
+                return CosyVoice2YueHTTPNode(
+                    endpoint=self.config.cosyvoice2_endpoint,
+                    prompt_audio=self.config.cosyvoice2_prompt_audio,
+                    speaker_id=self.config.cosyvoice2_speaker_id,
+                    instruct_text=self.config.cosyvoice2_instruct_text,
+                    sample_rate=self.config.cosyvoice2_sample_rate,
+                    stream=self.config.tts_stream,
+                    speed=self.config.tts_speed,
+                    text_frontend=self.config.cosyvoice2_text_frontend,
+                    timeout=self.config.cosyvoice2_timeout_sec,
+                )
+            return CosyVoice2YueTTSNode(
+                prompt_audio=self.config.cosyvoice2_prompt_audio,
+                speaker_id=self.config.cosyvoice2_speaker_id,
+                model_dir=self.config.cosyvoice2_model_dir,
+                instruct_text=self.config.cosyvoice2_instruct_text,
+                repo_path=self.config.cosyvoice2_repo_path,
+                stream=self.config.tts_stream,
+                speed=self.config.tts_speed,
+                text_frontend=self.config.cosyvoice2_text_frontend,
+                load_jit=self.config.cosyvoice2_load_jit,
+                load_trt=self.config.cosyvoice2_load_trt,
+                load_vllm=self.config.cosyvoice2_load_vllm,
+                fp16=self.config.cosyvoice2_fp16,
+                trt_concurrent=self.config.cosyvoice2_trt_concurrent,
+            )
         return CosyVoice3TTSNode(
             endpoint=self.config.tts_endpoint,
             model=self.config.tts_model,

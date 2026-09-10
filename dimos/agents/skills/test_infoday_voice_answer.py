@@ -229,6 +229,85 @@ def test_infoday_voice_answer_can_select_canto_tts(mocker) -> None:  # type: ign
     tts_node.dispose.assert_called_once_with()
 
 
+def test_infoday_voice_answer_can_configure_cosyvoice2_yue(mocker) -> None:  # type: ignore[no-untyped-def]
+    """The InfoDay backend selector forwards CosyVoice2-Yue voice controls."""
+    tts_node = mocker.Mock()
+    tts_node_cls = mocker.patch(
+        "dimos.agents.skills.infoday_voice_answer.CosyVoice2YueTTSNode",
+        return_value=tts_node,
+    )
+    skill = InfodayVoiceAnswerSkill(
+        tts_backend="cosyvoice2-yue-zoengjyutgaai",
+        cosyvoice2_endpoint=None,
+        tts_stream=True,
+        tts_speed=1.15,
+        cosyvoice2_model_dir="/models/cosyvoice2-yue",
+        cosyvoice2_prompt_audio="/voices/energetic.wav",
+        cosyvoice2_speaker_id="bundled-speaker",
+        cosyvoice2_instruct_text="用粤语开心噉讲",
+        cosyvoice2_repo_path="/src/CosyVoice",
+        cosyvoice2_text_frontend=False,
+        cosyvoice2_load_jit=True,
+        cosyvoice2_load_trt=False,
+        cosyvoice2_load_vllm=True,
+        cosyvoice2_fp16=True,
+        cosyvoice2_trt_concurrent=2,
+    )
+
+    try:
+        assert skill._get_tts_node() is tts_node
+    finally:
+        skill.stop()
+
+    tts_node_cls.assert_called_once_with(
+        prompt_audio="/voices/energetic.wav",
+        speaker_id="bundled-speaker",
+        model_dir="/models/cosyvoice2-yue",
+        instruct_text="用粤语开心噉讲",
+        repo_path="/src/CosyVoice",
+        stream=True,
+        speed=1.15,
+        text_frontend=False,
+        load_jit=True,
+        load_trt=False,
+        load_vllm=True,
+        fp16=True,
+        trt_concurrent=2,
+    )
+    tts_node.dispose.assert_called_once_with()
+
+
+def test_infoday_voice_answer_uses_cosyvoice2_http_service_by_default(mocker) -> None:  # type: ignore[no-untyped-def]
+    """CosyVoice2 runs in its dependency-isolated service by default."""
+    tts_node = mocker.Mock()
+    tts_node_cls = mocker.patch(
+        "dimos.agents.skills.infoday_voice_answer.CosyVoice2YueHTTPNode",
+        return_value=tts_node,
+    )
+    skill = InfodayVoiceAnswerSkill(
+        tts_backend="cosyvoice2-yue-zoengjyutgaai",
+        tts_stream=True,
+    )
+
+    try:
+        assert skill._get_tts_node() is tts_node
+    finally:
+        skill.stop()
+
+    tts_node_cls.assert_called_once_with(
+        endpoint="http://127.0.0.1:50000",
+        prompt_audio=None,
+        speaker_id="my_zero_shot_spk",
+        instruct_text="用粤语以热情、亲切、有活力嘅语气说这句话",
+        sample_rate=24000,
+        stream=True,
+        speed=1.0,
+        text_frontend=True,
+        timeout=None,
+    )
+    tts_node.dispose.assert_called_once_with()
+
+
 def test_infoday_tts_logs_first_audio_and_segment_summary(mocker) -> None:  # type: ignore[no-untyped-def]
     skill = InfodayVoiceAnswerSkill(tts_stream=True)
     skill.operator_audio = mocker.Mock()
