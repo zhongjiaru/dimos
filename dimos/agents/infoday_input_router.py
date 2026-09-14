@@ -128,7 +128,7 @@ class InfodayInputRouter(Module):
                 text=cleaned,
             )
         if not original:
-            route = InputRoute.DROP
+            route = InputRoute.REPEAT
         elif not cleaned:
             route = InputRoute.REPEAT
         else:
@@ -203,7 +203,11 @@ def classify_infoday_input(text: str) -> InputRoute:
         return InputRoute.INFODAY
     if has_infoday_question:
         return InputRoute.INFODAY
-    return InputRoute.AGENT
+    if _matches_any(normalized, _AMBIGUOUS_AGENT_PATTERNS):
+        return InputRoute.AGENT
+    # Info Day is voice-first: unknown non-action speech still goes through the
+    # answer skill so every response is delivered through TTS.
+    return InputRoute.INFODAY
 
 
 def strip_asr_prompt_prefix(text: str, initial_prompt: str | None) -> str:
@@ -239,6 +243,8 @@ _GREETING_PATTERNS = (
     r"\bwho are you\b|\bintroduce yourself\b",
 )
 
+_AMBIGUOUS_AGENT_PATTERNS = (r"\bresearch\b.*\b(?:person|object|thing)\b",)
+
 _INFODAY_PATTERNS = (
     r"\bpolyu\b|香港理工|理大|\beee\b|電機|电机|電子工程|电子工程|學系|学系",
     r"開放日|开放日|\binfo day\b|\bopen day\b|\bjupas\b",
@@ -246,4 +252,5 @@ _INFODAY_PATTERNS = (
     r"\bprogramme\b|\bprogram\b|\bcourse\b|\badmission|\btuition\b|\bscholarship\b",
     r"聯絡|联络|聯繫|联系|電話|电话|電郵|电邮|郵箱|邮箱|辦公室|办公室|校園|校园",
     r"\bdepartment\b|\bfaculty\b|\bcampus\b|\bcontact\b|\branking\b",
+    r"\bjs\s*\d{4}\b|三\s*一\s*[七八]\s*零|收分|幾多分|几多分|分數|分数",
 )

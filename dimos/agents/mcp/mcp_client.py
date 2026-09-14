@@ -93,6 +93,7 @@ class McpClientConfig(ModuleConfig):
     mcp_server_url: str = "http://localhost:9990/mcp"
     allowed_tools: list[str] | None = None
     require_tool_call: bool = False
+    suppress_final_ai_after_tool_call: bool = False
 
 
 class McpClient(Module):
@@ -393,6 +394,14 @@ class McpClient(Module):
                     if getattr(msg, "tool_calls", None):
                         tool_called = True
                     self._history.append(msg)
+                    if (
+                        self.config.suppress_final_ai_after_tool_call
+                        and tool_called
+                        and getattr(msg, "type", None) == "ai"
+                        and not getattr(msg, "tool_calls", None)
+                    ):
+                        logger.debug("Suppressed redundant final AI text after spoken tool call")
+                        continue
                     pretty_print_langchain_message(msg)
                     self.agent.publish(msg)
 

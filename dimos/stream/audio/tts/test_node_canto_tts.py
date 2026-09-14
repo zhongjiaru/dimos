@@ -39,7 +39,7 @@ def test_canto_tts_node_materializes_default_onnx_model_once(tmp_path, mocker) -
     mocker.patch("dimos.stream.audio.tts.node_canto_tts._CANTO_TTS_CACHE_DIR", cache_dir)
     engine = mocker.Mock()
 
-    def synthesize(_text: str, out_path: str) -> str:
+    def synthesize(_text: str, out_path: str, **_kwargs) -> str:  # type: ignore[no-untyped-def]
         audio = np.array([[0.1, -0.1], [0.2, -0.2]], dtype=np.float32)
         sf.write(out_path, audio, 48000, subtype="FLOAT")
         return out_path
@@ -63,6 +63,16 @@ def test_canto_tts_node_materializes_default_onnx_model_once(tmp_path, mocker) -
     assert (materialized / "model" / "weights.data").read_bytes() == b"model weights"
     assert not (materialized / "model" / "weights.data").is_symlink()
     assert [call.args[0] for call in engine.synthesize.call_args_list] == ["多謝晒。", "你好。"]
+    assert all(
+        call.kwargs
+        == {
+            "quality": None,
+            "max_attempts": 3,
+            "text_temperature": 0.9,
+            "audio_temperature": 0.9,
+        }
+        for call in engine.synthesize.call_args_list
+    )
     assert len(first) == 1
     assert first[0].sample_rate == 48000
     assert first[0].channels == 2
@@ -73,7 +83,7 @@ def test_canto_tts_node_materializes_default_onnx_model_once(tmp_path, mocker) -
 def test_canto_tts_node_forwards_checkpoint(mocker) -> None:  # type: ignore[no-untyped-def]
     engine = mocker.Mock()
 
-    def synthesize(_text: str, out_path: str) -> str:
+    def synthesize(_text: str, out_path: str, **_kwargs) -> str:  # type: ignore[no-untyped-def]
         sf.write(Path(out_path), np.array([0.1], dtype=np.float32), 48000, subtype="FLOAT")
         return out_path
 

@@ -204,6 +204,9 @@ class FastAPIServer(EdgeIO):
         ended = False
         audio_chunks = 0
         audio_samples = 0
+        audio_energy = 0.0
+        peak = 0.0
+        clipped_samples = 0
 
         def finish_utterance(reason: str) -> None:
             nonlocal ended
@@ -222,6 +225,9 @@ class FastAPIServer(EdgeIO):
                 duration_sec=round(duration_sec, 3),
                 sample_rate=sample_rate,
                 channels=channels,
+                rms=round((audio_energy / max(1, audio_samples)) ** 0.5, 4),
+                peak=round(peak, 4),
+                clipped_ratio=round(clipped_samples / max(1, audio_samples), 6),
             )
 
         try:
@@ -255,6 +261,7 @@ class FastAPIServer(EdgeIO):
                         await websocket.send_json({"success": True, "type": "stopped"})
                         return
                 elif message.get("bytes") is not None:
+                    # Keep aggregate signal diagnostics without retaining visitor audio.
                     if not started:
                         logger.warning(
                             "Ignoring browser microphone audio before start",
@@ -266,6 +273,9 @@ class FastAPIServer(EdgeIO):
                         continue
                     audio_chunks += 1
                     audio_samples += audio.size
+                    audio_energy += float(np.dot(audio, audio))
+                    peak = max(peak, float(np.max(np.abs(audio))))
+                    clipped_samples += int(np.count_nonzero(np.abs(audio) >= 0.999))
                     audio_subject.on_next(
                         AudioEvent(
                             data=audio,

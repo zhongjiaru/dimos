@@ -22,12 +22,13 @@ import shutil
 import tempfile
 import threading
 import time
-from typing import Protocol
+from typing import Literal, Protocol
 
 from canto_tts import CantoTTS  # type: ignore[import-untyped]
 from canto_tts.hub import resolve_onnx_model_dir  # type: ignore[import-untyped]
 from filelock import FileLock
 from reactivex import Observable, Subject
+from reactivex.abc import DisposableBase
 import soundfile as sf  # type: ignore[import-untyped]
 
 from dimos.constants import CACHE_DIR
@@ -42,19 +43,31 @@ _MATERIALIZED_MARKER = ".dimos-materialized"
 
 
 class _CantoTTSEngine(Protocol):
-    def synthesize(self, text: str, out_path: str) -> str: ...
+    def synthesize(self, text: str, out_path: str, **kwargs: object) -> str: ...
 
 
 class CantoTTSNode(AbstractTextConsumer, AbstractAudioEmitter, AbstractTextEmitter):
     """Local Cantonese TTS using the CPU-first canto-tts ONNX SDK."""
 
-    def __init__(self, *, checkpoint: str | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        checkpoint: str | None = None,
+        quality: Literal["duration_filter", "best_of_n"] | None = None,
+        max_attempts: int = 3,
+        text_temperature: float = 0.9,
+        audio_temperature: float = 0.9,
+    ) -> None:
         self.checkpoint = checkpoint
+        self.quality = quality
+        self.max_attempts = max_attempts
+        self.text_temperature = text_temperature
+        self.audio_temperature = audio_temperature
         self._engine: _CantoTTSEngine | None = None
         self._audio_subject: Subject[AudioEvent] = Subject()
         self._text_subject: Subject[str] = Subject()
         self._text_queue: queue.Queue[str | None] = queue.Queue()
-        self._subscription = None
+        self._subscription: DisposableBase | None = None
         self._worker: threading.Thread | None = None
         self._closed = False
 
@@ -92,7 +105,14 @@ class CantoTTSNode(AbstractTextConsumer, AbstractAudioEmitter, AbstractTextEmitt
         engine = self._get_engine()
         with tempfile.TemporaryDirectory(prefix="dimos-canto-tts-") as temp_dir:
             output_path = Path(temp_dir) / "speech.wav"
-            resolved_path = engine.synthesize(text, str(output_path))
+            resolved_path = engine.synthesize(
+                text,
+                str(output_path),
+                quality=self.quality,
+                max_attempts=self.max_attempts,
+                text_temperature=self.text_temperature,
+                audio_temperature=self.audio_temperature,
+            )
             audio_path = Path(resolved_path) if resolved_path else output_path
             with sf.SoundFile(audio_path, "r") as sound_file:
                 audio = sound_file.read(dtype="float32")

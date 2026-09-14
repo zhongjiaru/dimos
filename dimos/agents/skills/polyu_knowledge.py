@@ -20,6 +20,7 @@ import json
 from pathlib import Path
 import re
 from typing import Any
+import unicodedata
 
 from pydantic import Field
 
@@ -88,20 +89,20 @@ class PolyUKnowledgeSkill(Module):
         """
         query = question.strip()
         if not query:
-            return "问题为空，无法检索 PolyU/EEE 官方资料。"
+            return "問題為空，無法檢索 PolyU/EEE 官方資料。"
         if not self._facts and not self._chunks:
             return (
-                "未找到离线知识库文件。请先运行 "
+                "未搵到離線知識庫檔案。請先運行 "
                 "`python3 scripts/build_polyu_knowledge.py --knowledge-dir /home/jiaru/infoday/knowledge`。"
             )
 
         fact_hits = self._fact_hits(query)
         chunk_hits = self._chunk_hits(query, limit=self.config.max_chunks)
         if not fact_hits and not chunk_hits:
-            return "我在当前 PolyU 官方离线资料里没有找到足够相关的信息。请不要编造答案。"
+            return "我喺目前 PolyU 官方離線資料入面搵唔到足夠相關資訊。請唔好編造答案。"
 
         sections = [
-            "以下是 PolyU/EEE 官方离线资料检索结果。请只基于这些资料回答；官方英文名称保留原文；如果资料不足，要直接说明。",
+            "以下係 PolyU/EEE 官方離線資料檢索結果。請只基於呢啲資料回答；官方英文名稱保留原文；如果資料不足，要直接說明。",
         ]
         if fact_hits:
             sections.append("\n[结构化事实]\n" + "\n".join(f"- {hit}" for hit in fact_hits))
@@ -113,9 +114,9 @@ class PolyUKnowledgeSkill(Module):
                     "\n".join(
                         [
                             f"[{index}] {chunk.get('title', 'Untitled')}",
-                            f"来源: {chunk.get('source', 'unknown')}",
-                            f"中文提示: {chunk.get('audience_summary_zh', '')}",
-                            f"内容: {text}",
+                            f"來源: {chunk.get('source', 'unknown')}",
+                            f"中文提示: {_to_hk_traditional(str(chunk.get('audience_summary_zh', '')))}",
+                            f"原文內容: {text}",
                         ]
                     )
                 )
@@ -195,6 +196,7 @@ class PolyUKnowledgeSkill(Module):
                     [
                         str(chunk.get("title", "")),
                         str(chunk.get("audience_summary_zh", "")),
+                        str(chunk.get("search_text", "")),
                         " ".join(str(tag) for tag in chunk.get("tags", [])),
                         str(chunk.get("original_text", "")),
                     ]
@@ -219,11 +221,22 @@ def _programme_hits(label: str, data: dict[str, Any]) -> list[str]:
 
 
 def _normalize(text: str) -> str:
-    return re.sub(r"\s+", " ", text.casefold())
+    normalized = unicodedata.normalize("NFKC", text).casefold()
+    normalized = re.sub(r"(?<![a-z0-9])三\s*一\s*八\s*零(?![a-z0-9])", "js3180", normalized)
+    normalized = re.sub(r"(?<![a-z0-9])三千一百八十(?![a-z0-9])", "js3180", normalized)
+    normalized = re.sub(r"(?<![a-z0-9])三\s*一\s*七\s*零(?![a-z0-9])", "js3170", normalized)
+    normalized = _to_hk_traditional(normalized)
+    return re.sub(r"\s+", " ", normalized).strip()
+
+
+def _to_hk_traditional(text: str) -> str:
+    for simplified, traditional in _SIMPLIFIED_TO_HK_TRADITIONAL:
+        text = text.replace(simplified, traditional)
+    return text
 
 
 def _has_any(text: str, needles: Iterable[str]) -> bool:
-    return any(needle.casefold() in text for needle in needles)
+    return any(_normalize(needle) in text for needle in needles)
 
 
 def _query_tokens(query: str) -> list[str]:
@@ -232,10 +245,10 @@ def _query_tokens(query: str) -> list[str]:
     for segment in re.findall(r"[\u3400-\u9fff]+", normalized):
         tokens.update(segment[index : index + 2] for index in range(len(segment) - 1))
     for alias, expansions in _ALIASES.items():
-        if alias in normalized:
-            tokens.update(expansions)
+        if _normalize(alias) in normalized:
+            tokens.update(_normalize(expansion) for expansion in expansions)
     for phrase in _CHINESE_PHRASES:
-        if phrase in query:
+        if phrase in normalized:
             tokens.add(phrase)
     return sorted(token for token in tokens if len(token) > 1)
 
@@ -298,23 +311,70 @@ _ALIASES = {
     ],
     "a i": ["ai", "人工智能"],
     "分数": ["分數", "收生", "最佳", "加權"],
+    "幾多分": ["分數", "收生", "最佳五科", "加權", "jupas"],
+    "收分": ["分數", "收生", "最佳五科", "加權", "jupas"],
+    "js3180": ["js3180", "3180", "資訊", "人工智能", "工程"],
+    "js3170": ["js3170", "3170", "電機", "工程"],
 }
 
+_SIMPLIFIED_TO_HK_TRADITIONAL = tuple(
+    sorted(
+        {
+            "香港理工大学": "香港理工大學",
+            "电机及电子工程系": "電機及電子工程學系",
+            "电子计算学系": "電子計算學系",
+            "人工智能": "人工智能",
+            "信息安全": "資訊安全",
+            "物联网": "物聯網",
+            "研究方向": "研究方向",
+            "联系方式": "聯絡方式",
+            "本科": "本科",
+            "专业": "專業",
+            "课程": "課程",
+            "入学": "入學",
+            "申请": "申請",
+            "学校": "學校",
+            "大学": "大學",
+            "学系": "學系",
+            "电机": "電機",
+            "电子": "電子",
+            "信息": "資訊",
+            "联系": "聯絡",
+            "电话": "電話",
+            "邮箱": "電郵",
+            "办公室": "辦公室",
+            "毕业": "畢業",
+            "就业": "就業",
+            "实习": "實習",
+            "认证": "認可",
+            "认可": "認可",
+            "工程师": "工程師",
+            "区别": "分別",
+            "分别": "分別",
+            "分数": "分數",
+            "几多": "幾多",
+            "噶": "㗎",
+        }.items(),
+        key=lambda item: len(item[0]),
+        reverse=True,
+    )
+)
+
 _CHINESE_PHRASES = [
-    "香港理工大学",
+    "香港理工大學",
     "理大",
-    "电机及电子工程系",
-    "电机",
-    "电子工程",
+    "電機及電子工程學系",
+    "電機",
+    "電子工程",
     "本科",
-    "入学",
-    "申请",
+    "入學",
+    "申請",
     "研究方向",
-    "联系方式",
-    "办公室",
+    "聯絡方式",
+    "辦公室",
     "人工智能",
-    "信息安全",
-    "物联网",
+    "資訊安全",
+    "物聯網",
     "課程",
     "入學",
     "申請",

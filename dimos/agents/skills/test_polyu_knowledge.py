@@ -14,6 +14,8 @@
 
 import json
 
+import pytest
+
 # ruff: noqa: RUF001
 from dimos.agents.skills.polyu_knowledge import PolyUKnowledgeSkill
 
@@ -60,7 +62,7 @@ def test_polyu_knowledge_returns_structured_facts(tmp_path) -> None:  # type: ig
 
     assert "+852 2766 6150" in result
     assert "eee.notice@polyu.edu.hk" in result
-    assert "请只基于这些资料回答" in result
+    assert "請只基於呢啲資料回答" in result
 
 
 def test_polyu_knowledge_searches_chunks(tmp_path) -> None:  # type: ignore[no-untyped-def]
@@ -166,6 +168,56 @@ def test_polyu_knowledge_matches_q5_asr_variants(tmp_path) -> None:  # type: ign
     assert "JS3180 著重軟硬件結合與系統應用" in result
 
 
+@pytest.mark.parametrize(
+    "question",
+    [
+        "JS3180 要收幾多分㗎？",
+        "JS3180 要收几多分噶？",
+        "三一八零要收几多分噶？",
+        "三千一百八十要收幾多分？",
+    ],
+)
+def test_polyu_knowledge_matches_spoken_code_and_script_variants(
+    tmp_path,
+    question: str,
+) -> None:  # type: ignore[no-untyped-def]
+    processed = tmp_path / "processed"
+    processed.mkdir()
+    (processed / "facts.zh.json").write_text("{}", encoding="utf-8")
+    chunks = [
+        {
+            "id": "generic",
+            "source": "generic.html",
+            "title": "本科課程",
+            "audience_summary_zh": "一般本科課程資料。",
+            "original_text": "本科入學及課程簡介。",
+            "tags": ["本科"],
+        },
+        {
+            "id": "js3180-score",
+            "source": "JS3180_FAQ.docx",
+            "title": "常見問題（FAQ）– JS3180",
+            "audience_summary_zh": "JS3180 收生參考分數。",
+            "search_text": "JS3180 收生 分數 最佳五科 JUPAS",
+            "original_text": "JS3180 過往收生參考係最佳五科加權分數。",
+            "tags": ["JS3180", "收生"],
+        },
+    ]
+    (processed / "chunks.zh.jsonl").write_text(
+        "\n".join(json.dumps(chunk, ensure_ascii=False) for chunk in chunks) + "\n",
+        encoding="utf-8",
+    )
+    skill = PolyUKnowledgeSkill(knowledge_dir=tmp_path, max_chunks=1)
+
+    try:
+        skill.start()
+        result = skill.search_polyu_knowledge(question)
+    finally:
+        skill.stop()
+
+    assert "JS3180_FAQ.docx" in result
+
+
 def test_polyu_knowledge_reports_missing_files(tmp_path) -> None:  # type: ignore[no-untyped-def]
     skill = PolyUKnowledgeSkill(knowledge_dir=tmp_path)
 
@@ -175,4 +227,4 @@ def test_polyu_knowledge_reports_missing_files(tmp_path) -> None:  # type: ignor
     finally:
         skill.stop()
 
-    assert "未找到离线知识库文件" in result
+    assert "未搵到離線知識庫檔案" in result

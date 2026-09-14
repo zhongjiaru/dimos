@@ -85,7 +85,7 @@ def test_stereo_audio_is_mixed_and_resampled_for_go2() -> None:
 
     assert result.dtype == np.int16
     assert result.shape == (4410,)
-    assert np.all(result == 2000)
+    np.testing.assert_allclose(result, 2000, atol=1)
 
 
 def test_audio_can_use_lower_configured_wav_sample_rate() -> None:

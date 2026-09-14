@@ -12,10 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import queue
+
 import numpy as np
 
 from dimos.stream.audio.base import AudioEvent
-from dimos.stream.audio.stt.node_qwen3_asr import Qwen3AsrStreamingNode
+from dimos.stream.audio.stt.node_qwen3_asr import (
+    Qwen3AsrStreamingNode,
+    _audio_event_to_float32_bytes,
+)
 
 # ruff: noqa: RUF001
 
@@ -37,6 +42,18 @@ class _FakeResponse:
         return self.payload
 
 
+def test_qwen3_asr_resamples_browser_audio_with_expected_duration() -> None:
+    event = AudioEvent(np.full(4800, 0.25, dtype=np.float32), 48000, 1.0, 1)
+
+    pcm = np.frombuffer(
+        _audio_event_to_float32_bytes(event, target_sample_rate=16000),
+        dtype=np.float32,
+    )
+
+    assert pcm.shape == (1600,)
+    np.testing.assert_allclose(pcm, 0.25, atol=0.001)
+
+
 def test_qwen3_asr_uses_session_api_and_emits_final_text(mocker) -> None:  # type: ignore[no-untyped-def]
     """Qwen3 ASR streams float32 PCM chunks through the session API."""
     calls = []
@@ -56,7 +73,9 @@ def test_qwen3_asr_uses_session_api_and_emits_final_text(mocker) -> None:  # typ
         def close(self) -> None:
             pass
 
-    mocker.patch("dimos.stream.audio.stt.node_qwen3_asr.requests.Session", return_value=FakeSession())
+    mocker.patch(
+        "dimos.stream.audio.stt.node_qwen3_asr.requests.Session", return_value=FakeSession()
+    )
     node = Qwen3AsrStreamingNode(
         "http://localhost:8000",
         model="Qwen/Qwen3-ASR-0.6B",
@@ -98,3 +117,63 @@ def test_qwen3_asr_uses_session_api_and_emits_final_text(mocker) -> None:  # typ
         "Authorization": "Bearer test-key",
     }
     assert np.frombuffer(calls[1][1]["data"], dtype=np.float32).tolist() == [0.25, -0.25]
+
+
+def test_qwen3_asr_aggregates_browser_frames_into_half_second_requests(mocker) -> None:  # type: ignore[no-untyped-def]
+    session = mocker.Mock()
+    session.post.side_effect = [
+        _FakeResponse({"session_id": "session-1"}),
+        _FakeResponse({"text": "partial"}),
+        _FakeResponse({"text": "partial"}),
+        _FakeResponse({"text": "final"}),
+    ]
+    mocker.patch("dimos.stream.audio.stt.node_qwen3_asr.requests.Session", return_value=session)
+    node = Qwen3AsrStreamingNode("http://localhost:8000", request_chunk_sec=0.5)
+    emitted = []
+    subscription = node.emit_text().subscribe(emitted.append)
+    utterance_queue: queue.Queue[bytes | None] = queue.Queue()
+    for _index in range(6):
+        utterance_queue.put(np.zeros(1600, dtype=np.float32).tobytes())
+    utterance_queue.put(None)
+
+    try:
+        node._run_session_locked(utterance_queue, 1)
+    finally:
+        subscription.dispose()
+        node.dispose()
+
+    chunk_calls = [
+        call for call in session.post.call_args_list if call.args[0].endswith("/api/chunk")
+    ]
+    assert [len(call.kwargs["data"]) for call in chunk_calls] == [32000, 6400]
+    assert emitted == ["final"]
+
+
+def test_qwen3_asr_failed_utterance_does_not_terminate_text_stream(mocker) -> None:  # type: ignore[no-untyped-def]
+    session = mocker.Mock()
+    session.post.side_effect = [
+        RuntimeError("temporary failure"),
+        _FakeResponse({"session_id": "session-2"}),
+        _FakeResponse({"text": "partial"}),
+        _FakeResponse({"text": "第二次成功"}),
+    ]
+    mocker.patch("dimos.stream.audio.stt.node_qwen3_asr.requests.Session", return_value=session)
+    node = Qwen3AsrStreamingNode("http://localhost:8000")
+    emitted = []
+    subscription = node.emit_text().subscribe(emitted.append)
+
+    failed_queue: queue.Queue[bytes | None] = queue.Queue()
+    failed_queue.put(np.zeros(10, dtype=np.float32).tobytes())
+    failed_queue.put(None)
+    successful_queue: queue.Queue[bytes | None] = queue.Queue()
+    successful_queue.put(np.zeros(10, dtype=np.float32).tobytes())
+    successful_queue.put(None)
+
+    try:
+        node._run_session_locked(failed_queue, 1)
+        node._run_session_locked(successful_queue, 2)
+    finally:
+        subscription.dispose()
+        node.dispose()
+
+    assert emitted == ["", "第二次成功"]

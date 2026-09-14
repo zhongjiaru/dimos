@@ -74,7 +74,9 @@ must therefore call at least one of the two available tools; never respond with 
 # KNOWLEDGE
 - `answer_infoday_question` performs official knowledge lookup when needed, Cantonese response generation, TTS chunking, and Go2 streaming playback itself. Do not call `search_polyu_knowledge` again for the same answer.
 - Base answers only on retrieved official PolyU/EEE materials.
-- If the retrieved materials do not contain enough information, let the answer tool say so. Do not guess.
+- If the retrieved materials do not contain enough information, let the answer tool say so and
+  invite the user to choose a safe stationary demonstration such as waving or dancing. Do not
+  guess, claim an action happened, or execute an action until the user explicitly chooses one.
 
 # AUDIENCE
 - The user may be a secondary school student, parent, general visitor, current student, or researcher. Do not assume every question is an admissions question.
@@ -99,6 +101,7 @@ unitree_go2_infoday_agentic = autoconnect(
         max_tokens=128,
         allowed_tools=INFODAY_AGENT_TOOLS,
         require_tool_call=True,
+        suppress_final_ai_after_tool_call=True,
     ),
     InfodayActionSkill.blueprint(),
     WebInput.blueprint(
@@ -133,8 +136,8 @@ unitree_go2_infoday_agentic = autoconnect(
         tts_voice="cantonese",
         tts_sample_rate=24000,
         tts_response_format="pcm_s16le",
-        tts_stream=True,
-        tts_speed=1.2,
+        tts_stream=False,
+        tts_speed=1.0,
         min_tts_chunk_chars=24,
         max_tts_chunk_chars=45,
         wait_for_audio_playback=False,

@@ -68,6 +68,8 @@ def router_factory():  # type: ignore[no-untyped-def]
         "JUPAS 入學要求係咩？",
         "PolyU research ranking",
         "General Office 電話係幾多？",
+        "三一八零要收几多分噶？",
+        "今日有咩可以睇？",
     ],
 )
 def test_classifier_routes_clear_infoday_questions_directly(text: str) -> None:
@@ -93,7 +95,7 @@ def test_classifier_separates_direct_actions_from_mixed_or_ambiguous_input(
     assert classify_infoday_input(text) is expected
 
 
-def test_classifier_drops_empty_input() -> None:
+def test_classifier_routes_empty_input_to_repeat() -> None:
     assert classify_infoday_input("  ") is InputRoute.DROP
 
 
@@ -169,13 +171,15 @@ def test_router_asks_user_to_repeat_when_asr_returns_only_prompt(
     router.human_input.publish.assert_not_called()
 
 
-def test_router_still_drops_empty_asr_input(router_factory) -> None:  # type: ignore[no-untyped-def]
+def test_router_asks_to_repeat_empty_asr_input(router_factory) -> None:  # type: ignore[no-untyped-def]
     router = router_factory(asr_initial_prompt=ASR_INITIAL_PROMPT)
 
     router._on_input("  ")
 
-    assert router._answer_queue.empty()
-    router.voice_answer.ask_user_to_repeat.assert_not_called()
+    router._answer_queue.put_nowait(None)
+    router._run_answers()
+
+    router.voice_answer.ask_user_to_repeat.assert_called_once_with()
     router.human_input.publish.assert_not_called()
 
 

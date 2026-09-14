@@ -19,6 +19,7 @@ from __future__ import annotations
 import base64
 from io import BytesIO
 import json
+from math import gcd
 import queue
 import threading
 import time
@@ -28,6 +29,7 @@ import wave
 import numpy as np
 from numpy.typing import NDArray
 from reactivex.disposable import Disposable
+from scipy.signal import resample_poly
 import sounddevice as sd  # type: ignore[import-untyped]
 from unitree_webrtc_connect.constants import AUDIO_API, RTC_TOPIC
 
@@ -496,11 +498,12 @@ class Go2AudioBridgeModule(Module):
             usable = pcm.size - (pcm.size % frame.channels)
             pcm = pcm[:usable].reshape(-1, frame.channels).astype(np.int32).mean(axis=1)
         if frame.sample_rate != target_sample_rate and pcm.size:
-            output_size = round(pcm.size * target_sample_rate / frame.sample_rate)
-            pcm = np.interp(
-                np.linspace(0, pcm.size - 1, output_size),
-                np.arange(pcm.size),
+            divisor = gcd(frame.sample_rate, target_sample_rate)
+            pcm = resample_poly(
                 pcm,
+                target_sample_rate // divisor,
+                frame.sample_rate // divisor,
+                padtype="line",
             )
         return np.asarray(np.clip(pcm, INT16_MIN, INT16_MAX), dtype=np.int16)
 

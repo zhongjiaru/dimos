@@ -143,6 +143,8 @@ def test_web_input_can_use_qwen3_asr_backend(monkeypatch) -> None:  # type: igno
         "api_key": "test-key",
         "initial_prompt": "理大，EEE",
         "sample_rate": 16000,
+        "request_chunk_sec": 0.5,
+        "timeout": (2.0, 30.0),
     }
     assert instances[0].audio is not None
     assert instances[0].end is not None

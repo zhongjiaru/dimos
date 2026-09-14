@@ -26,6 +26,7 @@ from typing import Any, Literal
 
 import numpy as np
 from reactivex import Observable, Subject
+from reactivex.abc import DisposableBase
 import requests
 import soundfile as sf  # type: ignore[import-untyped]
 
@@ -69,7 +70,7 @@ class CosyVoice3TTSNode(AbstractTextConsumer, AbstractAudioEmitter, AbstractText
         self._audio_subject: Subject[AudioEvent] = Subject()
         self._text_subject: Subject[str] = Subject()
         self._text_queue: queue.Queue[str | None] = queue.Queue()
-        self._subscription = None
+        self._subscription: DisposableBase | None = None
         self._worker: threading.Thread | None = None
         self._session = requests.Session()
         self._closed = False
@@ -119,6 +120,7 @@ class CosyVoice3TTSNode(AbstractTextConsumer, AbstractAudioEmitter, AbstractText
             timeout=self.timeout,
         ) as response:
             response.raise_for_status()
+            response_sample_rate = _response_sample_rate(response, self.sample_rate)
             if self.response_format == "wav":
                 audio_data = io.BytesIO(response.content)
                 with sf.SoundFile(audio_data, "r") as sound_file:
@@ -134,7 +136,7 @@ class CosyVoice3TTSNode(AbstractTextConsumer, AbstractAudioEmitter, AbstractText
             if self.response_format == "ndjson_pcm_s16le":
                 yield from self._iter_ndjson_pcm(response)
                 return
-            yield from self._iter_pcm(response)
+            yield from self._iter_pcm(response, sample_rate=response_sample_rate)
 
     def dispose(self) -> None:
         self._closed = True
@@ -162,7 +164,12 @@ class CosyVoice3TTSNode(AbstractTextConsumer, AbstractAudioEmitter, AbstractText
                 logger.error("CosyVoice3 TTS request failed", error=str(exc))
                 self._audio_subject.on_error(exc)
 
-    def _iter_pcm(self, response: requests.Response) -> Iterator[AudioEvent]:
+    def _iter_pcm(
+        self,
+        response: requests.Response,
+        *,
+        sample_rate: int,
+    ) -> Iterator[AudioEvent]:
         if not self.stream:
             raw = response.content
             usable = len(raw) - (len(raw) % 2)
@@ -171,7 +178,7 @@ class CosyVoice3TTSNode(AbstractTextConsumer, AbstractAudioEmitter, AbstractText
             pcm = np.frombuffer(raw[:usable], dtype=np.int16).copy()
             yield AudioEvent(
                 data=pcm,
-                sample_rate=self.sample_rate,
+                sample_rate=sample_rate,
                 timestamp=time.time(),
                 channels=1,
             )
@@ -189,7 +196,7 @@ class CosyVoice3TTSNode(AbstractTextConsumer, AbstractAudioEmitter, AbstractText
             pcm = np.frombuffer(raw[:usable], dtype=np.int16).copy()
             yield AudioEvent(
                 data=pcm,
-                sample_rate=self.sample_rate,
+                sample_rate=sample_rate,
                 timestamp=time.time(),
                 channels=1,
             )
@@ -210,3 +217,16 @@ class CosyVoice3TTSNode(AbstractTextConsumer, AbstractAudioEmitter, AbstractText
             pcm = np.frombuffer(base64.b64decode(encoded), dtype=np.int16).copy()
             sample_rate = int(payload.get("sample_rate") or self.sample_rate)
             yield AudioEvent(data=pcm, sample_rate=sample_rate, timestamp=time.time(), channels=1)
+
+
+def _response_sample_rate(response: requests.Response, fallback: int) -> int:
+    """Use the service's actual PCM rate so playback speed and pitch stay correct."""
+    raw_value = response.headers.get("X-Sample-Rate")
+    if raw_value is None:
+        return fallback
+    try:
+        sample_rate = int(raw_value)
+    except (TypeError, ValueError):
+        logger.warning("Ignoring invalid TTS sample-rate header", value=raw_value)
+        return fallback
+    return sample_rate if sample_rate > 0 else fallback

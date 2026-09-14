@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+from math import gcd
 import queue
 import threading
 
@@ -23,6 +24,7 @@ from reactivex import Observable, Subject
 from reactivex.abc import DisposableBase
 from reactivex.disposable import CompositeDisposable
 import requests
+from scipy.signal import resample_poly
 
 from dimos.stream.audio.base import AbstractAudioConsumer, AudioEvent
 from dimos.stream.audio.text.base import AbstractTextEmitter
@@ -49,7 +51,8 @@ class Qwen3AsrStreamingNode(AbstractAudioConsumer, AbstractTextEmitter):
         api_key: str | None = None,
         initial_prompt: str | None = None,
         sample_rate: int = 16000,
-        timeout: float | tuple[float, float] | None = None,
+        request_chunk_sec: float = 0.5,
+        timeout: float | tuple[float, float] | None = (2.0, 30.0),
     ) -> None:
         self.endpoint = endpoint.rstrip("/")
         self.model = model
@@ -57,6 +60,7 @@ class Qwen3AsrStreamingNode(AbstractAudioConsumer, AbstractTextEmitter):
         self.api_key = api_key
         self.initial_prompt = initial_prompt
         self.sample_rate = sample_rate
+        self.request_chunk_sec = request_chunk_sec
         self.timeout = timeout
 
         self._text_subject: Subject[str] = Subject()
@@ -158,6 +162,9 @@ class Qwen3AsrStreamingNode(AbstractAudioConsumer, AbstractTextEmitter):
         latest_partial = ""
         audio_chunks = 0
         audio_bytes = 0
+        request_chunks = 0
+        request_bytes = max(4, round(self.sample_rate * 4 * self.request_chunk_sec))
+        pending = bytearray()
         try:
             session_id = self._start_session()
             logger.info(
@@ -172,19 +179,32 @@ class Qwen3AsrStreamingNode(AbstractAudioConsumer, AbstractTextEmitter):
                     break
                 audio_chunks += 1
                 audio_bytes += len(chunk)
-                text = self._push_chunk(session_id, chunk)
+                pending.extend(chunk)
+                while len(pending) >= request_bytes:
+                    request_chunk = bytes(pending[:request_bytes])
+                    del pending[:request_bytes]
+                    request_chunks += 1
+                    text = self._push_chunk(session_id, request_chunk)
+                    if text and text != latest_partial:
+                        latest_partial = text
+                        self._partial_text_subject.on_next(text)
+
+            if pending:
+                request_chunks += 1
+                text = self._push_chunk(session_id, bytes(pending))
                 if text and text != latest_partial:
-                    latest_partial = text
                     self._partial_text_subject.on_next(text)
 
             final_text = self._finish_session(session_id)
-            if final_text:
-                self._text_subject.on_next(final_text)
+            # Empty is an utterance result too: downstream can ask the visitor
+            # to repeat instead of silently doing nothing.
+            self._text_subject.on_next(final_text)
             logger.info(
                 "Qwen3-ASR utterance finished",
                 utterance_id=utterance_id,
                 session_id=session_id,
                 audio_chunks=audio_chunks,
+                request_chunks=request_chunks,
                 audio_duration_sec=round(audio_bytes / (4 * self.sample_rate), 3),
                 final_text=final_text or "<empty>",
             )
@@ -194,10 +214,13 @@ class Qwen3AsrStreamingNode(AbstractAudioConsumer, AbstractTextEmitter):
                 utterance_id=utterance_id,
                 session_id=session_id,
                 audio_chunks=audio_chunks,
+                request_chunks=request_chunks,
                 audio_duration_sec=round(audio_bytes / (4 * self.sample_rate), 3),
                 error=str(exc),
             )
-            self._text_subject.on_error(exc)
+            # A single failed HTTP utterance must not terminate the shared Rx
+            # subject; emit an empty result and keep later utterances usable.
+            self._text_subject.on_next("")
         finally:
             try:
                 self._workers.remove(threading.current_thread())
@@ -270,11 +293,12 @@ def _audio_event_to_float32_bytes(event: AudioEvent, *, target_sample_rate: int)
             return b""
         audio = audio[:usable].reshape(-1, event.channels).mean(axis=1)
     if event.sample_rate != target_sample_rate and audio.size:
-        output_size = round(audio.size * target_sample_rate / event.sample_rate)
-        audio = np.interp(
-            np.linspace(0, audio.size - 1, output_size),
-            np.arange(audio.size),
+        divisor = gcd(event.sample_rate, target_sample_rate)
+        audio = resample_poly(
             audio,
+            target_sample_rate // divisor,
+            event.sample_rate // divisor,
+            padtype="line",
         ).astype(np.float32)
     return np.clip(audio, -1.0, 1.0).astype(np.float32).tobytes()
 

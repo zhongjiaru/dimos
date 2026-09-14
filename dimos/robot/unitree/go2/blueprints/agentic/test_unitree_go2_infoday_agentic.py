@@ -69,6 +69,8 @@ def test_infoday_prompt_keeps_capability_speech_and_action_in_one_tool() -> None
     )
     assert "Do not emit both tool calls in one assistant" in INFODAY_SYSTEM_PROMPT
     assert "Never substitute a different physical action" in INFODAY_SYSTEM_PROMPT
+    assert "invite the user to choose a safe stationary demonstration" in INFODAY_SYSTEM_PROMPT
+    assert "until the user explicitly chooses one" in INFODAY_SYSTEM_PROMPT
 
 
 def test_infoday_blueprint_streams_audio_to_go2_without_local_debug_playback() -> None:

@@ -380,7 +380,7 @@
         }
 
         function cleanupAudio() {
-            if (processor) processor.onaudioprocess = null;
+            if (processor) processor.port.onmessage = null;
             if (processor) processor.disconnect();
             if (silentOutput) silentOutput.disconnect();
             if (mediaSource) mediaSource.disconnect();
@@ -465,7 +465,47 @@
             audioContext = new AudioContext();
             await audioContext.resume();
             mediaSource = audioContext.createMediaStreamSource(microphoneStream);
-            processor = audioContext.createScriptProcessor(2048, 1, 1);
+            const workletSource = `
+                class DimosMicrophoneProcessor extends AudioWorkletProcessor {
+                    constructor() {
+                        super();
+                        this.buffer = new Float32Array(2048);
+                        this.offset = 0;
+                    }
+
+                    process(inputs) {
+                        const input = inputs[0] && inputs[0][0];
+                        if (input) {
+                            let inputOffset = 0;
+                            while (inputOffset < input.length) {
+                                const count = Math.min(
+                                    input.length - inputOffset,
+                                    this.buffer.length - this.offset,
+                                );
+                                this.buffer.set(input.subarray(inputOffset, inputOffset + count), this.offset);
+                                inputOffset += count;
+                                this.offset += count;
+                                if (this.offset === this.buffer.length) {
+                                    this.port.postMessage(this.buffer.buffer, [this.buffer.buffer]);
+                                    this.buffer = new Float32Array(2048);
+                                    this.offset = 0;
+                                }
+                            }
+                        }
+                        return true;
+                    }
+                }
+                registerProcessor('dimos-microphone-processor', DimosMicrophoneProcessor);
+            `;
+            const workletUrl = URL.createObjectURL(
+                new Blob([workletSource], { type: 'application/javascript' }),
+            );
+            try {
+                await audioContext.audioWorklet.addModule(workletUrl);
+            } finally {
+                URL.revokeObjectURL(workletUrl);
+            }
+            processor = new AudioWorkletNode(audioContext, 'dimos-microphone-processor');
             silentOutput = audioContext.createGain();
             silentOutput.gain.value = 0;
             audioSocket = new WebSocket(audioSocketUrl());
@@ -479,10 +519,9 @@
                 channels: 1,
             }));
             await started;
-            processor.onaudioprocess = event => {
+            processor.port.onmessage = event => {
                 if (!isRecording || socket.readyState !== WebSocket.OPEN) return;
-                const input = event.inputBuffer.getChannelData(0);
-                socket.send(new Float32Array(input).buffer);
+                socket.send(event.data);
             };
             mediaSource.connect(processor);
             processor.connect(silentOutput);
@@ -499,7 +538,7 @@
         }
 
         async function stopVoiceStreaming() {
-            // Keep one short tail so the final phoneme reaches ScriptProcessor.
+            // Keep one short tail so the final phoneme reaches the AudioWorklet.
             await new Promise(resolve => setTimeout(resolve, AUDIO_STOP_TAIL_MS));
             isRecording = false;
             if (!audioSocket || audioSocket.readyState !== WebSocket.OPEN) {

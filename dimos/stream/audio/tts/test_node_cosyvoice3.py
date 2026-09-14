@@ -19,6 +19,7 @@ from dimos.stream.audio.tts.node_cosyvoice3 import CosyVoice3TTSNode
 
 class _FakeResponse:
     content = b""
+    headers: dict[str, str] = {}
 
     def __enter__(self):  # type: ignore[no-untyped-def]
         return self
@@ -37,6 +38,10 @@ class _FakeResponse:
 
 class _FakeCompleteResponse(_FakeResponse):
     content = np.array([1, -2, 3], dtype=np.int16).tobytes()
+
+
+class _FakeRateResponse(_FakeCompleteResponse):
+    headers = {"X-Sample-Rate": "48000"}
 
 
 def test_cosyvoice3_tts_streams_pcm_audio_events(mocker) -> None:  # type: ignore[no-untyped-def]
@@ -91,3 +96,17 @@ def test_cosyvoice3_tts_can_return_complete_pcm_audio_event(mocker) -> None:  # 
     assert events[0].data.tolist() == [1, -2, 3]
     client.post.assert_called_once()
     assert client.post.call_args.kwargs["json"]["stream"] is False
+
+
+def test_cosyvoice3_tts_uses_actual_pcm_sample_rate_header(mocker) -> None:  # type: ignore[no-untyped-def]
+    client = mocker.Mock()
+    client.post.return_value = _FakeRateResponse()
+    mocker.patch("dimos.stream.audio.tts.node_cosyvoice3.requests.Session", return_value=client)
+    node = CosyVoice3TTSNode("http://localhost:8001/tts", sample_rate=24000, stream=False)
+
+    try:
+        events = list(node.iter_audio_events("你好呀"))
+    finally:
+        node.dispose()
+
+    assert events[0].sample_rate == 48000

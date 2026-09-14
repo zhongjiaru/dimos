@@ -55,8 +55,10 @@ Answer in natural Hong Kong Cantonese speech, using Traditional Chinese characte
 Do not use Mainland Mandarin written style. Avoid phrases like 因此、此外、首先、綜上所述.
 Use concise spoken Cantonese phrases like 呢個、可以、如果你想知、我哋、會、係.
 Keep official English names unchanged when needed, for example PolyU, EEE, BEng(Hons), BSc(Hons).
+Write programme and subject codes in their official compact form, for example JS3180 or CLC1104C.
 Base the answer only on the provided official offline knowledge context.
-If the context is insufficient, say briefly in Cantonese that the current official offline materials do not include that detail, then suggest a topic you can answer.
+If the context is insufficient, say briefly in Cantonese that the current official offline materials do not include that detail, then invite the user to choose a safe stationary robot demonstration such as waving or dancing.
+Only offer the action; do not claim that it has happened or trigger it before the user explicitly chooses one.
 Answer in exactly two short spoken sentences, ideally under 80 Chinese characters in total.
 The first sentence must answer the question directly. The second must invite one relevant next interaction with at most two concrete choices.
 Avoid generic endings such as 仲有咩可以幫你. Vary the invitation to fit the topic.
@@ -131,6 +133,10 @@ class InfodayVoiceAnswerConfig(ModuleConfig):
     # canto-tts 0.1.x treats this as a local ONNX bundle path. None activates
     # the SDK's Hugging Face download for typangaa/canto-tts-nano.
     canto_tts_checkpoint: str | None = None
+    canto_tts_quality: Literal["duration_filter", "best_of_n"] | None = "duration_filter"
+    canto_tts_max_attempts: int = Field(default=3, ge=1, le=10)
+    canto_tts_text_temperature: float = Field(default=0.2, gt=0.0, le=2.0)
+    canto_tts_audio_temperature: float = Field(default=0.2, gt=0.0, le=2.0)
     cosyvoice2_model_dir: str = COSYVOICE2_YUE_MODEL
     cosyvoice2_endpoint: str | None = "http://127.0.0.1:50000"
     cosyvoice2_prompt_audio: str | None = None
@@ -292,7 +298,6 @@ class InfodayVoiceAnswerSkill(Module):
                         answer=answer_text,
                         text_chars=len(answer_text),
                     )
-                    self.infoday_answer.publish(answer_text)
                 else:
                     errors.put(RuntimeError("response LLM returned an empty answer"))
             except Exception as exc:
@@ -317,6 +322,7 @@ class InfodayVoiceAnswerSkill(Module):
             try:
                 error = errors.get_nowait()
             except queue.Empty:
+                self.infoday_answer.publish(answer_text)
                 return f"Answered Info Day question in Cantonese: {clean_question}"
             try:
                 self._speak_locked(INFODAY_ERROR_RESPONSE)
@@ -354,8 +360,8 @@ class InfodayVoiceAnswerSkill(Module):
         return f"Spoke Info Day message: {clean_text}"
 
     def _speak_locked(self, text: str) -> None:
-        self.infoday_answer.publish(text)
         self._stream_text_to_speaker(text)
+        self.infoday_answer.publish(text)
 
     def _stream_text_to_speaker(self, text: str) -> None:
         audio_events = self._publish_tts_chunk(
@@ -383,7 +389,8 @@ class InfodayVoiceAnswerSkill(Module):
         audio_chunks = 0
         audio_duration_sec = 0.0
         audio_events: list[AudioEvent] = []
-        for audio_event in tts_node.iter_audio_events(text):
+        speech_text = _text_for_speech(text)
+        for audio_event in tts_node.iter_audio_events(speech_text):
             channels = max(1, audio_event.channels)
             if audio_chunks == 0:
                 logger.info(
@@ -394,13 +401,13 @@ class InfodayVoiceAnswerSkill(Module):
                     sample_rate=audio_event.sample_rate,
                 )
             audio_events.append(audio_event)
-            if play_audio_immediately:
-                if not self.audio_bridge.play_audio([audio_event], wait_for_playback=False):
-                    raise RuntimeError("Go2 audio bridge failed to enqueue streaming audio")
-            elif publish_audio:
+            if not play_audio_immediately and publish_audio:
                 self.operator_audio.publish(audio_event)
             audio_chunks += 1
             audio_duration_sec += _audio_duration(audio_event)
+        if play_audio_immediately and audio_events:
+            if not self.audio_bridge.play_audio(audio_events, wait_for_playback=False):
+                raise RuntimeError("Go2 audio bridge failed to enqueue streaming audio")
         logger.info(
             "InfoDay TTS complete",
             duration_ms=round((time.monotonic() - started_at) * 1000.0, 1),
@@ -494,7 +501,13 @@ class InfodayVoiceAnswerSkill(Module):
 
     def _make_tts_node(self) -> _TTSNode:
         if self.config.tts_backend == "canto-tts":
-            return CantoTTSNode(checkpoint=self.config.canto_tts_checkpoint)
+            return CantoTTSNode(
+                checkpoint=self.config.canto_tts_checkpoint,
+                quality=self.config.canto_tts_quality,
+                max_attempts=self.config.canto_tts_max_attempts,
+                text_temperature=self.config.canto_tts_text_temperature,
+                audio_temperature=self.config.canto_tts_audio_temperature,
+            )
         if self.config.tts_backend == "cosyvoice2-yue-zoengjyutgaai":
             if self.config.cosyvoice2_endpoint is not None:
                 return CosyVoice2YueHTTPNode(
@@ -589,28 +602,46 @@ class _TextChunker:
 
     def _best_split(self, *, final: bool) -> int | None:
         text = self._buffer
-        if final:
-            return len(text)
-        if len(text) < self.min_chars:
+        if not final and len(text) < self.min_chars:
             return None
-        window = text[: self.max_chars]
         sentence_matches = [
             match
-            for match in re.finditer(r"[\u3002\uFF01\uFF1F!?]\s*", window)
+            for match in re.finditer(r"[\u3002\uFF01\uFF1F!?]\s*", text)
             if match.end() >= self.min_chars
         ]
         if sentence_matches:
-            return sentence_matches[-1].end()
+            return sentence_matches[0].end()
+        if not final:
+            return None
+        if len(text) <= self.max_chars:
+            return len(text)
+        window = text[: self.max_chars]
         natural_matches = [
             match
             for match in re.finditer(r"[\uFF0C,\uFF1B;\u3001]\s*|\s+", window)
             if match.end() >= self.min_chars
         ]
-        if natural_matches:
-            return natural_matches[0].end()
-        if len(text) >= self.max_chars:
-            return self.max_chars
-        return None
+        split_at = natural_matches[-1].end() if natural_matches else self.max_chars
+        if len(text) - split_at < self.min_chars:
+            return len(text)
+        return split_at
+
+
+_SPOKEN_DIGITS = str.maketrans("0123456789", "零一二三四五六七八九")
+_PROGRAMME_CODE_RE = re.compile(
+    r"(?<![A-Za-z0-9])(?=[A-Z0-9-]*[A-Z])(?=[A-Z0-9-]*\d)"
+    r"[A-Z0-9]+(?:-[A-Z0-9]+)*(?![A-Za-z0-9])"
+)
+
+
+def _text_for_speech(text: str) -> str:
+    """Make compact programme codes unambiguous without changing display text."""
+
+    def expand_code(match: re.Match[str]) -> str:
+        characters = [character.translate(_SPOKEN_DIGITS) for character in match.group(0)]
+        return " ".join(characters)
+
+    return _PROGRAMME_CODE_RE.sub(expand_code, text)
 
 
 def _fast_infoday_answer(question: str) -> str | None:

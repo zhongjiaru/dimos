@@ -275,15 +275,18 @@ def _chunk_document(document: Document, max_chars: int = 1800) -> list[dict[str,
         if not current:
             return
         text = "\n".join(current).strip()
+        summary = _summary_zh(document.title, text)
+        tags = _tags_for(document.title, text)
         chunks.append(
             {
                 "id": f"{_safe_name(document.source_id)}_{chunk_index:04d}",
                 "source_type": document.source_type,
                 "source": document.source,
                 "title": document.title,
-                "audience_summary_zh": _summary_zh(document.title, text),
+                "audience_summary_zh": summary,
+                "search_text": " ".join([document.title, summary, *tags]),
                 "original_text": text,
-                "tags": _tags_for(document.title, text),
+                "tags": tags,
             }
         )
         chunk_index += 1
@@ -306,22 +309,22 @@ def _chunk_document(document: Document, max_chars: int = 1800) -> list[dict[str,
 def _summary_zh(title: str, text: str) -> str:
     lower = f"{title}\n{text}".lower()
     if "faq" in lower or "js3180" in lower:
-        return "这段资料来自 JS3180 资讯及人工智能工程课程常见问题，可用于回答课程、入学、就业、专业认可、实习或交流问题。"
+        return "呢段資料來自 JS3180 資訊及人工智能工程課程常見問題，可用嚟回答課程、入學、就業、專業認可、實習或交流問題。"
     if "contact us" in lower:
-        return "这段资料提供 EEE 学系办公室地址、电话、电邮和官方网站等联系方式。"
+        return "呢段資料提供 EEE 學系辦公室地址、電話、電郵同官方網站等聯絡方式。"
     if "vision" in lower and "mission" in lower:
         return (
-            "这段资料介绍 EEE 的愿景和使命，包括教育、科研、知识转移和面向未来社会的工程人才培养。"
+            "呢段資料介紹 EEE 嘅願景同使命，包括教育、科研、知識轉移同面向未來社會嘅工程人才培養。"
         )
     if "message from head" in lower:
-        return "这段资料介绍 EEE 学系的成立背景、课程覆盖、研究方向和学系定位。"
+        return "呢段資料介紹 EEE 學系嘅成立背景、課程範圍、研究方向同學系定位。"
     if "research themes" in lower or "research" in lower:
-        return "这段资料介绍 EEE 的研究方向和科研优势。"
+        return "呢段資料介紹 EEE 嘅研究方向同科研優勢。"
     if "undergraduate" in lower or "beng" in lower or "bsc" in lower:
-        return "这段资料介绍 EEE 本科课程、专业方向、入学路径或课程要求。"
+        return "呢段資料介紹 EEE 本科課程、專業方向、入學途徑或課程要求。"
     if "polyu" in lower or "hong kong polytechnic university" in lower:
-        return "这段资料介绍香港理工大学的学校信息、学习体验、排名或本科招生入口。"
-    return "这段资料来自 PolyU 官方材料，可用于回答学校、学系或课程相关问题。"
+        return "呢段資料介紹香港理工大學嘅學校資訊、學習體驗、排名或本科招生入口。"
+    return "呢段資料來自 PolyU 官方材料，可用嚟回答學校、學系或課程相關問題。"
 
 
 def _tags_for(title: str, text: str) -> list[str]:
@@ -333,10 +336,10 @@ def _tags_for(title: str, text: str) -> list[str]:
         ("PolyU", ["polyu", "hong kong polytechnic university"]),
         ("EEE", ["electrical and electronic engineering", "eee"]),
         ("本科", ["undergraduate", "bachelor", "beng", "bsc", "jupas"]),
-        ("入学", ["admission", "jupas", "applicant", "entrance"]),
-        ("课程", ["programme", "curriculum", "scheme", "award"]),
+        ("入學", ["admission", "jupas", "applicant", "entrance"]),
+        ("課程", ["programme", "curriculum", "scheme", "award"]),
         ("研究", ["research", "laborator", "innovation"]),
-        ("联系方式", ["contact", "phone", "email", "general office"]),
+        ("聯絡方式", ["contact", "phone", "email", "general office"]),
         ("排名", ["ranking", "qs", "times higher education", "u.s. news"]),
     ]
     for tag, needles in candidates:
@@ -347,20 +350,20 @@ def _tags_for(title: str, text: str) -> list[str]:
 
 def _facts() -> dict[str, Any]:
     return {
-        "language": "zh-Hans",
-        "audience_note": "默认用普通话简体中文回答，面向中学生、家长、访客和一般咨询者。官方英文名称保留原文。",
+        "language": "zh-Hant-HK",
+        "audience_note": "預設用香港粵語繁體中文回答，面向中學生、家長、訪客同一般諮詢者。官方英文名稱保留原文。",
         "polyu": {
             "official_name_en": "The Hong Kong Polytechnic University",
-            "official_name_zh": "香港理工大学",
+            "official_name_zh": "香港理工大學",
             "undergraduate_admissions_url": "https://www.polyu.edu.hk/study/ug/",
             "main_site_url": "https://www.polyu.edu.hk/",
-            "faculties_schools_note_zh": "PolyU 本科招生网页介绍，学校有多个学院、学校和本科生院，提供跨学科学习机会。",
+            "faculties_schools_note_zh": "PolyU 本科招生網頁介紹，學校有多個學院、學校同本科生院，提供跨學科學習機會。",
         },
         "eee": {
             "official_name_en": "Department of Electrical and Electronic Engineering",
-            "official_name_zh": "电机及电子工程系",
+            "official_name_zh": "電機及電子工程學系",
             "faculty_en": "Faculty of Engineering",
-            "faculty_zh": "工程学院",
+            "faculty_zh": "工程學院",
             "formed_on": "2023-07-01",
             "formed_from": [
                 "Department of Electrical Engineering",
@@ -382,8 +385,8 @@ def _facts() -> dict[str, Any]:
                 "Photonics and Smart Devices (PSD)",
                 "Power & Energy Systems (PES)",
             ],
-            "vision_zh": "成为电机及电子工程教育、科研及知识转移上的世界领先学系，以国际一流的科研及专业知识推动未来社会发展。",
-            "mission_zh": "在能源、通讯、光电、智能、量子及电动交通领域，引领创新并培育具备全球视野与实践能力的未来领袖。",
+            "vision_zh": "成為電機及電子工程教育、科研及知識轉移上嘅世界領先學系，以國際一流嘅科研及專業知識推動未來社會發展。",
+            "mission_zh": "喺能源、通訊、光電、智能、量子及電動交通領域，引領創新並培育具備全球視野同實踐能力嘅未來領袖。",
             "undergraduate_programmes": [
                 "Bachelor of Engineering (Hons) Scheme in Electrical Engineering",
                 "Bachelor of Engineering (Hons) / Bachelor of Science (Hons) Scheme in Information and Artificial Intelligence Engineering",
@@ -485,29 +488,29 @@ def build(knowledge_dir: Path, urls: list[str]) -> None:
 
 def _qa_seed() -> list[dict[str, str]]:
     questions = [
-        "香港理工大学是什么学校？",
-        "EEE 是什么学系？",
-        "EEE 是什么时候成立的？",
-        "电机及电子工程系由哪两个学系合并而来？",
-        "EEE 有哪些研究方向？",
-        "EEE 学系办公室在哪里？",
-        "EEE 的联系电话和邮箱是什么？",
-        "EEE 有哪些本科 scheme？",
-        "EE scheme 有哪些 award？",
-        "IAIE scheme 有哪些专业方向？",
-        "中学生想了解 EEE，应该先知道什么？",
-        "EEE 和人工智能有什么关系？",
-        "EEE 的愿景是什么？",
-        "EEE 的使命是什么？",
-        "理大本科招生页面在哪里？",
-        "JS3180 主要学习什么？",
-        "没有读 M1、M2 或 ICT 可以申请 JS3180 吗？",
-        "JS3180 有哪些主修方向？",
-        "JS3180 的收生要求和参考分数是多少？",
-        "JS3180 毕业后有哪些就业出路？",
-        "JS3180 是否获得 HKIE 专业认可？",
-        "JS3180 有没有实习和海外交流机会？",
-        "JS3180 毕业生的起薪和就业率如何？",
+        "香港理工大學係一間點樣嘅學校？",
+        "EEE 係咩學系？",
+        "EEE 係幾時成立嘅？",
+        "電機及電子工程學系由邊兩個學系合併而成？",
+        "EEE 有邊啲研究方向？",
+        "EEE 學系辦公室喺邊度？",
+        "EEE 嘅聯絡電話同電郵係咩？",
+        "EEE 有邊啲本科 scheme？",
+        "EE scheme 有邊啲 award？",
+        "IAIE scheme 有邊啲專業方向？",
+        "中學生想了解 EEE，應該先知道啲咩？",
+        "EEE 同人工智能有咩關係？",
+        "EEE 嘅願景係咩？",
+        "EEE 嘅使命係咩？",
+        "理大本科招生頁面喺邊度？",
+        "JS3180 主要學啲咩？",
+        "冇讀 M1、M2 或 ICT 可以申請 JS3180 嗎？",
+        "JS3180 有邊啲主修方向？",
+        "JS3180 嘅收生要求同參考分數係幾多？",
+        "JS3180 畢業後有邊啲就業出路？",
+        "JS3180 有冇獲得 HKIE 專業認可？",
+        "JS3180 有冇實習同海外交流機會？",
+        "JS3180 畢業生嘅起薪同就業率係點？",
     ]
     return [{"question": question} for question in questions]
 

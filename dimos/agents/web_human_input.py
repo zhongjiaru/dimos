@@ -13,7 +13,7 @@
 # limitations under the License.
 
 from threading import Thread
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 import reactivex as rx
 import reactivex.operators as ops
@@ -41,6 +41,8 @@ class WebInputConfig(ModuleConfig):
     stt_endpoint: str | None = None
     stt_api_key: str | None = None
     stt_sample_rate: int = 16000
+    stt_request_chunk_sec: float = 0.5
+    stt_timeout_sec: float = 30.0
 
 
 class WebInput(Module):
@@ -86,21 +88,23 @@ class WebInput(Module):
         self,
         audio_subject: rx.subject.Subject["AudioEvent"],
         audio_end_subject: rx.subject.Subject[None],
-    ):
+    ) -> Any:
         audio_stream = audio_subject.pipe(ops.share())
         if self.config.stt_backend == "qwen3_asr":
             from dimos.stream.audio.stt.node_qwen3_asr import Qwen3AsrStreamingNode
 
             endpoint = self.config.stt_endpoint or "http://localhost:8000"
-            stt_node = Qwen3AsrStreamingNode(
+            qwen_node = Qwen3AsrStreamingNode(
                 endpoint=endpoint,
                 model=self.config.stt_model,
                 language=self.config.stt_language or "Cantonese",
                 api_key=self.config.stt_api_key,
                 initial_prompt=self.config.stt_initial_prompt,
                 sample_rate=self.config.stt_sample_rate,
+                request_chunk_sec=self.config.stt_request_chunk_sec,
+                timeout=(2.0, self.config.stt_timeout_sec),
             )
-            stt_node.consume_audio(audio_stream).consume_end(audio_end_subject)
+            qwen_node.consume_audio(audio_stream).consume_end(audio_end_subject)
             logger.info(
                 "Configured web speech-to-text",
                 stt_backend=self.config.stt_backend,
@@ -108,7 +112,7 @@ class WebInput(Module):
                 stt_model=self.config.stt_model,
                 stt_language=self.config.stt_language,
             )
-            return stt_node
+            return qwen_node
 
         normalizer = AudioNormalizer()
 
@@ -121,7 +125,7 @@ class WebInput(Module):
         if self.config.stt_initial_prompt:
             modelopts["initial_prompt"] = self.config.stt_initial_prompt
 
-        stt_node = WhisperNode(model=self.config.stt_model, modelopts=modelopts)
+        whisper_node = WhisperNode(model=self.config.stt_model, modelopts=modelopts)
         logger.info(
             "Configured web speech-to-text",
             stt_backend=self.config.stt_backend,
@@ -131,8 +135,8 @@ class WebInput(Module):
         )
 
         normalizer.consume_audio(audio_stream)
-        stt_node.consume_audio(normalizer.emit_audio())
-        return stt_node
+        whisper_node.consume_audio(normalizer.emit_audio())
+        return whisper_node
 
     @rpc
     def stop(self) -> None:

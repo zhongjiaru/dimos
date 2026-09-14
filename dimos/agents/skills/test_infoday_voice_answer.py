@@ -12,15 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from threading import Event
+
 import numpy as np
 import pytest
 
 from dimos.agents.skills.infoday_voice_answer import (
+    INFODAY_CANTONESE_RESPONSE_PROMPT,
     INFODAY_ERROR_RESPONSE,
     INFODAY_IDENTITY_ANSWER,
     INFODAY_REPEAT_REQUEST,
     InfodayVoiceAnswerSkill,
     _fast_infoday_answer,
+    _text_for_speech,
     _TextChunker,
 )
 from dimos.stream.audio.base import AudioEvent
@@ -28,24 +32,37 @@ from dimos.stream.audio.base import AudioEvent
 # ruff: noqa: RUF001
 
 
+def test_response_prompt_offers_an_action_when_official_context_is_insufficient() -> None:
+    assert "invite the user to choose a safe stationary robot demonstration" in (
+        INFODAY_CANTONESE_RESPONSE_PROMPT
+    )
+    assert "do not claim that it has happened" in INFODAY_CANTONESE_RESPONSE_PROMPT
+
+
 def test_text_chunker_splits_on_comma_after_minimum() -> None:
-    """Text chunking emits a natural phrase before the complete sentence arrives."""
+    """Text chunking waits for a complete sentence instead of emitting a short tail."""
     chunker = _TextChunker(min_chars=8, max_chars=40)
 
     chunks = chunker.feed("理大 EEE 呢個課程，")
     chunks.extend(chunker.feed("幾適合想學 AI 嘅同學。下一句"))
     chunks.extend(chunker.flush())
 
-    assert chunks == ["理大 EEE 呢個課程，", "幾適合想學 AI 嘅同學。", "下一句"]
+    assert chunks == ["理大 EEE 呢個課程，幾適合想學 AI 嘅同學。", "下一句"]
 
 
-def test_text_chunker_enforces_maximum_without_natural_boundary() -> None:
+def test_tts_expands_programme_code_digits_without_changing_other_numbers() -> None:
+    assert _text_for_speech("JS3180 參考分數係 23.4 分。") == (
+        "J S 三 一 八 零 參考分數係 23.4 分。"
+    )
+
+
+def test_text_chunker_avoids_a_tiny_final_fragment() -> None:
     chunker = _TextChunker(min_chars=8, max_chars=12)
 
     chunks = chunker.feed("甲乙丙丁戊己庚辛壬癸子丑寅卯")
     chunks.extend(chunker.flush())
 
-    assert chunks == ["甲乙丙丁戊己庚辛壬癸子丑", "寅卯"]
+    assert chunks == ["甲乙丙丁戊己庚辛壬癸子丑寅卯"]
 
 
 def test_infoday_voice_answer_streams_tts_audio_to_operator_audio(mocker) -> None:  # type: ignore[no-untyped-def]
@@ -57,7 +74,7 @@ def test_infoday_voice_answer_streams_tts_audio_to_operator_audio(mocker) -> Non
     skill.infoday_answer = mocker.Mock()
     skill.operator_audio = mocker.Mock()
     mocker.patch.object(
-        skill, "_stream_response", return_value=iter(["理大 EEE 呢個課程，", "幾適合你。"])
+        skill, "_stream_response", return_value=iter(["理大 EEE 呢個課", "程。幾適合你。"])
     )
     frame_a = AudioEvent(np.array([1], dtype=np.int16), 24000, 1.0, 1)
     frame_b = AudioEvent(np.array([2], dtype=np.int16), 24000, 1.1, 1)
@@ -73,14 +90,54 @@ def test_infoday_voice_answer_streams_tts_audio_to_operator_audio(mocker) -> Non
     assert result == "Answered Info Day question in Cantonese: EEE 有咩讀？"
     skill.polyu_knowledge.search_polyu_knowledge.assert_called_once_with("EEE 有咩讀？")
     assert [call.args[0] for call in tts_node.iter_audio_events.call_args_list] == [
-        "理大 EEE 呢個課程，",
+        "理大 EEE 呢個課程。",
         "幾適合你。",
     ]
     assert [call.args[0] for call in skill.operator_audio.publish.call_args_list] == [
         frame_a,
         frame_b,
     ]
-    skill.infoday_answer.publish.assert_called_once_with("理大 EEE 呢個課程，幾適合你。")
+    skill.infoday_answer.publish.assert_called_once_with("理大 EEE 呢個課程。幾適合你。")
+
+
+def test_infoday_voice_answer_starts_first_sentence_tts_before_response_finishes(
+    mocker,
+) -> None:  # type: ignore[no-untyped-def]
+    skill = InfodayVoiceAnswerSkill(min_tts_chunk_chars=4, max_tts_chunk_chars=40)
+    skill._client = mocker.Mock()
+    skill.polyu_knowledge = mocker.Mock()
+    skill.polyu_knowledge.search_polyu_knowledge.return_value = "official context"
+    skill.infoday_answer = mocker.Mock()
+    skill.operator_audio = mocker.Mock()
+    first_tts_started = Event()
+
+    def response_stream(_question: str, _knowledge: str):  # type: ignore[no-untyped-def]
+        yield "第一句完整答案。"
+        assert first_tts_started.wait(timeout=1.0)
+        yield "第二句邀請。"
+
+    mocker.patch.object(skill, "_stream_response", side_effect=response_stream)
+    frame = AudioEvent(np.array([1], dtype=np.int16), 24000, 1.0, 1)
+    tts_node = mocker.Mock()
+
+    def synthesize(text: str) -> list[AudioEvent]:
+        if text == "第一句完整答案。":
+            first_tts_started.set()
+        return [frame]
+
+    tts_node.iter_audio_events.side_effect = synthesize
+    mocker.patch.object(skill, "_make_tts_node", return_value=tts_node)
+
+    try:
+        result = skill.answer_infoday_question("問題")
+    finally:
+        skill.stop()
+
+    assert result == "Answered Info Day question in Cantonese: 問題"
+    assert [call.args[0] for call in tts_node.iter_audio_events.call_args_list] == [
+        "第一句完整答案。",
+        "第二句邀請。",
+    ]
 
 
 def test_infoday_voice_answer_waits_for_complete_combined_playback(mocker) -> None:  # type: ignore[no-untyped-def]
@@ -98,7 +155,7 @@ def test_infoday_voice_answer_waits_for_complete_combined_playback(mocker) -> No
     skill.infoday_audio_complete = mocker.Mock()
     skill.operator_audio = mocker.Mock()
     mocker.patch.object(
-        skill, "_stream_response", return_value=iter(["理大 EEE 呢個課程，", "幾適合你。"])
+        skill, "_stream_response", return_value=iter(["理大 EEE 呢個課", "程。幾適合你。"])
     )
     frame_a = AudioEvent(np.array([1], dtype=np.int16), 24000, 1.0, 1)
     frame_b = AudioEvent(np.array([2], dtype=np.int16), 24000, 1.1, 1)
@@ -123,7 +180,7 @@ def test_infoday_voice_answer_waits_for_complete_combined_playback(mocker) -> No
     )
     logger.info.assert_any_call(
         "InfoDay LLM answer",
-        answer="理大 EEE 呢個課程，幾適合你。",
+        answer="理大 EEE 呢個課程。幾適合你。",
         text_chars=17,
     )
 
@@ -145,7 +202,7 @@ def test_infoday_voice_answer_streams_each_tts_event_then_waits_for_drain(mocker
     skill.infoday_audio_complete = mocker.Mock()
     skill.operator_audio = mocker.Mock()
     mocker.patch.object(
-        skill, "_stream_response", return_value=iter(["理大 EEE 呢個課程，", "幾適合你。"])
+        skill, "_stream_response", return_value=iter(["理大 EEE 呢個課", "程。幾適合你。"])
     )
     frame_a = AudioEvent(np.array([1], dtype=np.int16), 24000, 1.0, 1)
     frame_b = AudioEvent(np.array([2], dtype=np.int16), 24000, 1.1, 1)
@@ -225,7 +282,13 @@ def test_infoday_voice_answer_can_select_canto_tts(mocker) -> None:  # type: ign
     finally:
         skill.stop()
 
-    tts_node_cls.assert_called_once_with(checkpoint=None)
+    tts_node_cls.assert_called_once_with(
+        checkpoint=None,
+        quality="duration_filter",
+        max_attempts=3,
+        text_temperature=0.2,
+        audio_temperature=0.2,
+    )
     tts_node.dispose.assert_called_once_with()
 
 

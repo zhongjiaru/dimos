@@ -18,7 +18,7 @@ from queue import Empty
 from threading import RLock
 from unittest.mock import MagicMock, create_autospec, patch
 
-from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langchain_core.messages.base import BaseMessage
 from langchain_openai import ChatOpenAI
 import pytest
@@ -267,6 +267,39 @@ def test_required_tool_call_accepts_model_tool_invocation(mcp_client: McpClient)
     mcp_client._process_message(state_graph, HumanMessage(content="hello"))
 
     mcp_client.agent_error.publish.assert_not_called()
+
+
+def test_final_ai_text_can_be_suppressed_after_spoken_tool_call(
+    mcp_client: McpClient,
+    mocker,
+) -> None:  # type: ignore[no-untyped-def]
+    mcp_client.config.suppress_final_ai_after_tool_call = True
+    mcp_client.agent = MagicMock()
+    mcp_client.agent_error = MagicMock()
+    mcp_client.agent_idle = MagicMock()
+    mocker.patch("dimos.agents.mcp.mcp_client.pretty_print_langchain_message")
+    tool_call = AIMessage(
+        content="",
+        tool_calls=[{"name": "answer", "args": {}, "id": "call-1"}],
+    )
+    tool_result = ToolMessage(content="spoken", tool_call_id="call-1")
+    final_text = AIMessage(content="I already answered through the speaker")
+    state_graph = MagicMock()
+    state_graph.stream.return_value = [
+        {"model": {"messages": [tool_call]}},
+        {"tools": {"messages": [tool_result]}},
+        {"model": {"messages": [final_text]}},
+    ]
+    human = HumanMessage(content="hello")
+
+    mcp_client._process_message(state_graph, human)
+
+    assert [call.args[0] for call in mcp_client.agent.publish.call_args_list] == [
+        human,
+        tool_call,
+        tool_result,
+    ]
+    assert mcp_client._history[-1] is final_text
 
 
 def test_mcp_tool_call_sends_progress_token(mcp_client: McpClient) -> None:
