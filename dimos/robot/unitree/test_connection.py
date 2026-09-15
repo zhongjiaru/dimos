@@ -19,12 +19,19 @@ aes_128_key forwarding, and the UNITREE_AES_128_KEY env var via GlobalConfig.
 """
 
 import asyncio
+from datetime import datetime, timezone
 import json
 import threading
 from typing import Any
 from unittest.mock import ANY, AsyncMock, MagicMock, call
 
 from aiortc.mediastreams import MediaStreamError
+from aiortc.stats import (
+    RTCOutboundRtpStreamStats,
+    RTCRemoteInboundRtpStreamStats,
+    RTCStatsReport,
+    RTCTransportStats,
+)
 import numpy as np
 import pytest
 from unitree_webrtc_connect.constants import DATA_CHANNEL_TYPE, RTC_TOPIC, SPORT_CMD
@@ -150,6 +157,7 @@ def test_video_track_end_completes_stream_without_callback_error(built_connectio
 
 def test_audio_output_attaches_and_queues_on_webrtc_loop(
     monkeypatch: pytest.MonkeyPatch,
+    mocker: Any,
 ) -> None:
     driver = _stub_driver()
     sender = MagicMock(name="audio-sender")
@@ -161,6 +169,7 @@ def test_audio_output_attaches_and_queues_on_webrtc_loop(
     track_factory = MagicMock(return_value=track)
     monkeypatch.setattr(conn_mod, "LegionConnection", MagicMock(return_value=driver))
     monkeypatch.setattr(conn_mod, "QueuedGo2AudioTrack", track_factory)
+    sleep = mocker.patch.object(conn_mod.asyncio, "sleep", new_callable=AsyncMock)
     add_track_thread: list[int] = []
     driver.pc.addTrack.side_effect = (
         lambda value: add_track_thread.append(threading.get_ident()) or sender
@@ -183,12 +192,125 @@ def test_audio_output_attaches_and_queues_on_webrtc_loop(
     driver.pc.addTrack.assert_called_once_with(track)
     assert driver.audio.switchAudioChannel.call_args_list == [
         call(True),
+        call(False),
         call(True),
         call(False),
     ]
+    sleep.assert_awaited_once_with(conn_mod._AUDIO_CHANNEL_RESET_DELAY_SEC)
     assert add_track_thread == [connection.thread.ident]
     track.enqueue.assert_called_once()
     track.stop.assert_called_once_with()
+
+
+def _audio_sender_report(
+    *,
+    packets_sent: int,
+    payload_bytes_sent: int,
+) -> RTCStatsReport:
+    now = datetime.now(timezone.utc)
+    report = RTCStatsReport()
+    report.add(
+        RTCOutboundRtpStreamStats(
+            timestamp=now,
+            type="outbound-rtp",
+            id="outbound-audio",
+            ssrc=1,
+            kind="audio",
+            transportId="transport",
+            packetsSent=packets_sent,
+            bytesSent=payload_bytes_sent,
+            trackId="audio-track",
+        )
+    )
+    report.add(
+        RTCRemoteInboundRtpStreamStats(
+            timestamp=now,
+            type="remote-inbound-rtp",
+            id="remote-audio",
+            ssrc=1,
+            kind="audio",
+            transportId="transport",
+            packetsReceived=packets_sent,
+            packetsLost=0,
+            jitter=2,
+            roundTripTime=0.01,
+            fractionLost=0.0,
+        )
+    )
+    report.add(
+        RTCTransportStats(
+            timestamp=now,
+            type="transport",
+            id="transport",
+            packetsSent=packets_sent,
+            packetsReceived=1,
+            bytesSent=payload_bytes_sent,
+            bytesReceived=100,
+            iceRole="controlling",
+            dtlsState="connected",
+        )
+    )
+    return report
+
+
+def test_audio_output_logs_rtp_stats_for_completed_send_window(
+    monkeypatch: pytest.MonkeyPatch,
+    mocker: Any,
+) -> None:
+    driver = _stub_driver()
+    driver.pc.connectionState = "connected"
+    driver.pc.iceConnectionState = "completed"
+    sender = MagicMock(name="audio-sender")
+    sender.getStats = AsyncMock(
+        side_effect=[
+            _audio_sender_report(packets_sent=100, payload_bytes_sent=10_000),
+            _audio_sender_report(packets_sent=101, payload_bytes_sent=10_240),
+        ]
+    )
+    transceiver = MagicMock(sender=sender, currentDirection="sendrecv")
+    driver.pc.addTrack.return_value = sender
+    driver.pc.getTransceivers.return_value = [transceiver]
+    track = MagicMock(name="QueuedGo2AudioTrack")
+    track.enqueue.return_value = True
+    track.wait_drained = AsyncMock(return_value=True)
+    monkeypatch.setattr(conn_mod, "LegionConnection", MagicMock(return_value=driver))
+    monkeypatch.setattr(conn_mod, "QueuedGo2AudioTrack", MagicMock(return_value=track))
+
+    connection = UnitreeWebRTCConnection(ip="10.0.0.99", audio_output=True)
+    log_info = mocker.patch.object(conn_mod.logger, "info")
+    try:
+        event = AudioEvent(
+            np.ones(960, dtype=np.int16),
+            sample_rate=GO2_AUDIO_SAMPLE_RATE,
+            timestamp=1.0,
+            channels=1,
+        )
+
+        assert connection.enqueue_audio(event) is True
+        assert connection.wait_audio_drained(timeout=1.0) is True
+    finally:
+        connection.stop()
+
+    log_info.assert_any_call(
+        "Go2 WebRTC RTP send window",
+        queue_drained=True,
+        pcm_samples=960,
+        pcm_duration_sec=0.02,
+        expected_audio_packets=1,
+        elapsed_sec=ANY,
+        rtp_stats_available=True,
+        rtp_packets_sent=1,
+        rtp_payload_bytes_sent=240,
+        rtp_packet_ratio=1.0,
+        peer_connection_state="connected",
+        ice_connection_state="completed",
+        dtls_state="connected",
+        remote_packets_received=1,
+        remote_packets_lost=0,
+        remote_fraction_lost=0.0,
+        remote_jitter=2.0,
+        round_trip_time=0.01,
+    )
 
 
 @pytest.mark.parametrize(

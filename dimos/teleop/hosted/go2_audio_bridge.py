@@ -19,7 +19,7 @@ from __future__ import annotations
 import base64
 from io import BytesIO
 import json
-from math import gcd
+from math import gcd, log10
 import queue
 import threading
 import time
@@ -90,6 +90,7 @@ class Go2AudioBridgeModule(Module):
         self._stop_event = threading.Event()
         self._speaker_available: bool | None = None
         self._megaphone_active = False
+        self._webrtc_audio_queued_until: float | None = None
 
     @rpc
     def start(self) -> None:
@@ -128,6 +129,7 @@ class Go2AudioBridgeModule(Module):
                     self.go2.clear_audio()
                 except Exception:
                     logger.warning("Failed to clear Go2 WebRTC speaker audio", exc_info=True)
+                self._webrtc_audio_queued_until = None
             else:
                 self._exit_megaphone()
         super().stop()
@@ -260,6 +262,7 @@ class Go2AudioBridgeModule(Module):
             logger.info("Local Go2 WebRTC audio queue drained")
             return True
         finally:
+            self._webrtc_audio_queued_until = None
             if self.config.speaker == "auto":
                 # SDP direction alone does not reflect whether Go2 firmware has
                 # since closed its audio channel. Re-arm it on the next turn.
@@ -274,17 +277,43 @@ class Go2AudioBridgeModule(Module):
         if not frames:
             return False
         pcm = np.concatenate(frames).astype(np.int16, copy=False)
+        input_stats = self._pcm_diagnostics(pcm, silence_peak=self.config.noise_gate_peak)
+        input_peak = self._peak(pcm)
         pcm = self._normalize_level(pcm)
         if pcm.size == 0:
+            logger.info("Go2 playback PCM suppressed by noise gate", **input_stats)
             return False
+        output_stats = self._pcm_diagnostics(pcm, silence_peak=self.config.noise_gate_peak)
+        output_peak = self._peak(pcm)
+        applied_gain = output_peak / input_peak if input_peak else 0.0
+        logger.info(
+            "Go2 playback PCM prepared",
+            duration_sec=round(pcm.size / self.config.target_sample_rate, 3),
+            sample_rate=self.config.target_sample_rate,
+            applied_gain=round(applied_gain, 4),
+            input_peak=input_stats["peak"],
+            input_rms=input_stats["rms"],
+            input_rms_dbfs=input_stats["rms_dbfs"],
+            input_dc_offset=input_stats["dc_offset"],
+            input_silence_ratio=input_stats["silence_ratio"],
+            output_peak=output_stats["peak"],
+            output_rms=output_stats["rms"],
+            output_rms_dbfs=output_stats["rms_dbfs"],
+            output_clipped_ratio=output_stats["clipped_ratio"],
+        )
         if self.config.debug_local_playback:
             self._play_debug_audio_locally(pcm)
-        if not self._ensure_speaker():
+        if self.config.speaker_backend == "webrtc":
+            speaker_ready = self._ensure_webrtc_speaker_for_next_audio()
+        else:
+            speaker_ready = self._ensure_speaker()
+        if not speaker_ready:
             return False
         try:
             if self.config.speaker_backend == "webrtc":
                 if not self._enqueue_webrtc_pcm(pcm):
                     raise RuntimeError("Go2 WebRTC speaker queue rejected audio")
+                self._record_webrtc_audio_window(pcm.size)
                 if self.config.debug_local_playback or wait_for_playback:
                     audio_duration_sec = pcm.size / self.config.target_sample_rate
                     timeout = audio_duration_sec + self.config.debug_robot_playback_timeout_sec
@@ -335,9 +364,30 @@ class Go2AudioBridgeModule(Module):
         except Exception:
             logger.warning("Go2 speaker audio send failed", exc_info=True)
             self._exit_megaphone()
+            if self.config.speaker_backend == "webrtc":
+                self._webrtc_audio_queued_until = None
             if self.config.speaker == "auto":
                 self._speaker_available = None if self.config.speaker_backend == "webrtc" else False
             return False
+
+    def _ensure_webrtc_speaker_for_next_audio(self, *, now: float | None = None) -> bool:
+        """Re-arm Go2 after an idle gap without interrupting queued speech."""
+        current_time = time.monotonic() if now is None else now
+        queued_until = self._webrtc_audio_queued_until
+        if queued_until is not None and current_time >= queued_until:
+            logger.info(
+                "Go2 WebRTC playback window ended; re-arming audio channel",
+                idle_sec=round(current_time - queued_until, 3),
+            )
+            self._speaker_available = None
+            self._webrtc_audio_queued_until = None
+        return self._ensure_speaker()
+
+    def _record_webrtc_audio_window(self, samples: int, *, now: float | None = None) -> None:
+        current_time = time.monotonic() if now is None else now
+        queued_until = self._webrtc_audio_queued_until
+        starts_at = max(current_time, queued_until) if queued_until is not None else current_time
+        self._webrtc_audio_queued_until = starts_at + samples / self.config.target_sample_rate
 
     def _enqueue_webrtc_pcm(self, pcm: NDArray[np.int16]) -> bool:
         """Send bounded RPC payloads while keeping one continuous Go2 queue."""
@@ -472,6 +522,36 @@ class Go2AudioBridgeModule(Module):
     @staticmethod
     def _peak(pcm: NDArray[np.int16]) -> int:
         return int(np.max(np.abs(pcm.astype(np.int32))))
+
+    @staticmethod
+    def _pcm_diagnostics(
+        pcm: NDArray[np.int16],
+        *,
+        silence_peak: int,
+    ) -> dict[str, int | float | None]:
+        """Return compact signal-level diagnostics without retaining audio."""
+        if pcm.size == 0:
+            return {
+                "samples": 0,
+                "peak": 0,
+                "rms": 0.0,
+                "rms_dbfs": None,
+                "dc_offset": 0.0,
+                "silence_ratio": 1.0,
+                "clipped_ratio": 0.0,
+            }
+        values = pcm.astype(np.float64)
+        absolute = np.abs(values)
+        rms = float(np.sqrt(np.mean(np.square(values))))
+        return {
+            "samples": int(pcm.size),
+            "peak": int(np.max(absolute)),
+            "rms": round(rms, 2),
+            "rms_dbfs": round(20.0 * log10(rms / INT16_MAX), 2) if rms > 0 else None,
+            "dc_offset": round(float(np.mean(values)), 2),
+            "silence_ratio": round(float(np.mean(absolute <= silence_peak)), 4),
+            "clipped_ratio": round(float(np.mean(absolute >= INT16_MAX)), 6),
+        }
 
     def _normalize_level(self, pcm: NDArray[np.int16]) -> NDArray[np.int16]:
         """Gate near-silence and raise each segment toward a bounded peak."""

@@ -15,13 +15,19 @@
 import asyncio
 from dataclasses import dataclass
 import functools
+import inspect
 import json
 import threading
 import time
 from typing import Any, TypeAlias, TypeVar
 
-from aiortc import RTCBundlePolicy, RTCConfiguration, RTCPeerConnection
+from aiortc import RTCBundlePolicy, RTCConfiguration, RTCPeerConnection, RTCRtpSender
 from aiortc.mediastreams import MediaStreamError
+from aiortc.stats import (
+    RTCOutboundRtpStreamStats,
+    RTCRemoteInboundRtpStreamStats,
+    RTCTransportStats,
+)
 import numpy as np
 from numpy.typing import NDArray
 from reactivex import operators as ops
@@ -47,7 +53,11 @@ from dimos.msgs.geometry_msgs.Transform import Transform
 from dimos.msgs.geometry_msgs.Twist import Twist
 from dimos.msgs.sensor_msgs.Image import Image, ImageFormat
 from dimos.msgs.sensor_msgs.PointCloud2 import PointCloud2
-from dimos.robot.unitree.audio_track import GO2_AUDIO_SAMPLE_RATE, QueuedGo2AudioTrack
+from dimos.robot.unitree.audio_track import (
+    GO2_AUDIO_FRAME_SAMPLES,
+    GO2_AUDIO_SAMPLE_RATE,
+    QueuedGo2AudioTrack,
+)
 from dimos.robot.unitree.type.lidar import (
     RawLidarMsg,
     pointcloud2_from_webrtc_lidar,
@@ -67,6 +77,7 @@ logger = setup_logger()
 
 _WEBRTC_DISCONNECT_TIMEOUT = 3.0
 _WEBRTC_SHUTDOWN_REQUEST_TIMEOUT = 1.0
+_AUDIO_CHANNEL_RESET_DELAY_SEC = 0.1
 
 
 _T = TypeVar("_T", bound=Timestamped)
@@ -167,6 +178,11 @@ class UnitreeWebRTCConnection(Resource):
         self._audio_output_available = False
         self._audio_channel_enabled = False
         self._audio_track: QueuedGo2AudioTrack | None = None
+        self._audio_sender: RTCRtpSender | None = None
+        self._audio_send_window_active = False
+        self._audio_send_window_started_at: float | None = None
+        self._audio_send_window_samples = 0
+        self._audio_send_window_baseline: dict[str, Any] | None = None
         self._move_ids = SequentialIds()
         self._stop_lock = threading.Lock()
         self._stopped = False
@@ -184,6 +200,7 @@ class UnitreeWebRTCConnection(Resource):
             if self._audio_output_enabled:
                 self._audio_track = QueuedGo2AudioTrack()
                 sender = self.conn.pc.addTrack(self._audio_track)
+                self._audio_sender = sender
                 transceiver = next(
                     (item for item in self.conn.pc.getTransceivers() if item.sender is sender),
                     None,
@@ -194,7 +211,7 @@ class UnitreeWebRTCConnection(Resource):
                     self.conn.audio.switchAudioChannel(True)
                     self._audio_channel_enabled = True
                     logger.info(
-                        "Go2 WebRTC speaker track attached and audio channel enabled",
+                        "Go2 WebRTC speaker track attached; audio-channel enable command sent",
                         direction=direction,
                         sample_rate=GO2_AUDIO_SAMPLE_RATE,
                     )
@@ -227,7 +244,9 @@ class UnitreeWebRTCConnection(Resource):
                 if self._audio_track is not None:
                     self._audio_track.stop()
                     self._audio_track = None
+                    self._audio_sender = None
                     self._audio_output_available = False
+                    self._reset_audio_send_window()
                 await self.conn.disconnect()
 
             try:
@@ -286,17 +305,23 @@ class UnitreeWebRTCConnection(Resource):
         if not self._audio_output_available or not self.loop.is_running():
             return False
 
-        async def reenable_audio_channel() -> None:
+        async def reset_audio_channel() -> None:
+            self.conn.audio.switchAudioChannel(False)
+            self._audio_channel_enabled = False
+            await asyncio.sleep(_AUDIO_CHANNEL_RESET_DELAY_SEC)
             self.conn.audio.switchAudioChannel(True)
 
         try:
-            future = asyncio.run_coroutine_threadsafe(reenable_audio_channel(), self.loop)
+            future = asyncio.run_coroutine_threadsafe(reset_audio_channel(), self.loop)
             future.result(timeout=2.0)
         except Exception:
-            logger.warning("Failed to re-enable Go2 WebRTC audio channel", exc_info=True)
+            logger.warning("Failed to reset Go2 WebRTC audio channel", exc_info=True)
             return False
         self._audio_channel_enabled = True
-        logger.info("Go2 WebRTC audio channel re-enabled for playback")
+        logger.info(
+            "Go2 WebRTC audio-channel off/on reset sent for playback",
+            reset_delay_sec=_AUDIO_CHANNEL_RESET_DELAY_SEC,
+        )
         return True
 
     def enqueue_audio(self, event: AudioEvent) -> bool:
@@ -313,7 +338,17 @@ class UnitreeWebRTCConnection(Resource):
         pcm = event.to_int16().data.reshape(-1)
 
         async def enqueue() -> bool:
-            return track.enqueue(pcm)
+            if not self._audio_send_window_active:
+                self._audio_send_window_active = True
+                self._audio_send_window_started_at = time.monotonic()
+                self._audio_send_window_samples = 0
+                self._audio_send_window_baseline = await self._read_audio_sender_stats()
+            accepted = track.enqueue(pcm)
+            if accepted:
+                self._audio_send_window_samples += pcm.size
+            elif self._audio_send_window_samples == 0:
+                self._reset_audio_send_window()
+            return accepted
 
         return bool(asyncio.run_coroutine_threadsafe(enqueue(), self.loop).result(timeout=2.0))
 
@@ -324,6 +359,7 @@ class UnitreeWebRTCConnection(Resource):
 
         async def clear() -> None:
             track.clear()
+            self._reset_audio_send_window()
 
         asyncio.run_coroutine_threadsafe(clear(), self.loop).result(timeout=2.0)
 
@@ -331,9 +367,116 @@ class UnitreeWebRTCConnection(Resource):
         track = self._audio_track
         if track is None or not self.loop.is_running():
             return True
-        future = asyncio.run_coroutine_threadsafe(track.wait_drained(timeout), self.loop)
+
+        async def wait_and_report() -> bool:
+            drained = await track.wait_drained(timeout)
+            if self._audio_send_window_active:
+                final_stats = await self._read_audio_sender_stats()
+                self._log_audio_send_window(drained=drained, final_stats=final_stats)
+                self._reset_audio_send_window()
+            return drained
+
+        future = asyncio.run_coroutine_threadsafe(wait_and_report(), self.loop)
         result_timeout = None if timeout is None else timeout + 1.0
         return bool(future.result(timeout=result_timeout))
+
+    async def _read_audio_sender_stats(self) -> dict[str, Any] | None:
+        sender = self._audio_sender
+        if sender is None:
+            return None
+        try:
+            pending_report = sender.getStats()
+            if not inspect.isawaitable(pending_report):
+                return None
+            report = await pending_report
+        except Exception:
+            logger.warning("Failed to read Go2 WebRTC RTP sender stats", exc_info=True)
+            return None
+
+        result: dict[str, Any] = {
+            "peer_connection_state": self.conn.pc.connectionState,
+            "ice_connection_state": self.conn.pc.iceConnectionState,
+        }
+        for stats in report.values():
+            if isinstance(stats, RTCOutboundRtpStreamStats) and stats.kind == "audio":
+                result["packets_sent"] = int(stats.packetsSent)
+                result["payload_bytes_sent"] = int(stats.bytesSent)
+            elif isinstance(stats, RTCRemoteInboundRtpStreamStats) and stats.kind == "audio":
+                result["remote_packets_received"] = int(stats.packetsReceived)
+                result["remote_packets_lost"] = int(stats.packetsLost)
+                result["remote_fraction_lost"] = float(stats.fractionLost)
+                result["remote_jitter"] = float(stats.jitter)
+                result["round_trip_time"] = stats.roundTripTime
+            elif isinstance(stats, RTCTransportStats):
+                result["dtls_state"] = str(stats.dtlsState)
+        return result
+
+    def _log_audio_send_window(
+        self,
+        *,
+        drained: bool,
+        final_stats: dict[str, Any] | None,
+    ) -> None:
+        baseline = self._audio_send_window_baseline or {}
+        final = final_stats or {}
+        packets_sent = self._counter_delta(baseline, final, "packets_sent")
+        payload_bytes_sent = self._counter_delta(baseline, final, "payload_bytes_sent")
+        remote_packets_received = self._counter_delta(
+            baseline,
+            final,
+            "remote_packets_received",
+        )
+        remote_packets_lost = self._counter_delta(baseline, final, "remote_packets_lost")
+        started_at = self._audio_send_window_started_at
+        elapsed_sec = time.monotonic() - started_at if started_at is not None else None
+        expected_audio_packets = (
+            self._audio_send_window_samples + GO2_AUDIO_FRAME_SAMPLES - 1
+        ) // GO2_AUDIO_FRAME_SAMPLES
+        logger.info(
+            "Go2 WebRTC RTP send window",
+            queue_drained=drained,
+            pcm_samples=self._audio_send_window_samples,
+            pcm_duration_sec=round(
+                self._audio_send_window_samples / GO2_AUDIO_SAMPLE_RATE,
+                3,
+            ),
+            expected_audio_packets=expected_audio_packets,
+            elapsed_sec=round(elapsed_sec, 3) if elapsed_sec is not None else None,
+            rtp_stats_available=packets_sent is not None,
+            rtp_packets_sent=packets_sent,
+            rtp_payload_bytes_sent=payload_bytes_sent,
+            rtp_packet_ratio=(
+                round(packets_sent / expected_audio_packets, 3)
+                if packets_sent is not None and expected_audio_packets
+                else None
+            ),
+            peer_connection_state=final.get("peer_connection_state"),
+            ice_connection_state=final.get("ice_connection_state"),
+            dtls_state=final.get("dtls_state"),
+            remote_packets_received=remote_packets_received,
+            remote_packets_lost=remote_packets_lost,
+            remote_fraction_lost=final.get("remote_fraction_lost"),
+            remote_jitter=final.get("remote_jitter"),
+            round_trip_time=final.get("round_trip_time"),
+        )
+
+    @staticmethod
+    def _counter_delta(
+        baseline: dict[str, Any],
+        final: dict[str, Any],
+        key: str,
+    ) -> int | None:
+        before = baseline.get(key)
+        after = final.get(key)
+        if not isinstance(before, int) or not isinstance(after, int):
+            return None
+        return max(0, after - before)
+
+    def _reset_audio_send_window(self) -> None:
+        self._audio_send_window_active = False
+        self._audio_send_window_started_at = None
+        self._audio_send_window_samples = 0
+        self._audio_send_window_baseline = None
 
     def _publish_movement(self, x: float, y: float, yaw: float) -> None:
         if self._velocity_api:

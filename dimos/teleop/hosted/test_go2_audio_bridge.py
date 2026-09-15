@@ -193,6 +193,42 @@ def test_auto_webrtc_speaker_is_rechecked_after_each_completed_turn() -> None:
     assert bridge.go2.audio_output_available.call_count == 2
 
 
+def test_webrtc_speaker_rearms_after_predicted_playback_window_ends() -> None:
+    bridge = AudioBridgeTestModule(
+        speaker="auto",
+        speaker_backend="webrtc",
+        target_sample_rate=GO2_AUDIO_SAMPLE_RATE,
+    )
+    bridge.go2 = MagicMock()
+    bridge.go2.audio_output_available.return_value = True
+    bridge._speaker_available = True
+    bridge._webrtc_audio_queued_until = 101.0
+    try:
+        assert bridge._ensure_webrtc_speaker_for_next_audio(now=100.0) is True
+        bridge.go2.audio_output_available.assert_not_called()
+        assert bridge._ensure_webrtc_speaker_for_next_audio(now=102.0) is True
+        assert bridge._webrtc_audio_queued_until is None
+    finally:
+        bridge.stop()
+
+    bridge.go2.audio_output_available.assert_called_once_with()
+
+
+def test_webrtc_audio_window_extends_while_previous_audio_is_queued() -> None:
+    bridge = AudioBridgeTestModule(
+        speaker="enabled",
+        speaker_backend="webrtc",
+        target_sample_rate=GO2_AUDIO_SAMPLE_RATE,
+    )
+    bridge._webrtc_audio_queued_until = 105.0
+
+    try:
+        bridge._record_webrtc_audio_window(GO2_AUDIO_SAMPLE_RATE * 2, now=100.0)
+        assert bridge._webrtc_audio_queued_until == 107.0
+    finally:
+        bridge.stop()
+
+
 def test_auto_webrtc_speaker_retries_transient_unavailable_state() -> None:
     bridge = AudioBridgeTestModule(
         speaker="auto",
@@ -284,6 +320,39 @@ def test_debug_playback_plays_final_pcm_locally_before_go2(mocker) -> None:  # t
     )
     queued = bridge.go2.enqueue_audio.call_args.args[0]
     np.testing.assert_array_equal(queued.data, local_play.call_args.args[0])
+
+
+def test_flush_logs_pcm_signal_diagnostics(mocker) -> None:  # type: ignore[no-untyped-def]
+    bridge = AudioBridgeTestModule(
+        speaker="enabled",
+        speaker_backend="webrtc",
+        target_sample_rate=GO2_AUDIO_SAMPLE_RATE,
+        target_peak=10000,
+        max_gain=2.0,
+        noise_gate_peak=32,
+    )
+    bridge.go2 = MagicMock()
+    bridge.go2.enqueue_audio.return_value = True
+    log_info = mocker.patch("dimos.teleop.hosted.go2_audio_bridge.logger.info")
+
+    try:
+        result = bridge._flush([np.array([-2000, 0, 2000], dtype=np.int16)])
+    finally:
+        bridge.stop()
+
+    assert result is True
+    diagnostic_calls = [
+        logged
+        for logged in log_info.call_args_list
+        if logged.args == ("Go2 playback PCM prepared",)
+    ]
+    assert len(diagnostic_calls) == 1
+    fields = diagnostic_calls[0].kwargs
+    assert fields["applied_gain"] == 2.0
+    assert fields["input_peak"] == 2000
+    assert fields["output_peak"] == 4000
+    assert fields["input_dc_offset"] == 0.0
+    assert fields["output_clipped_ratio"] == 0.0
 
 
 def test_complete_webrtc_audio_uses_bounded_rpc_chunks() -> None:
