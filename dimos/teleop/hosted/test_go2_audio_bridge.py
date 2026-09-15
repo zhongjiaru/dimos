@@ -19,6 +19,7 @@ from collections.abc import Iterator
 from io import BytesIO
 import json
 import queue
+import threading
 from typing import Any
 from unittest.mock import MagicMock
 import wave
@@ -33,6 +34,7 @@ from dimos.robot.unitree.audio_track import GO2_AUDIO_FRAME_SAMPLES, GO2_AUDIO_S
 from dimos.stream.audio.base import AudioEvent
 from dimos.teleop.hosted.blueprints.cloudflare import teleop_hosted_go2_transport
 from dimos.teleop.hosted.go2_audio_bridge import (
+    DEFAULT_UPLOAD_CHUNK_CHARS,
     ENTER_MEGAPHONE,
     EXIT_MEGAPHONE,
     GET_AUDIO_LIST,
@@ -102,6 +104,32 @@ def test_audio_can_use_lower_configured_wav_sample_rate() -> None:
     assert result.shape == (2400,)
     with wave.open(BytesIO(wav_data), "rb") as wav:
         assert wav.getframerate() == 24000
+
+
+def test_megaphone_defaults_use_ack_paced_large_upload_blocks() -> None:
+    bridge = AudioBridgeTestModule()
+
+    try:
+        assert bridge.config.upload_chunk_chars == DEFAULT_UPLOAD_CHUNK_CHARS == 32768
+        assert bridge.config.chunk_interval_sec == 0.0
+    finally:
+        bridge.stop()
+
+
+def test_megaphone_edge_fade_suppresses_wav_boundary_clicks() -> None:
+    pcm = np.full(1000, 1000, dtype=np.int16)
+
+    result = Go2AudioBridgeModule._fade_edges(
+        pcm,
+        sample_rate=1000,
+        fade_ms=10.0,
+    )
+
+    assert result[0] == 0
+    assert result[-1] == 0
+    assert result[9] == 1000
+    assert result[-10] == 1000
+    assert result[500] == 1000
 
 
 def test_hosted_blueprint_accepts_speaker_override() -> None:
@@ -193,7 +221,7 @@ def test_auto_webrtc_speaker_is_rechecked_after_each_completed_turn() -> None:
     assert bridge.go2.audio_output_available.call_count == 2
 
 
-def test_webrtc_speaker_rearms_after_predicted_playback_window_ends() -> None:
+def test_webrtc_speaker_rechecks_after_predicted_playback_window_ends() -> None:
     bridge = AudioBridgeTestModule(
         speaker="auto",
         speaker_backend="webrtc",
@@ -320,6 +348,35 @@ def test_debug_playback_plays_final_pcm_locally_before_go2(mocker) -> None:  # t
     )
     queued = bridge.go2.enqueue_audio.call_args.args[0]
     np.testing.assert_array_equal(queued.data, local_play.call_args.args[0])
+
+
+def test_debug_audio_dump_writes_exact_pcm_without_local_playback(tmp_path, mocker) -> None:  # type: ignore[no-untyped-def]
+    bridge = AudioBridgeTestModule(
+        speaker="enabled",
+        speaker_backend="webrtc",
+        target_sample_rate=GO2_AUDIO_SAMPLE_RATE,
+        target_peak=12000,
+        debug_audio_dump_dir=str(tmp_path),
+    )
+    bridge.go2 = MagicMock()
+    bridge.go2.enqueue_audio.return_value = True
+    local_play = mocker.patch("dimos.teleop.hosted.go2_audio_bridge.sd.play")
+
+    try:
+        result = bridge._flush([np.array([-100, 0, 100], dtype=np.int16)])
+    finally:
+        bridge.stop()
+
+    assert result is True
+    dumped_files = list(tmp_path.glob("go2-playback-*.wav"))
+    assert len(dumped_files) == 1
+    with wave.open(str(dumped_files[0]), "rb") as dumped_wav:
+        assert dumped_wav.getframerate() == GO2_AUDIO_SAMPLE_RATE
+        dumped_pcm = np.frombuffer(dumped_wav.readframes(dumped_wav.getnframes()), dtype=np.int16)
+    np.testing.assert_array_equal(dumped_pcm, [-12000, 0, 12000])
+    local_play.assert_not_called()
+    queued = bridge.go2.enqueue_audio.call_args.args[0]
+    np.testing.assert_array_equal(queued.data, dumped_pcm)
 
 
 def test_flush_logs_pcm_signal_diagnostics(mocker) -> None:  # type: ignore[no-untyped-def]
@@ -495,7 +552,9 @@ def test_full_sentence_audio_uses_configured_upload_blocks(
     )
 
 
-def test_flush_can_keep_megaphone_open_for_playback(bridge: AudioBridgeTestModule, mocker) -> None:
+def test_flush_holds_then_exits_megaphone_for_playback(
+    bridge: AudioBridgeTestModule, mocker
+) -> None:
     bridge._speaker_available = True
     bridge.config.wait_for_playback = True
     bridge.config.playback_tail_sec = 0.25
@@ -505,6 +564,57 @@ def test_flush_can_keep_megaphone_open_for_playback(bridge: AudioBridgeTestModul
     bridge._flush([np.full(TARGET_SAMPLE_RATE * 2, 100, dtype=np.int16)])
 
     wait.assert_called_once_with(2.25)
+    requests = [call.args[1]["api_id"] for call in bridge.go2.publish_request.call_args_list]
+    assert requests[-1] == EXIT_MEGAPHONE
+    assert bridge._megaphone_active is False
+
+
+def test_idle_cleanup_cannot_exit_megaphone_during_upload(
+    bridge: AudioBridgeTestModule, mocker
+) -> None:
+    bridge._speaker_available = True
+    bridge.config.wait_for_playback = True
+    bridge.go2.publish_request.return_value = {"code": 0}
+    upload_started = threading.Event()
+    release_upload = threading.Event()
+    exit_attempted = threading.Event()
+    exit_finished = threading.Event()
+    playback_results: list[bool] = []
+
+    def upload(_wav_data: bytes) -> None:
+        upload_started.set()
+        assert release_upload.wait(timeout=1.0)
+
+    mocker.patch.object(bridge, "_upload_wav", side_effect=upload)
+    mocker.patch.object(bridge._stop_event, "wait", return_value=False)
+
+    playback_thread = threading.Thread(
+        target=lambda: playback_results.append(
+            bridge._flush([np.full(TARGET_SAMPLE_RATE, 100, dtype=np.int16)])
+        )
+    )
+
+    def exit_when_possible() -> None:
+        exit_attempted.set()
+        bridge._exit_megaphone()
+        exit_finished.set()
+
+    exit_thread = threading.Thread(target=exit_when_possible)
+    playback_thread.start()
+    assert upload_started.wait(timeout=1.0)
+    exit_thread.start()
+    assert exit_attempted.wait(timeout=1.0)
+    assert not exit_finished.wait(timeout=0.05)
+
+    release_upload.set()
+    playback_thread.join(timeout=1.0)
+    exit_thread.join(timeout=1.0)
+
+    assert not playback_thread.is_alive()
+    assert not exit_thread.is_alive()
+    assert playback_results == [True]
+    requests = [call.args[1]["api_id"] for call in bridge.go2.publish_request.call_args_list]
+    assert requests == [ENTER_MEGAPHONE, EXIT_MEGAPHONE]
 
 
 def test_start_and_stop_manage_audio_subscription_and_worker(

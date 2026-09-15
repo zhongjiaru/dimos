@@ -56,6 +56,7 @@ from dimos.msgs.sensor_msgs.PointCloud2 import PointCloud2
 from dimos.robot.unitree.audio_track import (
     GO2_AUDIO_FRAME_SAMPLES,
     GO2_AUDIO_SAMPLE_RATE,
+    Go2AudioPacingDiagnostics,
     QueuedGo2AudioTrack,
 )
 from dimos.robot.unitree.type.lidar import (
@@ -77,7 +78,6 @@ logger = setup_logger()
 
 _WEBRTC_DISCONNECT_TIMEOUT = 3.0
 _WEBRTC_SHUTDOWN_REQUEST_TIMEOUT = 1.0
-_AUDIO_CHANNEL_RESET_DELAY_SEC = 0.1
 
 
 _T = TypeVar("_T", bound=Timestamped)
@@ -176,7 +176,6 @@ class UnitreeWebRTCConnection(Resource):
         self._audio_output_enabled = audio_output
         self._lidar_enabled = lidar_enabled
         self._audio_output_available = False
-        self._audio_channel_enabled = False
         self._audio_track: QueuedGo2AudioTrack | None = None
         self._audio_sender: RTCRtpSender | None = None
         self._audio_send_window_active = False
@@ -208,10 +207,8 @@ class UnitreeWebRTCConnection(Resource):
                 direction = transceiver.currentDirection if transceiver is not None else None
                 self._audio_output_available = direction in ("sendonly", "sendrecv")
                 if self._audio_output_available:
-                    self.conn.audio.switchAudioChannel(True)
-                    self._audio_channel_enabled = True
                     logger.info(
-                        "Go2 WebRTC speaker track attached; audio-channel enable command sent",
+                        "Go2 WebRTC speaker track attached",
                         direction=direction,
                         sample_rate=GO2_AUDIO_SAMPLE_RATE,
                     )
@@ -272,12 +269,6 @@ class UnitreeWebRTCConnection(Resource):
                 self.stop_timer = None
 
             async def async_disconnect() -> None:
-                if self._audio_channel_enabled:
-                    try:
-                        self.conn.audio.switchAudioChannel(False)
-                    except Exception:
-                        logger.warning("Failed to disable Go2 WebRTC audio channel", exc_info=True)
-                    self._audio_channel_enabled = False
                 if self._audio_track is not None:
                     self._audio_track.stop()
                     self._audio_track = None
@@ -304,25 +295,16 @@ class UnitreeWebRTCConnection(Resource):
     def audio_output_available(self) -> bool:
         if not self._audio_output_available or not self.loop.is_running():
             return False
-
-        async def reset_audio_channel() -> None:
-            self.conn.audio.switchAudioChannel(False)
-            self._audio_channel_enabled = False
-            await asyncio.sleep(_AUDIO_CHANNEL_RESET_DELAY_SEC)
-            self.conn.audio.switchAudioChannel(True)
-
-        try:
-            future = asyncio.run_coroutine_threadsafe(reset_audio_channel(), self.loop)
-            future.result(timeout=2.0)
-        except Exception:
-            logger.warning("Failed to reset Go2 WebRTC audio channel", exc_info=True)
-            return False
-        self._audio_channel_enabled = True
-        logger.info(
-            "Go2 WebRTC audio-channel off/on reset sent for playback",
-            reset_delay_sec=_AUDIO_CHANNEL_RESET_DELAY_SEC,
+        # Unitree's ``aud`` data-channel switch controls the robot-to-client
+        # microphone stream.  Speaker playback uses the negotiated outbound
+        # RTP sender directly, so toggling ``aud`` between utterances cannot
+        # confirm or repair speaker playback and can disturb the firmware's
+        # media state.  Keep the sender continuous and only validate its
+        # negotiated transport here.
+        peer_connection = self.conn.pc
+        return peer_connection.connectionState == "connected" and (
+            peer_connection.iceConnectionState in ("connected", "completed")
         )
-        return True
 
     def enqueue_audio(self, event: AudioEvent) -> bool:
         track = self._audio_track
@@ -372,7 +354,12 @@ class UnitreeWebRTCConnection(Resource):
             drained = await track.wait_drained(timeout)
             if self._audio_send_window_active:
                 final_stats = await self._read_audio_sender_stats()
-                self._log_audio_send_window(drained=drained, final_stats=final_stats)
+                pacing = track.take_pacing_diagnostics()
+                self._log_audio_send_window(
+                    drained=drained,
+                    final_stats=final_stats,
+                    pacing=pacing,
+                )
                 self._reset_audio_send_window()
             return drained
 
@@ -416,6 +403,7 @@ class UnitreeWebRTCConnection(Resource):
         *,
         drained: bool,
         final_stats: dict[str, Any] | None,
+        pacing: Go2AudioPacingDiagnostics,
     ) -> None:
         baseline = self._audio_send_window_baseline or {}
         final = final_stats or {}
@@ -458,7 +446,19 @@ class UnitreeWebRTCConnection(Resource):
             remote_fraction_lost=final.get("remote_fraction_lost"),
             remote_jitter=final.get("remote_jitter"),
             round_trip_time=final.get("round_trip_time"),
+            pacing_frames=pacing["frame_count"],
+            pacing_late_frames=pacing["late_frame_count"],
+            pacing_max_lag_ms=pacing["max_lag_ms"],
+            pacing_max_catchup_streak=pacing["max_catchup_streak"],
         )
+        if pacing["max_lag_ms"] >= 100.0 or pacing["max_catchup_streak"] >= 3:
+            logger.warning(
+                "Go2 WebRTC audio pacing anomaly detected",
+                pacing_frames=pacing["frame_count"],
+                pacing_late_frames=pacing["late_frame_count"],
+                pacing_max_lag_ms=pacing["max_lag_ms"],
+                pacing_max_catchup_streak=pacing["max_catchup_streak"],
+            )
 
     @staticmethod
     def _counter_delta(

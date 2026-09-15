@@ -56,6 +56,8 @@ Do not use Mainland Mandarin written style. Avoid phrases like 因此、此外�
 Use concise spoken Cantonese phrases like 呢個、可以、如果你想知、我哋、會、係.
 Keep official English names unchanged when needed, for example PolyU, EEE, BEng(Hons), BSc(Hons).
 Write programme and subject codes in their official compact form, for example JS3180 or CLC1104C.
+Optimize for low speech latency: start with a short, direct Cantonese answer and keep the first sentence to at most 45 characters whenever possible.
+Do not repeat or spell out a full English programme or award title unless the user explicitly asks for its official English name; normally use the programme code and a concise Traditional Chinese name instead.
 Base the answer only on the provided official offline knowledge context.
 If the context is insufficient, say briefly in Cantonese that the current official offline materials do not include that detail, then invite the user to choose a safe stationary robot demonstration such as waving or dancing.
 Only offer the action; do not claim that it has happened or trigger it before the user explicitly chooses one.
@@ -247,14 +249,26 @@ class InfodayVoiceAnswerSkill(Module):
             )
             tts_node = self._get_tts_node()
             tts_chunks: queue.Queue[str | None] = queue.Queue()
+            audio_chunks: queue.Queue[list[AudioEvent] | None] | None = (
+                queue.Queue() if self.config.stream_audio_playback else None
+            )
             errors: queue.Queue[Exception] = queue.Queue()
             playback_events: list[AudioEvent] = []
             worker = threading.Thread(
                 target=self._tts_worker,
-                args=(tts_node, tts_chunks, errors, playback_events),
+                args=(tts_node, tts_chunks, audio_chunks, errors, playback_events),
                 daemon=True,
                 name="InfodayVoiceAnswerSkill-tts",
             )
+            playback_worker: threading.Thread | None = None
+            if audio_chunks is not None:
+                playback_worker = threading.Thread(
+                    target=self._audio_playback_worker,
+                    args=(audio_chunks, errors),
+                    daemon=True,
+                    name="InfodayVoiceAnswerSkill-playback",
+                )
+                playback_worker.start()
             worker.start()
 
             answer_text = ""
@@ -306,8 +320,12 @@ class InfodayVoiceAnswerSkill(Module):
             finally:
                 tts_chunks.put(None)
                 worker.join(timeout=self.config.tts_queue_timeout_sec)
+                if audio_chunks is not None:
+                    audio_chunks.put(None)
+                if playback_worker is not None:
+                    playback_worker.join(timeout=self.config.tts_queue_timeout_sec)
 
-            if worker.is_alive():
+            if worker.is_alive() or (playback_worker is not None and playback_worker.is_alive()):
                 return "Error: timed out while streaming Info Day answer"
             if self.config.stream_audio_playback and errors.empty():
                 try:
@@ -397,6 +415,7 @@ class InfodayVoiceAnswerSkill(Module):
                     "InfoDay TTS first audio",
                     duration_ms=round((time.monotonic() - started_at) * 1000.0, 1),
                     text_chars=len(text),
+                    speech_text_chars=len(speech_text),
                     chunk_samples=audio_event.data.size // channels,
                     sample_rate=audio_event.sample_rate,
                 )
@@ -412,6 +431,7 @@ class InfodayVoiceAnswerSkill(Module):
             "InfoDay TTS complete",
             duration_ms=round((time.monotonic() - started_at) * 1000.0, 1),
             text_chars=len(text),
+            speech_text_chars=len(speech_text),
             audio_chunks=audio_chunks,
             audio_duration_ms=round(audio_duration_sec * 1000.0, 1),
         )
@@ -551,6 +571,7 @@ class InfodayVoiceAnswerSkill(Module):
         self,
         tts_node: _TTSNode,
         tts_chunks: queue.Queue[str | None],
+        audio_chunks: queue.Queue[list[AudioEvent] | None] | None,
         errors: queue.Queue[Exception],
         playback_events: list[AudioEvent],
     ) -> None:
@@ -559,18 +580,35 @@ class InfodayVoiceAnswerSkill(Module):
             if text is None:
                 return
             try:
-                playback_events.extend(
-                    self._publish_tts_chunk(
-                        tts_node,
-                        text,
-                        publish_audio=not (
-                            self.config.wait_for_audio_playback or self.config.stream_audio_playback
-                        ),
-                        play_audio_immediately=self.config.stream_audio_playback,
-                    )
+                events = self._publish_tts_chunk(
+                    tts_node,
+                    text,
+                    publish_audio=not (
+                        self.config.wait_for_audio_playback or self.config.stream_audio_playback
+                    ),
                 )
+                playback_events.extend(events)
+                if audio_chunks is not None:
+                    audio_chunks.put(events)
             except Exception as exc:
                 logger.error("InfoDay TTS streaming failed", error=str(exc), text=text)
+                errors.put(exc)
+                return
+
+    def _audio_playback_worker(
+        self,
+        audio_chunks: queue.Queue[list[AudioEvent] | None],
+        errors: queue.Queue[Exception],
+    ) -> None:
+        while True:
+            events = audio_chunks.get()
+            if events is None:
+                return
+            try:
+                if not self.audio_bridge.play_audio(events, wait_for_playback=False):
+                    raise RuntimeError("Go2 audio bridge failed to play streaming audio")
+            except Exception as exc:
+                logger.error("InfoDay audio playback failed", error=str(exc))
                 errors.put(exc)
                 return
 
@@ -632,16 +670,54 @@ _PROGRAMME_CODE_RE = re.compile(
     r"(?<![A-Za-z0-9])(?=[A-Z0-9-]*[A-Z])(?=[A-Z0-9-]*\d)"
     r"[A-Z0-9]+(?:-[A-Z0-9]+)*(?![A-Za-z0-9])"
 )
+_SPOKEN_ENGLISH_NAMES: tuple[tuple[re.Pattern[str], str], ...] = (
+    (
+        re.compile(
+            r"BEng\s*\(Hons\)\s*/\s*BSc\s*\(Hons\)\s+"
+            r"Scheme\s+in\s+Information\s+and\s+Artificial\s+"
+            r"Intelligence\s+Engineering",
+            flags=re.IGNORECASE,
+        ),
+        "工程學榮譽學士同理學榮譽學士嘅資訊及人工智能工程組合課程",
+    ),
+    (
+        re.compile(
+            r"Scheme\s+in\s+Information\s+and\s+Artificial\s+"
+            r"Intelligence\s+Engineering",
+            flags=re.IGNORECASE,
+        ),
+        "資訊及人工智能工程組合課程",
+    ),
+    (
+        re.compile(
+            r"Information\s+and\s+Artificial\s+Intelligence\s+Engineering",
+            flags=re.IGNORECASE,
+        ),
+        "資訊及人工智能工程",
+    ),
+    (
+        re.compile(
+            r"Electronic\s+Systems\s+and\s+Internet-of-Things",
+            flags=re.IGNORECASE,
+        ),
+        "電子系統及物聯網",
+    ),
+    (re.compile(r"Information\s+Security", flags=re.IGNORECASE), "資訊保安"),
+)
 
 
 def _text_for_speech(text: str) -> str:
-    """Make compact programme codes unambiguous without changing display text."""
+    """Make official names concise and codes unambiguous for speech only."""
+
+    speech_text = text
+    for pattern, replacement in _SPOKEN_ENGLISH_NAMES:
+        speech_text = pattern.sub(replacement, speech_text)
 
     def expand_code(match: re.Match[str]) -> str:
         characters = [character.translate(_SPOKEN_DIGITS) for character in match.group(0)]
         return " ".join(characters)
 
-    return _PROGRAMME_CODE_RE.sub(expand_code, text)
+    return _PROGRAMME_CODE_RE.sub(expand_code, speech_text)
 
 
 def _fast_infoday_answer(question: str) -> str | None:

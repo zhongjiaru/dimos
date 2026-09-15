@@ -39,6 +39,11 @@ def test_response_prompt_offers_an_action_when_official_context_is_insufficient(
     assert "do not claim that it has happened" in INFODAY_CANTONESE_RESPONSE_PROMPT
 
 
+def test_response_prompt_requests_a_short_direct_first_sentence() -> None:
+    assert "first sentence to at most 45 characters" in INFODAY_CANTONESE_RESPONSE_PROMPT
+    assert "full English programme or award title" in INFODAY_CANTONESE_RESPONSE_PROMPT
+
+
 def test_text_chunker_splits_on_comma_after_minimum() -> None:
     """Text chunking waits for a complete sentence instead of emitting a short tail."""
     chunker = _TextChunker(min_chars=8, max_chars=40)
@@ -53,6 +58,19 @@ def test_text_chunker_splits_on_comma_after_minimum() -> None:
 def test_tts_expands_programme_code_digits_without_changing_other_numbers() -> None:
     assert _text_for_speech("JS3180 參考分數係 23.4 分。") == (
         "J S 三 一 八 零 參考分數係 23.4 分。"
+    )
+
+
+def test_tts_speaks_long_official_english_names_in_concise_traditional_chinese() -> None:
+    text = (
+        "JS3180 呢個 BEng(Hons)/BSc(Hons) Scheme in Information and Artificial "
+        "Intelligence Engineering，主要讀 Electronic Systems and Internet-of-Things "
+        "同 Information Security。"
+    )
+
+    assert _text_for_speech(text) == (
+        "J S 三 一 八 零 呢個 工程學榮譽學士同理學榮譽學士嘅資訊及人工智能工程組合課程，"
+        "主要讀 電子系統及物聯網 同 資訊保安。"
     )
 
 
@@ -230,6 +248,65 @@ def test_infoday_voice_answer_streams_each_tts_event_then_waits_for_drain(mocker
     skill.infoday_audio_complete.publish.assert_called_once_with(
         {"audio_chunks": 2, "audio_duration_sec": pytest.approx(2 / 24000)}
     )
+
+
+def test_infoday_streaming_prefetches_next_tts_chunk_during_playback(mocker) -> None:
+    skill = InfodayVoiceAnswerSkill(
+        min_tts_chunk_chars=4,
+        max_tts_chunk_chars=40,
+        stream_audio_playback=True,
+    )
+    skill._client = mocker.Mock()
+    skill.polyu_knowledge = mocker.Mock()
+    skill.polyu_knowledge.search_polyu_knowledge.return_value = "official context"
+    skill.audio_bridge = mocker.Mock()
+    skill.audio_bridge.finish_audio_playback.return_value = True
+    skill.infoday_answer = mocker.Mock()
+    skill.infoday_audio_complete = mocker.Mock()
+    skill.operator_audio = mocker.Mock()
+    mocker.patch.object(
+        skill,
+        "_stream_response",
+        return_value=iter(["第一句完整答案。", "第二句邀請。"]),
+    )
+    frame_a = AudioEvent(np.array([1], dtype=np.int16), 24000, 1.0, 1)
+    frame_b = AudioEvent(np.array([2], dtype=np.int16), 24000, 1.1, 1)
+    first_playback_started = Event()
+    second_tts_ready = Event()
+    tts_node = mocker.Mock()
+
+    def synthesize(text: str) -> list[AudioEvent]:
+        if text == "第二句邀請。":
+            assert first_playback_started.wait(timeout=1.0)
+            second_tts_ready.set()
+            return [frame_b]
+        return [frame_a]
+
+    def play_audio(events: list[AudioEvent], *, wait_for_playback: bool) -> bool:
+        assert wait_for_playback is False
+        if events == [frame_a]:
+            first_playback_started.set()
+            assert second_tts_ready.wait(timeout=1.0)
+        return True
+
+    tts_node.iter_audio_events.side_effect = synthesize
+    skill.audio_bridge.play_audio.side_effect = play_audio
+    mocker.patch.object(skill, "_make_tts_node", return_value=tts_node)
+
+    try:
+        result = skill.answer_infoday_question("問題")
+    finally:
+        skill.stop()
+
+    assert result == "Answered Info Day question in Cantonese: 問題"
+    assert [call.args[0] for call in tts_node.iter_audio_events.call_args_list] == [
+        "第一句完整答案。",
+        "第二句邀請。",
+    ]
+    assert [call.args[0] for call in skill.audio_bridge.play_audio.call_args_list] == [
+        [frame_a],
+        [frame_b],
+    ]
 
 
 def test_infoday_voice_answer_asks_user_to_repeat_without_llm(mocker) -> None:  # type: ignore[no-untyped-def]

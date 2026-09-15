@@ -50,6 +50,8 @@ def _stub_driver(connect_exc: Exception | None = None) -> MagicMock:
     driver = MagicMock(name="LegionConnection-instance")
     driver.connect = AsyncMock(side_effect=connect_exc)
     driver.disconnect = AsyncMock()
+    driver.pc.connectionState = "connected"
+    driver.pc.iceConnectionState = "completed"
     driver.datachannel.disableTrafficSaving = AsyncMock()
     driver.datachannel.set_decoder = MagicMock()
     driver.datachannel.pub_sub.publish_request_new = AsyncMock()
@@ -157,7 +159,6 @@ def test_video_track_end_completes_stream_without_callback_error(built_connectio
 
 def test_audio_output_attaches_and_queues_on_webrtc_loop(
     monkeypatch: pytest.MonkeyPatch,
-    mocker: Any,
 ) -> None:
     driver = _stub_driver()
     sender = MagicMock(name="audio-sender")
@@ -169,7 +170,6 @@ def test_audio_output_attaches_and_queues_on_webrtc_loop(
     track_factory = MagicMock(return_value=track)
     monkeypatch.setattr(conn_mod, "LegionConnection", MagicMock(return_value=driver))
     monkeypatch.setattr(conn_mod, "QueuedGo2AudioTrack", track_factory)
-    sleep = mocker.patch.object(conn_mod.asyncio, "sleep", new_callable=AsyncMock)
     add_track_thread: list[int] = []
     driver.pc.addTrack.side_effect = (
         lambda value: add_track_thread.append(threading.get_ident()) or sender
@@ -190,16 +190,40 @@ def test_audio_output_attaches_and_queues_on_webrtc_loop(
 
     track_factory.assert_called_once_with()
     driver.pc.addTrack.assert_called_once_with(track)
-    assert driver.audio.switchAudioChannel.call_args_list == [
-        call(True),
-        call(False),
-        call(True),
-        call(False),
-    ]
-    sleep.assert_awaited_once_with(conn_mod._AUDIO_CHANNEL_RESET_DELAY_SEC)
+    driver.audio.switchAudioChannel.assert_not_called()
     assert add_track_thread == [connection.thread.ident]
     track.enqueue.assert_called_once()
     track.stop.assert_called_once_with()
+
+
+@pytest.mark.parametrize(
+    ("connection_state", "ice_state"),
+    [
+        pytest.param("failed", "completed", id="peer-failed"),
+        pytest.param("connected", "failed", id="ice-failed"),
+        pytest.param("disconnected", "disconnected", id="disconnected"),
+    ],
+)
+def test_audio_output_rejects_unhealthy_transport_without_toggling_audio_channel(
+    monkeypatch: pytest.MonkeyPatch,
+    connection_state: str,
+    ice_state: str,
+) -> None:
+    driver = _stub_driver()
+    driver.pc.connectionState = connection_state
+    driver.pc.iceConnectionState = ice_state
+    sender = MagicMock(name="audio-sender")
+    driver.pc.addTrack.return_value = sender
+    driver.pc.getTransceivers.return_value = [MagicMock(sender=sender, currentDirection="sendrecv")]
+    monkeypatch.setattr(conn_mod, "LegionConnection", MagicMock(return_value=driver))
+
+    connection = UnitreeWebRTCConnection(ip="10.0.0.99", audio_output=True)
+    try:
+        assert connection.audio_output_available() is False
+    finally:
+        connection.stop()
+
+    driver.audio.switchAudioChannel.assert_not_called()
 
 
 def _audio_sender_report(
@@ -273,6 +297,12 @@ def test_audio_output_logs_rtp_stats_for_completed_send_window(
     track = MagicMock(name="QueuedGo2AudioTrack")
     track.enqueue.return_value = True
     track.wait_drained = AsyncMock(return_value=True)
+    track.take_pacing_diagnostics.return_value = {
+        "frame_count": 2,
+        "late_frame_count": 0,
+        "max_lag_ms": 0.5,
+        "max_catchup_streak": 0,
+    }
     monkeypatch.setattr(conn_mod, "LegionConnection", MagicMock(return_value=driver))
     monkeypatch.setattr(conn_mod, "QueuedGo2AudioTrack", MagicMock(return_value=track))
 
@@ -310,6 +340,10 @@ def test_audio_output_logs_rtp_stats_for_completed_send_window(
         remote_fraction_lost=0.0,
         remote_jitter=2.0,
         round_trip_time=0.01,
+        pacing_frames=2,
+        pacing_late_frames=0,
+        pacing_max_lag_ms=0.5,
+        pacing_max_catchup_streak=0,
     )
 
 

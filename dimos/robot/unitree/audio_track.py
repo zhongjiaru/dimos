@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 from collections import deque
 from fractions import Fraction
+from typing import TypedDict
 
 from aiortc.mediastreams import AudioStreamTrack, MediaStreamError
 from av import AudioFrame
@@ -26,6 +27,14 @@ from numpy.typing import NDArray
 GO2_AUDIO_SAMPLE_RATE = 48000
 GO2_AUDIO_FRAME_SAMPLES = 960
 GO2_AUDIO_TIME_BASE = Fraction(1, GO2_AUDIO_SAMPLE_RATE)
+GO2_AUDIO_FRAME_DURATION_SEC = GO2_AUDIO_FRAME_SAMPLES / GO2_AUDIO_SAMPLE_RATE
+
+
+class Go2AudioPacingDiagnostics(TypedDict):
+    frame_count: int
+    late_frame_count: int
+    max_lag_ms: float
+    max_catchup_streak: int
 
 
 class QueuedGo2AudioTrack(AudioStreamTrack):
@@ -43,6 +52,11 @@ class QueuedGo2AudioTrack(AudioStreamTrack):
         self._drained.set()
         self._next_frame_at: float | None = None
         self._pts = 0
+        self._pacing_frame_count = 0
+        self._pacing_late_frame_count = 0
+        self._pacing_max_lag_sec = 0.0
+        self._pacing_catchup_streak = 0
+        self._pacing_max_catchup_streak = 0
 
     @property
     def buffered_samples(self) -> int:
@@ -77,16 +91,36 @@ class QueuedGo2AudioTrack(AudioStreamTrack):
             return False
         return True
 
+    def take_pacing_diagnostics(self) -> Go2AudioPacingDiagnostics:
+        """Return and reset pacing counters collected since the previous report."""
+        diagnostics = Go2AudioPacingDiagnostics(
+            frame_count=self._pacing_frame_count,
+            late_frame_count=self._pacing_late_frame_count,
+            max_lag_ms=round(self._pacing_max_lag_sec * 1000.0, 3),
+            max_catchup_streak=self._pacing_max_catchup_streak,
+        )
+        self._pacing_frame_count = 0
+        self._pacing_late_frame_count = 0
+        self._pacing_max_lag_sec = 0.0
+        self._pacing_catchup_streak = 0
+        self._pacing_max_catchup_streak = 0
+        return diagnostics
+
     async def recv(self) -> AudioFrame:
         if self.readyState != "live":
             raise MediaStreamError
 
         loop = asyncio.get_running_loop()
         now = loop.time()
+        lag_sec = 0.0
         if self._next_frame_at is None:
             self._next_frame_at = now
         elif self._next_frame_at > now:
             await asyncio.sleep(self._next_frame_at - now)
+        else:
+            lag_sec = now - self._next_frame_at
+
+        self._record_pacing(lag_sec)
 
         pcm = np.zeros(GO2_AUDIO_FRAME_SAMPLES, dtype=np.int16)
         copied = 0
@@ -111,8 +145,21 @@ class QueuedGo2AudioTrack(AudioStreamTrack):
         frame.time_base = GO2_AUDIO_TIME_BASE
 
         self._pts += GO2_AUDIO_FRAME_SAMPLES
-        self._next_frame_at += GO2_AUDIO_FRAME_SAMPLES / GO2_AUDIO_SAMPLE_RATE
+        self._next_frame_at += GO2_AUDIO_FRAME_DURATION_SEC
         return frame
+
+    def _record_pacing(self, lag_sec: float) -> None:
+        self._pacing_frame_count += 1
+        self._pacing_max_lag_sec = max(self._pacing_max_lag_sec, lag_sec)
+        if lag_sec >= GO2_AUDIO_FRAME_DURATION_SEC:
+            self._pacing_late_frame_count += 1
+            self._pacing_catchup_streak += 1
+            self._pacing_max_catchup_streak = max(
+                self._pacing_max_catchup_streak,
+                self._pacing_catchup_streak,
+            )
+        else:
+            self._pacing_catchup_streak = 0
 
     def stop(self) -> None:
         self.clear()

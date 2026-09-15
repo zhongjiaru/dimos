@@ -20,6 +20,7 @@ import base64
 from io import BytesIO
 import json
 from math import gcd, log10
+from pathlib import Path
 import queue
 import threading
 import time
@@ -51,7 +52,7 @@ TARGET_SAMPLE_RATE = 44100
 INT16_MIN = np.iinfo(np.int16).min
 INT16_MAX = np.iinfo(np.int16).max
 # Base64-character block size the Unitree upload API takes per request.
-DEFAULT_UPLOAD_CHUNK_CHARS = 8192
+DEFAULT_UPLOAD_CHUNK_CHARS = 32768
 
 
 class Go2AudioBridgeConfig(ModuleConfig):
@@ -60,7 +61,7 @@ class Go2AudioBridgeConfig(ModuleConfig):
     batch_ms: int = 100
     idle_timeout_sec: float = 1.0
     queue_frames: int = 100
-    chunk_interval_sec: float = 0.05
+    chunk_interval_sec: float = 0.0
     megaphone_enter_delay_sec: float = 0.2
     upload_chunk_chars: int = DEFAULT_UPLOAD_CHUNK_CHARS
     target_sample_rate: int = TARGET_SAMPLE_RATE
@@ -69,8 +70,10 @@ class Go2AudioBridgeConfig(ModuleConfig):
     target_peak: int = 12000
     max_gain: float = 128.0
     noise_gate_peak: int = 32
+    megaphone_edge_fade_ms: float = 5.0
     debug_local_playback: bool = False
     debug_local_device: int | None = None
+    debug_audio_dump_dir: str | None = None
     debug_robot_playback_timeout_sec: float = 5.0
     webrtc_rpc_chunk_ms: int = 250
     webrtc_channel_warmup_sec: float = 0.0
@@ -90,6 +93,10 @@ class Go2AudioBridgeModule(Module):
         self._stop_event = threading.Event()
         self._speaker_available: bool | None = None
         self._megaphone_active = False
+        # ``play_audio`` RPC calls and the operator-audio worker run on
+        # different threads.  Keep idle cleanup from exiting megaphone mode
+        # while another thread is still uploading or holding playback open.
+        self._megaphone_lock = threading.RLock()
         self._webrtc_audio_queued_until: float | None = None
 
     @rpc
@@ -264,8 +271,8 @@ class Go2AudioBridgeModule(Module):
         finally:
             self._webrtc_audio_queued_until = None
             if self.config.speaker == "auto":
-                # SDP direction alone does not reflect whether Go2 firmware has
-                # since closed its audio channel. Re-arm it on the next turn.
+                # Recheck the peer transport on the next turn instead of
+                # relying on a cached negotiated state indefinitely.
                 self._speaker_available = None
 
     def _flush(
@@ -283,6 +290,12 @@ class Go2AudioBridgeModule(Module):
         if pcm.size == 0:
             logger.info("Go2 playback PCM suppressed by noise gate", **input_stats)
             return False
+        if self.config.speaker_backend == "megaphone":
+            pcm = self._fade_edges(
+                pcm,
+                sample_rate=self.config.target_sample_rate,
+                fade_ms=self.config.megaphone_edge_fade_ms,
+            )
         output_stats = self._pcm_diagnostics(pcm, silence_peak=self.config.noise_gate_peak)
         output_peak = self._peak(pcm)
         applied_gain = output_peak / input_peak if input_peak else 0.0
@@ -301,6 +314,11 @@ class Go2AudioBridgeModule(Module):
             output_rms_dbfs=output_stats["rms_dbfs"],
             output_clipped_ratio=output_stats["clipped_ratio"],
         )
+        if self.config.debug_audio_dump_dir is not None:
+            try:
+                self._dump_debug_audio(pcm)
+            except Exception:
+                logger.warning("Failed to dump Go2 playback PCM", exc_info=True)
         if self.config.debug_local_playback:
             self._play_debug_audio_locally(pcm)
         if self.config.speaker_backend == "webrtc":
@@ -336,31 +354,10 @@ class Go2AudioBridgeModule(Module):
                     samples=pcm.size,
                 )
                 return True
-            if not self._megaphone_active:
-                self._request(ENTER_MEGAPHONE)
-                self._megaphone_active = True
-                if self._stop_event.is_set():
-                    self._exit_megaphone()
-                    return False
-                if self.config.megaphone_enter_delay_sec > 0:
-                    if self._stop_event.wait(self.config.megaphone_enter_delay_sec):
-                        self._exit_megaphone()
-                        return False
-            wav_data = self._wav_bytes(pcm, sample_rate=self.config.target_sample_rate)
-            logger.info(
-                "Go2 speaker audio upload starting",
-                samples=pcm.size,
-                sample_rate=self.config.target_sample_rate,
-                wav_bytes=len(wav_data),
+            return self._send_megaphone_pcm(
+                pcm,
+                wait_for_playback=wait_for_playback,
             )
-            self._upload_wav(wav_data)
-            if self.config.wait_for_playback or wait_for_playback:
-                audio_duration_sec = pcm.size / self.config.target_sample_rate
-                if self._stop_event.wait(audio_duration_sec + self.config.playback_tail_sec):
-                    self._exit_megaphone()
-                    return False
-            logger.info("Go2 speaker audio upload finished")
-            return True
         except Exception:
             logger.warning("Go2 speaker audio send failed", exc_info=True)
             self._exit_megaphone()
@@ -370,13 +367,63 @@ class Go2AudioBridgeModule(Module):
                 self._speaker_available = None if self.config.speaker_backend == "webrtc" else False
             return False
 
+    def _send_megaphone_pcm(
+        self,
+        pcm: NDArray[np.int16],
+        *,
+        wait_for_playback: bool,
+    ) -> bool:
+        with self._megaphone_lock:
+            if not self._megaphone_active:
+                response = self._request(ENTER_MEGAPHONE)
+                self._megaphone_active = True
+                logger.info(
+                    "Go2 megaphone mode entered",
+                    response_code=self._response_code(response),
+                )
+                if self._stop_event.is_set():
+                    self._exit_megaphone()
+                    return False
+                if self.config.megaphone_enter_delay_sec > 0:
+                    if self._stop_event.wait(self.config.megaphone_enter_delay_sec):
+                        self._exit_megaphone()
+                        return False
+
+            wav_data = self._wav_bytes(pcm, sample_rate=self.config.target_sample_rate)
+            logger.info(
+                "Go2 speaker audio upload starting",
+                samples=pcm.size,
+                sample_rate=self.config.target_sample_rate,
+                wav_bytes=len(wav_data),
+            )
+            self._upload_wav(wav_data)
+
+            hold_for_playback = self.config.wait_for_playback or wait_for_playback
+            if hold_for_playback:
+                audio_duration_sec = pcm.size / self.config.target_sample_rate
+                hold_sec = audio_duration_sec + self.config.playback_tail_sec
+                logger.info(
+                    "Go2 megaphone playback hold starting",
+                    audio_duration_sec=round(audio_duration_sec, 3),
+                    hold_sec=round(hold_sec, 3),
+                )
+                try:
+                    if self._stop_event.wait(hold_sec):
+                        return False
+                    logger.info("Go2 megaphone playback hold complete")
+                finally:
+                    self._exit_megaphone()
+
+            logger.info("Go2 speaker audio upload finished")
+            return True
+
     def _ensure_webrtc_speaker_for_next_audio(self, *, now: float | None = None) -> bool:
-        """Re-arm Go2 after an idle gap without interrupting queued speech."""
+        """Recheck the Go2 speaker transport after an idle playback gap."""
         current_time = time.monotonic() if now is None else now
         queued_until = self._webrtc_audio_queued_until
         if queued_until is not None and current_time >= queued_until:
             logger.info(
-                "Go2 WebRTC playback window ended; re-arming audio channel",
+                "Go2 WebRTC playback window ended; rechecking speaker transport",
                 idle_sec=round(current_time - queued_until, 3),
             )
             self._speaker_available = None
@@ -445,6 +492,19 @@ class Go2AudioBridgeModule(Module):
         else:
             logger.info("Local debug audio playback finished")
 
+    def _dump_debug_audio(self, pcm: NDArray[np.int16]) -> None:
+        """Persist the exact normalized PCM sent to Go2 without delaying for playback."""
+        dump_dir = Path(self.config.debug_audio_dump_dir or "").expanduser()
+        dump_dir.mkdir(parents=True, exist_ok=True)
+        output_path = dump_dir / f"go2-playback-{time.time_ns()}.wav"
+        output_path.write_bytes(self._wav_bytes(pcm, sample_rate=self.config.target_sample_rate))
+        logger.info(
+            "Go2 playback PCM dumped",
+            path=str(output_path),
+            samples=pcm.size,
+            sample_rate=self.config.target_sample_rate,
+        )
+
     def _upload_wav(self, wav_data: bytes) -> None:
         encoded = base64.b64encode(wav_data).decode("ascii")
         chunk_chars = max(1, self.config.upload_chunk_chars)
@@ -473,20 +533,26 @@ class Go2AudioBridgeModule(Module):
                 if self._stop_event.wait(self.config.chunk_interval_sec):
                     return
         logger.info(
-            "Go2 megaphone WAV upload sent",
+            "Go2 megaphone WAV upload acknowledged",
             upload_chunks=len(chunks),
+            acknowledged_chunks=len(chunks),
             upload_ms=(time.monotonic() - started_at) * 1000.0,
         )
 
     def _exit_megaphone(self) -> None:
-        if not self._megaphone_active:
-            return
-        try:
-            self._request(EXIT_MEGAPHONE)
-        except Exception:
-            logger.warning("Failed to exit Go2 megaphone mode", exc_info=True)
-        else:
-            self._megaphone_active = False
+        with self._megaphone_lock:
+            if not self._megaphone_active:
+                return
+            try:
+                response = self._request(EXIT_MEGAPHONE)
+            except Exception:
+                logger.warning("Failed to exit Go2 megaphone mode", exc_info=True)
+            else:
+                self._megaphone_active = False
+                logger.info(
+                    "Go2 megaphone mode exited",
+                    response_code=self._response_code(response),
+                )
 
     def _request(self, api_id: int, parameter: dict[str, Any] | None = None) -> dict[Any, Any]:
         response = self.go2.publish_request(
@@ -522,6 +588,26 @@ class Go2AudioBridgeModule(Module):
     @staticmethod
     def _peak(pcm: NDArray[np.int16]) -> int:
         return int(np.max(np.abs(pcm.astype(np.int32))))
+
+    @staticmethod
+    def _fade_edges(
+        pcm: NDArray[np.int16],
+        *,
+        sample_rate: int,
+        fade_ms: float,
+    ) -> NDArray[np.int16]:
+        """Apply a short fade to suppress speaker clicks at WAV boundaries."""
+        fade_samples = min(
+            max(0, round(sample_rate * fade_ms / 1000.0)),
+            pcm.size // 2,
+        )
+        if fade_samples == 0:
+            return pcm
+        ramp = np.linspace(0.0, 1.0, fade_samples, dtype=np.float64)
+        values = pcm.astype(np.float64)
+        values[:fade_samples] *= ramp
+        values[-fade_samples:] *= ramp[::-1]
+        return np.rint(values).astype(np.int16)
 
     @staticmethod
     def _pcm_diagnostics(
