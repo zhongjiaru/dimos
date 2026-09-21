@@ -161,12 +161,13 @@ class UnitreeWebRTCConnection(Resource):
 
     def __init__(
         self,
-        ip: str,
+        ip: str | None,
         mode: str = "ai",
         aes_128_key: str | None = None,
         velocity_api: bool = False,
         audio_output: bool = False,
         lidar_enabled: bool = True,
+        connection_method: WebRTCConnectionMethod = WebRTCConnectionMethod.LocalSTA,
     ) -> None:
         self.ip = ip
         self.mode = mode
@@ -186,9 +187,7 @@ class UnitreeWebRTCConnection(Resource):
         self._stop_lock = threading.Lock()
         self._stopped = False
         # Per-device AES-128 key for new Unitree firmware (data2=3 handshake); omitted when unset.
-        self.conn = LegionConnection(
-            WebRTCConnectionMethod.LocalSTA, ip=self.ip, aes_128_key=aes_128_key
-        )
+        self.conn = LegionConnection(connection_method, ip=self.ip, aes_128_key=aes_128_key)
         self.connect()
 
     def connect(self) -> None:

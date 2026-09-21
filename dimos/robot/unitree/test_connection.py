@@ -34,7 +34,12 @@ from aiortc.stats import (
 )
 import numpy as np
 import pytest
-from unitree_webrtc_connect.constants import DATA_CHANNEL_TYPE, RTC_TOPIC, SPORT_CMD
+from unitree_webrtc_connect.constants import (
+    DATA_CHANNEL_TYPE,
+    RTC_TOPIC,
+    SPORT_CMD,
+    WebRTCConnectionMethod,
+)
 
 from dimos.core.global_config import GlobalConfig
 from dimos.msgs.geometry_msgs.Twist import Twist
@@ -493,6 +498,14 @@ def test_empty_string_key_forwarded_as_falsy(stub_legion: MagicMock) -> None:
     """Empty-string key stays falsy → the driver treats it as no key."""
     UnitreeWebRTCConnection(ip="192.168.123.161", aes_128_key="")
     assert not _aes_kwarg(stub_legion)
+
+
+def test_local_ap_connection_method_forwarded(stub_legion: MagicMock) -> None:
+    UnitreeWebRTCConnection(
+        ip=None,
+        connection_method=WebRTCConnectionMethod.LocalAP,
+    )
+    assert stub_legion.call_args.args[0] is WebRTCConnectionMethod.LocalAP
 
 
 def test_global_config_reads_unitree_aes_128_key_env(monkeypatch: pytest.MonkeyPatch) -> None:

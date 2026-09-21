@@ -23,7 +23,7 @@ from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
-from unitree_webrtc_connect.constants import RTC_TOPIC
+from unitree_webrtc_connect.constants import RTC_TOPIC, WebRTCConnectionMethod
 
 from dimos.core.global_config import GlobalConfig
 from dimos.msgs.geometry_msgs.PoseStamped import PoseStamped
@@ -52,7 +52,18 @@ def test_make_connection_webrtc_forwards_aes_128_key(stub_webrtc: MagicMock) -> 
         velocity_api=False,
         audio_output=False,
         lidar_enabled=True,
+        connection_method=WebRTCConnectionMethod.LocalSTA,
     )
+
+
+def test_make_connection_webrtc_forwards_local_ap(stub_webrtc: MagicMock) -> None:
+    cfg = SimpleNamespace(unitree_connection_type="webrtc")
+    go2_conn.make_connection(
+        None,
+        cfg,
+        webrtc_connection_method=WebRTCConnectionMethod.LocalAP,
+    )
+    assert stub_webrtc.call_args.kwargs["connection_method"] is WebRTCConnectionMethod.LocalAP
 
 
 def test_connection_config_aes_key_defaults_from_global_config() -> None:

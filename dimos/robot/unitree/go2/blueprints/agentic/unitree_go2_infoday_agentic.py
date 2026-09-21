@@ -15,6 +15,8 @@
 
 # ruff: noqa: RUF001
 
+from unitree_webrtc_connect.constants import WebRTCConnectionMethod
+
 from dimos.agents.infoday_input_router import InfodayInputRouter
 from dimos.agents.mcp.mcp_client import McpClient
 from dimos.agents.mcp.mcp_server import McpServer
@@ -87,6 +89,7 @@ must therefore call at least one of the two available tools; never respond with 
 
 unitree_go2_infoday_agentic = autoconnect(
     GO2Connection.blueprint(
+        webrtc_connection_method=WebRTCConnectionMethod.LocalAP,
         camera=False,
         lidar=False,
         odom=False,

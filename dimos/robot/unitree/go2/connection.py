@@ -24,7 +24,7 @@ from pydantic import Field
 from reactivex import empty
 from reactivex.disposable import Disposable
 from reactivex.observable import Observable
-from unitree_webrtc_connect.constants import RTC_TOPIC
+from unitree_webrtc_connect.constants import RTC_TOPIC, WebRTCConnectionMethod
 
 from dimos.agents.annotation import skill
 from dimos.constants import DEFAULT_THREAD_JOIN_TIMEOUT
@@ -65,7 +65,8 @@ class Go2Mode(str, Enum):
 
 
 class ConnectionConfig(ModuleConfig):
-    ip: str = Field(default_factory=lambda m: m["g"].robot_ip)
+    ip: str | None = Field(default_factory=lambda m: m["g"].robot_ip)
+    webrtc_connection_method: WebRTCConnectionMethod = WebRTCConnectionMethod.LocalSTA
     mode: Go2Mode = Go2Mode.DEFAULT
     lidar: bool = True
     camera: bool = True
@@ -153,6 +154,7 @@ def make_connection(
     velocity_api: bool = False,
     audio_output: bool = False,
     lidar_enabled: bool = True,
+    webrtc_connection_method: WebRTCConnectionMethod = WebRTCConnectionMethod.LocalSTA,
 ) -> Go2ConnectionProtocol:
     connection_type = cfg.unitree_connection_type.lower()
 
@@ -168,13 +170,16 @@ def make_connection(
 
         return DimSimConnection(cfg)
     elif connection_type == "webrtc":
-        assert ip is not None, "IP address must be provided"
+        assert ip is not None or webrtc_connection_method is WebRTCConnectionMethod.LocalAP, (
+            "IP address must be provided for a non-AP WebRTC connection"
+        )
         return UnitreeWebRTCConnection(
             ip,
             aes_128_key=aes_128_key,
             velocity_api=velocity_api,
             audio_output=audio_output,
             lidar_enabled=lidar_enabled,
+            connection_method=webrtc_connection_method,
         )
     else:
         raise ValueError(f"Unknown simulator {cfg.simulation!r}. Choose from: mujoco, dimsim")
@@ -338,6 +343,7 @@ class GO2Connection(Module, Camera, Pointcloud):
             velocity_api=self.config.velocity_api,
             audio_output=self.config.audio_output,
             lidar_enabled=self.config.lidar,
+            webrtc_connection_method=self.config.webrtc_connection_method,
         )
 
         if self.config.go2_volume is not None:
