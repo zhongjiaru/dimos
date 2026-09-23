@@ -16,8 +16,10 @@
 
 from dataclasses import dataclass
 import re
+import threading
 import time
-from typing import Literal
+from time import monotonic
+from typing import Any, Literal
 import unicodedata
 
 from pydantic import Field
@@ -26,6 +28,7 @@ from unitree_webrtc_connect.constants import SPORT_CMD
 from dimos.agents.annotation import skill
 from dimos.agents.capabilities import CAP_MOVEMENT
 from dimos.agents.skills.infoday_voice_answer_spec import InfodayVoiceAnswerSpec
+from dimos.core.core import rpc
 from dimos.core.module import Module, ModuleConfig
 from dimos.robot.unitree.go2.connection_spec import GO2ConnectionSpec
 from dimos.utils.logging_config import setup_logger
@@ -115,6 +118,11 @@ _ACTION_SPECS: dict[InfodayAction, _ActionSpec] = {
 _ACTION_COMPLETE = "完成啦！你想睇我做另一個動作，定係問下 EEE 嘅課程？"
 _ACTION_FAILED = "唔好意思，呢個動作今次做唔到；你想試下揮手，定係問下 EEE 嘅課程？"
 _SUGGESTED_ACTIONS: tuple[InfodayAction, ...] = ("wave", "stretch", "dance")
+_ATTENTION_ACTIONS: tuple[InfodayAction, ...] = (
+    "wave",
+    "stretch",
+    "finger_heart",
+)
 _CAPABILITY_OVERVIEW_PATTERN = r"what can you do|你識做咩|你识做咩|你會做咩|你会做什么"
 _CAPABILITY_QUESTION_PATTERN = (
     r"\bcan you\b|識唔識|识不识|會唔會|会不会|你識|你识|你會|你会|得唔得|行唔行"
@@ -149,6 +157,42 @@ class InfodayActionSkill(Module):
     go2: GO2ConnectionSpec
     voice_answer: InfodayVoiceAnswerSpec
 
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self._motion_lock = threading.Lock()
+        self._explicit_action_in_progress = False
+        self._attention_busy_until = 0.0
+        self._attention_action_index = 0
+
+    @rpc
+    def start_attention_action(self) -> str:
+        """Start a short silent action while an Info Day answer is generated."""
+        now = monotonic()
+        with self._motion_lock:
+            if self._explicit_action_in_progress or now < self._attention_busy_until:
+                return "Skipped Info Day attention action: robot action already in progress"
+
+            action = _ATTENTION_ACTIONS[self._attention_action_index % len(_ATTENTION_ACTIONS)]
+            spec = _ACTION_SPECS[action]
+            try:
+                succeeded = self.go2.sport_command(SPORT_CMD[spec.command])
+            except Exception as exc:
+                logger.exception("InfoDay attention action failed", action=action)
+                return f"Error starting Info Day attention action '{action}': {exc}"
+            if not succeeded:
+                logger.warning("InfoDay attention action rejected", action=action)
+                return f"Info Day attention action '{action}' was rejected by the robot"
+
+            self._attention_action_index += 1
+            self._attention_busy_until = now + spec.duration_sec
+
+        logger.info(
+            "InfoDay attention action started",
+            action=action,
+            duration_sec=spec.duration_sec,
+        )
+        return f"Started Info Day attention action: {action}"
+
     @skill(uses=[CAP_MOVEMENT])
     def perform_robot_action(self, request: str) -> str:
         """Handle a robot capability/action request with matching speech and movement.
@@ -163,33 +207,39 @@ class InfodayActionSkill(Module):
         """
         clean_request = request.strip()
         resolved = _resolve_action_request(clean_request)
-        self.voice_answer.speak_message(resolved.message)
         if resolved.action is None:
+            self.voice_answer.speak_message(resolved.message)
             return f"Answered robot action capability request: {clean_request or '<empty>'}"
 
         action = resolved.action
         spec = _ACTION_SPECS[action]
-
+        with self._motion_lock:
+            self._explicit_action_in_progress = True
         try:
-            if action == "stop":
-                self.go2.stop_movement()
-                succeeded = True
-            else:
-                succeeded = self.go2.sport_command(SPORT_CMD[spec.command])
-        except Exception as exc:
-            logger.exception("InfoDay action command failed", action=action)
-            self.voice_answer.speak_message(_ACTION_FAILED)
-            return f"Error performing Info Day action '{action}': {exc}"
+            self.voice_answer.speak_message(resolved.message)
+            try:
+                if action == "stop":
+                    self.go2.stop_movement()
+                    succeeded = True
+                else:
+                    succeeded = self.go2.sport_command(SPORT_CMD[spec.command])
+            except Exception as exc:
+                logger.exception("InfoDay action command failed", action=action)
+                self.voice_answer.speak_message(_ACTION_FAILED)
+                return f"Error performing Info Day action '{action}': {exc}"
 
-        if not succeeded:
-            self.voice_answer.speak_message(_ACTION_FAILED)
-            return f"Info Day action '{action}' was rejected by the robot"
+            if not succeeded:
+                self.voice_answer.speak_message(_ACTION_FAILED)
+                return f"Info Day action '{action}' was rejected by the robot"
 
-        delay = spec.duration_sec * self.config.action_time_scale
-        if delay:
-            time.sleep(delay)
-        self.voice_answer.speak_message(_ACTION_COMPLETE)
-        return f"Completed Info Day action: {action}"
+            delay = spec.duration_sec * self.config.action_time_scale
+            if delay:
+                time.sleep(delay)
+            self.voice_answer.speak_message(_ACTION_COMPLETE)
+            return f"Completed Info Day action: {action}"
+        finally:
+            with self._motion_lock:
+                self._explicit_action_in_progress = False
 
 
 def _resolve_action_request(request: str) -> _ResolvedAction:

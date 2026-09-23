@@ -140,7 +140,20 @@ def test_router_directly_calls_voice_answer_once(router_factory) -> None:  # typ
     router._run_answers()
 
     router.voice_answer.answer_infoday_question.assert_called_once_with("EEE 有咩課程？")
+    router.action.start_attention_action.assert_called_once_with()
     router.human_input.publish.assert_not_called()
+
+
+def test_router_queues_answer_before_dispatching_attention_action(router_factory) -> None:  # type: ignore[no-untyped-def]
+    router = router_factory()
+    queue_sizes_at_dispatch: list[int] = []
+    router.action.start_attention_action.side_effect = lambda: queue_sizes_at_dispatch.append(
+        router._answer_queue.qsize()
+    )
+
+    router._on_input("EEE 有咩課程？")
+
+    assert queue_sizes_at_dispatch == [1]
 
 
 def test_router_sends_question_without_asr_prompt_to_voice_answer(
@@ -191,6 +204,7 @@ def test_router_directly_runs_action_through_worker(router_factory) -> None:  # 
     router._run_answers()
 
     router.action.perform_robot_action.assert_called_once_with("立即停低")
+    router.action.start_attention_action.assert_not_called()
     router.human_input.publish.assert_not_called()
     router.voice_answer.answer_infoday_question.assert_not_called()
 

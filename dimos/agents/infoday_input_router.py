@@ -157,6 +157,12 @@ class InfodayInputRouter(Module):
         except queue.Full:
             logger.warning("InfoDay answer queue full; forwarding input to agent")
             self.human_input.publish(cleaned)
+            return
+        try:
+            result = self.action.start_attention_action()
+            logger.info("InfoDay attention action dispatched", result=result)
+        except Exception:
+            logger.exception("InfoDay attention action dispatch failed")
 
     def _on_agent_error(self, error: str) -> None:
         logger.error("InfoDay agent processing failed", error=error)

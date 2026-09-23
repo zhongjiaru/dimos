@@ -46,6 +46,47 @@ def test_infoday_action_speaks_and_runs_safe_stationary_command(action_skill) ->
     ]
 
 
+def test_attention_action_starts_silently_and_rotates_safe_actions(
+    action_skill,
+    mocker,
+) -> None:  # type: ignore[no-untyped-def]
+    mocker.patch(
+        "dimos.agents.skills.infoday_action.monotonic",
+        side_effect=[100.0, 104.0, 109.0],
+    )
+
+    first_result = action_skill.start_attention_action()
+    second_result = action_skill.start_attention_action()
+    third_result = action_skill.start_attention_action()
+
+    assert first_result == "Started Info Day attention action: wave"
+    assert second_result == "Started Info Day attention action: stretch"
+    assert third_result == "Started Info Day attention action: finger_heart"
+    assert [call.args[0] for call in action_skill.go2.sport_command.call_args_list] == [
+        SPORT_CMD["Hello"],
+        SPORT_CMD["Stretch"],
+        SPORT_CMD["FingerHeart"],
+    ]
+    action_skill.voice_answer.speak_message.assert_not_called()
+
+
+def test_attention_action_does_not_overlap_an_action_already_in_progress(
+    action_skill,
+    mocker,
+) -> None:  # type: ignore[no-untyped-def]
+    mocker.patch(
+        "dimos.agents.skills.infoday_action.monotonic",
+        side_effect=[100.0, 101.0],
+    )
+
+    first_result = action_skill.start_attention_action()
+    second_result = action_skill.start_attention_action()
+
+    assert first_result == "Started Info Day attention action: wave"
+    assert second_result == ("Skipped Info Day attention action: robot action already in progress")
+    action_skill.go2.sport_command.assert_called_once_with(SPORT_CMD["Hello"])
+
+
 def test_infoday_action_reports_rejected_command_out_loud(action_skill) -> None:  # type: ignore[no-untyped-def]
     action_skill.go2.sport_command.return_value = False
 
