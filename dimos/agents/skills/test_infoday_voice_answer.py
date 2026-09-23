@@ -44,6 +44,13 @@ def test_response_prompt_requests_a_short_direct_first_sentence() -> None:
     assert "full English programme or award title" in INFODAY_CANTONESE_RESPONSE_PROMPT
 
 
+def test_response_prompt_speaks_as_the_go2_robot_in_first_person() -> None:
+    assert '"我" refers to the robot' in INFODAY_CANTONESE_RESPONSE_PROMPT
+    assert 'say "叫我跳隻舞" instead of "叫我隻機械狗跳隻舞"' in (
+        INFODAY_CANTONESE_RESPONSE_PROMPT
+    )
+
+
 def test_text_chunker_splits_on_comma_after_minimum() -> None:
     """Text chunking waits for a complete sentence instead of emitting a short tail."""
     chunker = _TextChunker(min_chars=8, max_chars=40)
