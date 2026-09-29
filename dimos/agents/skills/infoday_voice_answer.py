@@ -788,6 +788,12 @@ _PROGRAMME_CODE_RE = re.compile(
     r"(?<![A-Za-z0-9])(?=[A-Z0-9-]*[A-Z])(?=[A-Z0-9-]*\d)"
     r"[A-Z0-9]+(?:-[A-Z0-9]+)*(?![A-Za-z0-9])"
 )
+_HKD_AMOUNT_RE = re.compile(
+    r"(?:HK\s*\$|HKD)\s*([0-9][0-9,]*(?:\.[0-9]+)?)",
+    flags=re.IGNORECASE,
+)
+_SPOKEN_NUMBER_DIGITS = "零一二三四五六七八九"
+_SPOKEN_SMALL_UNITS = ("", "十", "百", "千")
 _SPOKEN_ENGLISH_NAMES: tuple[tuple[re.Pattern[str], str], ...] = (
     (
         re.compile(
@@ -830,12 +836,61 @@ def _text_for_speech(text: str) -> str:
     speech_text = text
     for pattern, replacement in _SPOKEN_ENGLISH_NAMES:
         speech_text = pattern.sub(replacement, speech_text)
+    speech_text = _HKD_AMOUNT_RE.sub(_spoken_hkd_amount, speech_text)
 
     def expand_code(match: re.Match[str]) -> str:
         characters = [character.translate(_SPOKEN_DIGITS) for character in match.group(0)]
         return " ".join(characters)
 
     return _PROGRAMME_CODE_RE.sub(expand_code, speech_text)
+
+
+def _spoken_hkd_amount(match: re.Match[str]) -> str:
+    whole_text, separator, fraction = match.group(1).replace(",", "").partition(".")
+    spoken = f"港幣{_spoken_chinese_integer(int(whole_text))}"
+    if separator and any(digit != "0" for digit in fraction):
+        spoken_fraction = "".join(_SPOKEN_NUMBER_DIGITS[int(digit)] for digit in fraction)
+        spoken = f"{spoken}點{spoken_fraction}"
+    return spoken
+
+
+def _spoken_chinese_integer(number: int) -> str:
+    if number == 0:
+        return _SPOKEN_NUMBER_DIGITS[0]
+    if number >= 100_000_000:
+        high, remainder = divmod(number, 100_000_000)
+        result = f"{_spoken_chinese_integer(high)}億"
+        if remainder:
+            separator = "零" if remainder < 10_000_000 else ""
+            result += f"{separator}{_spoken_chinese_integer(remainder)}"
+        return result
+    if number >= 10_000:
+        high, remainder = divmod(number, 10_000)
+        result = f"{_spoken_chinese_integer(high)}萬"
+        if remainder:
+            separator = "零" if remainder < 1_000 else ""
+            result += f"{separator}{_spoken_four_digit_integer(remainder)}"
+        return result
+    return _spoken_four_digit_integer(number)
+
+
+def _spoken_four_digit_integer(number: int) -> str:
+    parts: list[str] = []
+    pending_zero = False
+    for position in range(3, -1, -1):
+        place = 10**position
+        digit = number // place % 10
+        if digit == 0:
+            if parts and number % place:
+                pending_zero = True
+            continue
+        if pending_zero:
+            parts.append("零")
+            pending_zero = False
+        if not (digit == 1 and position == 1 and not parts):
+            parts.append(_SPOKEN_NUMBER_DIGITS[digit])
+        parts.append(_SPOKEN_SMALL_UNITS[position])
+    return "".join(parts)
 
 
 def _prepare_programme_turn(

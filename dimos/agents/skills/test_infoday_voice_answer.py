@@ -247,6 +247,27 @@ def test_tts_expands_programme_code_digits_without_changing_other_numbers() -> N
     )
 
 
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        (
+            "JS3170畢業生平均起薪點係每月HK$25,620。",
+            "J S 三 一 七 零畢業生平均起薪點係每月港幣二萬五千六百二十。",
+        ),
+        (
+            "JS3180 就係 HK$21,711。",
+            "J S 三 一 八 零 就係 港幣二萬一千七百一十一。",
+        ),
+        ("獎學金係 HKD 10,000。", "獎學金係 港幣一萬。"),
+    ],
+)
+def test_tts_speaks_hkd_amounts_as_complete_cantonese_numbers(
+    text: str,
+    expected: str,
+) -> None:
+    assert _text_for_speech(text) == expected
+
+
 def test_tts_speaks_long_official_english_names_in_concise_traditional_chinese() -> None:
     text = (
         "JS3180 呢個 BEng(Hons)/BSc(Hons) Scheme in Information and Artificial "
