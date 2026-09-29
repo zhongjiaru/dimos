@@ -68,6 +68,8 @@ Do not use Mainland Mandarin written style. Avoid phrases like 因此、此外�
 Use concise spoken Cantonese phrases like 呢個、可以、如果你想知、我哋、會、係.
 Keep official English names unchanged when needed, for example PolyU, EEE, BEng(Hons), BSc(Hons).
 Write programme and subject codes in their official compact form, for example JS3180 or CLC1104C.
+Do not use slash punctuation in spoken answers. Write natural Cantonese connectors such as 同,
+或者, or 至 instead.
 Optimize for low speech latency: start with a short, direct Cantonese answer and keep the first sentence to at most 45 characters whenever possible.
 Do not repeat or spell out a full English programme or award title unless the user explicitly asks for its official English name; normally use the programme code and a concise Traditional Chinese name instead.
 Base the answer only on the provided reference information.
@@ -802,6 +804,8 @@ _HKD_AMOUNT_RE = re.compile(
 )
 _SPOKEN_NUMBER_DIGITS = "零一二三四五六七八九"
 _SPOKEN_SMALL_UNITS = ("", "十", "百", "千")
+_NUMERIC_SLASH_RE = re.compile(r"(?<=\d)\s*[/／]\s*(?=\d)")
+_SLASH_SEPARATOR_RE = re.compile(r"\s*[/／]\s*")
 _SPOKEN_ENGLISH_NAMES: tuple[tuple[re.Pattern[str], str], ...] = (
     (
         re.compile(
@@ -845,6 +849,8 @@ def _text_for_speech(text: str) -> str:
     for pattern, replacement in _SPOKEN_ENGLISH_NAMES:
         speech_text = pattern.sub(replacement, speech_text)
     speech_text = _HKD_AMOUNT_RE.sub(_spoken_hkd_amount, speech_text)
+    speech_text = _NUMERIC_SLASH_RE.sub("至", speech_text)
+    speech_text = _SLASH_SEPARATOR_RE.sub("同", speech_text)
 
     def expand_code(match: re.Match[str]) -> str:
         characters = [character.translate(_SPOKEN_DIGITS) for character in match.group(0)]

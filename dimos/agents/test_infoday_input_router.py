@@ -28,9 +28,10 @@ from dimos.agents.infoday_input_router import (
 
 ASR_INITIAL_PROMPT = (
     "香港理工大學，理大，PolyU，電機及電子工程學系，EEE，開放日，"
-    "本科，課程，入學，申請，JUPAS，BEng，BSc，IAIE，"
-    "Electrical Engineering，Information and Artificial Intelligence Engineering，"
-    "Electronic Systems and Internet-of-Things，Information Security。"
+    "JS3170，JS3180，JUPAS，HKDSE，M1，M2，ICT，HKIE，"
+    "電機工程，交通系統工程，資訊及人工智能工程，電子系統及物聯網，"
+    "人工智能及資訊工程，資訊安全，課程，主修，入學要求，收生分數，"
+    "學費，獎學金，實習，海外交流，就業，起薪，專業認可。"
 )
 
 

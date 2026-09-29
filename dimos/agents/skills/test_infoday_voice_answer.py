@@ -354,6 +354,25 @@ def test_tts_speaks_long_official_english_names_in_concise_traditional_chinese()
     )
 
 
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        (
+            "JS3170/JS3180 都有唔同主修。",
+            "J S 三 一 七 零同J S 三 一 八 零 都有唔同主修。",
+        ),
+        ("M1 / M2 都會計分。", "M 一同M 二 都會計分。"),
+        ("可以了解本地／海外交流。", "可以了解本地同海外交流。"),
+        ("2025/26 學年", "2025至26 學年"),
+    ],
+)
+def test_tts_replaces_slashes_with_spoken_cantonese_connectors(
+    text: str,
+    expected: str,
+) -> None:
+    assert _text_for_speech(text) == expected
+
+
 def test_text_chunker_avoids_a_tiny_final_fragment() -> None:
     chunker = _TextChunker(min_chars=8, max_chars=12)
 

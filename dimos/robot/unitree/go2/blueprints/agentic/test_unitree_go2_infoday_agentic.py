@@ -17,11 +17,37 @@ from dimos.agents.mcp.mcp_server import McpServer
 from dimos.agents.skills.infoday_voice_answer import InfodayVoiceAnswerSkill
 from dimos.robot.unitree.go2.blueprints.agentic.unitree_go2_infoday_agentic import (
     INFODAY_AGENT_TOOLS,
+    INFODAY_STT_INITIAL_PROMPT,
     INFODAY_SYSTEM_PROMPT,
     unitree_go2_infoday_agentic,
 )
 from dimos.robot.unitree.go2.connection import GO2Connection
 from dimos.teleop.hosted.go2_audio_bridge import Go2AudioBridgeModule
+
+
+def test_infoday_stt_prompt_prioritizes_programme_codes_and_common_questions() -> None:
+    expected_terms = {
+        "JS3170",
+        "JS3180",
+        "JUPAS",
+        "HKDSE",
+        "HKIE",
+        "交通系統工程",
+        "資訊及人工智能工程",
+        "電子系統及物聯網",
+        "資訊安全",
+        "學費",
+        "獎學金",
+        "收生分數",
+        "實習",
+        "海外交流",
+        "就業",
+        "起薪",
+        "專業認可",
+    }
+
+    assert all(term in INFODAY_STT_INITIAL_PROMPT for term in expected_terms)
+    assert "Information and Artificial Intelligence Engineering" not in (INFODAY_STT_INITIAL_PROMPT)
 
 
 def test_infoday_blueprint_uses_minimal_sensor_free_go2_connection() -> None:
