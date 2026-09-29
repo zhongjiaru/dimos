@@ -17,6 +17,7 @@ from __future__ import annotations
 
 # ruff: noqa: RUF001
 import argparse
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from hashlib import sha256
@@ -34,7 +35,9 @@ import requests
 
 DEFAULT_KNOWLEDGE_DIR = Path("/home/jiaru/infoday/knowledge")
 POLYU_HOST_SUFFIX = "polyu.edu.hk"
-FAQ_QUESTION_RE = re.compile(r"^Q\d+\s*[:：]", re.IGNORECASE)
+FAQ_QUESTION_RE = re.compile(r"^Q\d+\s*[:：]?", re.IGNORECASE)
+FAQ_PROGRAMME_RE = re.compile(r"(?<![A-Z0-9])(JS\d{4})(?![A-Z0-9])", re.IGNORECASE)
+SOURCE_DATE_RE = re.compile(r"(?<!\d)(20\d{6})(?!\d)")
 
 POLYU_URLS = [
     "https://www.polyu.edu.hk/",
@@ -176,12 +179,35 @@ def _document_title(text: str, fallback: str) -> str:
     return faq_title or (lines[0] if lines else fallback)
 
 
+def _select_docx_sources(paths: Iterable[Path]) -> list[Path]:
+    """Select one dated FAQ source per programme, while retaining other documents."""
+    documents: list[Path] = []
+    faq_versions: dict[str, list[Path]] = {}
+
+    for path in sorted(paths):
+        programme_match = FAQ_PROGRAMME_RE.search(path.name)
+        if "faq" not in path.name.casefold() or programme_match is None:
+            documents.append(path)
+            continue
+        programme = programme_match.group(1).upper()
+        faq_versions.setdefault(programme, []).append(path)
+
+    for versions in faq_versions.values():
+        documents.append(max(versions, key=_docx_version_key))
+    return sorted(documents)
+
+
+def _docx_version_key(path: Path) -> tuple[int, str]:
+    dates = [int(value) for value in SOURCE_DATE_RE.findall(path.stem)]
+    return (max(dates, default=0), path.name.casefold())
+
+
 def _copy_docx_sources(knowledge_dir: Path) -> list[Document]:
     raw_docx_dir = knowledge_dir / "raw" / "docx"
     raw_docx_dir.mkdir(parents=True, exist_ok=True)
     documents: list[Document] = []
 
-    for src in sorted(knowledge_dir.glob("*.docx")):
+    for src in _select_docx_sources(knowledge_dir.glob("*.docx")):
         dst = raw_docx_dir / src.name
         if src.resolve() != dst.resolve():
             shutil.copy2(src, dst)
@@ -212,7 +238,12 @@ def _fetch_polyu_pages(knowledge_dir: Path, urls: list[str]) -> list[Document]:
             response = session.get(url, timeout=30)
             response.raise_for_status()
         except requests.RequestException as exc:
-            print(f"WARN: failed to fetch {url}: {exc}")
+            cached = _load_cached_polyu_page(knowledge_dir, url)
+            if cached is not None:
+                print(f"WARN: failed to fetch {url}; using cached page: {exc}")
+                documents.append(cached)
+            else:
+                print(f"WARN: failed to fetch {url}: {exc}")
             continue
 
         parser = _MarkdownHTMLParser()
@@ -236,6 +267,36 @@ def _fetch_polyu_pages(knowledge_dir: Path, urls: list[str]) -> list[Document]:
             )
         )
     return documents
+
+
+def _load_cached_polyu_page(knowledge_dir: Path, url: str) -> Document | None:
+    cache_path = knowledge_dir / "raw" / "web_polyu" / f"{_safe_name(url)}.md"
+    if not cache_path.exists():
+        return None
+
+    lines = cache_path.read_text(encoding="utf-8").splitlines()
+    if len(lines) < 5 or not lines[0].startswith("# "):
+        return None
+    title = lines[0].removeprefix("# ").strip()
+    fetched_at = next(
+        (
+            line.removeprefix("Fetched: ").strip()
+            for line in lines[1:4]
+            if line.startswith("Fetched: ")
+        ),
+        None,
+    )
+    markdown = "\n".join(lines[4:]).strip()
+    if not markdown:
+        return None
+    return Document(
+        source_id=f"web:{url}",
+        source_type="web",
+        source=url,
+        title=title,
+        text=markdown,
+        fetched_at=fetched_at,
+    )
 
 
 def _split_paragraphs(text: str) -> list[str]:
@@ -308,8 +369,14 @@ def _chunk_document(document: Document, max_chars: int = 1800) -> list[dict[str,
 
 def _summary_zh(title: str, text: str) -> str:
     lower = f"{title}\n{text}".lower()
-    if "faq" in lower or "js3180" in lower:
+    if "js3170" in lower:
+        return "呢段資料來自 JS3170 電機工程學課程常見問題，可用嚟回答課程、入學、就業、專業認可、實習、交流或主修分流問題。"
+    if "js3180" in lower:
         return "呢段資料來自 JS3180 資訊及人工智能工程課程常見問題，可用嚟回答課程、入學、就業、專業認可、實習或交流問題。"
+    if "faq" in lower:
+        return (
+            "呢段資料來自 EEE 課程常見問題，可用嚟回答課程、入學、就業、專業認可、實習或交流問題。"
+        )
     if "contact us" in lower:
         return "呢段資料提供 EEE 學系辦公室地址、電話、電郵同官方網站等聯絡方式。"
     if "vision" in lower and "mission" in lower:
@@ -331,6 +398,7 @@ def _tags_for(title: str, text: str) -> list[str]:
     lower = f"{title}\n{text}".lower()
     tags: list[str] = []
     candidates = [
+        ("JS3170", ["js3170"]),
         ("JS3180", ["js3180"]),
         ("FAQ", ["faq", "常見問題", "常见问题"]),
         ("PolyU", ["polyu", "hong kong polytechnic university"]),
@@ -503,6 +571,14 @@ def _qa_seed() -> list[dict[str, str]]:
         "EEE 嘅願景係咩？",
         "EEE 嘅使命係咩？",
         "理大本科招生頁面喺邊度？",
+        "JS3170 主要學啲咩？",
+        "冇讀 M1、M2 或物理可以申請 JS3170 嗎？",
+        "JS3170 有邊啲主修方向，點樣分流？",
+        "JS3170 嘅收生要求同參考分數係幾多？",
+        "JS3170 畢業後有邊啲就業出路？",
+        "JS3170 有冇獲得 HKIE 專業認可？",
+        "JS3170 有冇實習同海外交流機會？",
+        "JS3170 畢業生嘅起薪同就業率係點？",
         "JS3180 主要學啲咩？",
         "冇讀 M1、M2 或 ICT 可以申請 JS3180 嗎？",
         "JS3180 有邊啲主修方向？",
