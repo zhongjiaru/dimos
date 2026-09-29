@@ -17,7 +17,12 @@ import json
 import pytest
 
 # ruff: noqa: RUF001
-from dimos.agents.skills.polyu_knowledge import PolyUKnowledgeSkill
+from dimos.agents.skills.polyu_knowledge import (
+    PROGRAMME_CLARIFICATION_ZH,
+    PolyUKnowledgeSkill,
+    identify_programme,
+    programme_question_needs_clarification,
+)
 
 
 def test_polyu_knowledge_returns_structured_facts(tmp_path) -> None:  # type: ignore[no-untyped-def]
@@ -228,3 +233,137 @@ def test_polyu_knowledge_reports_missing_files(tmp_path) -> None:  # type: ignor
         skill.stop()
 
     assert "未搵到離線知識庫檔案" in result
+
+
+@pytest.mark.parametrize(
+    ("question", "expected"),
+    [
+        ("JS3170 收生分數係幾多？", "JS3170"),
+        ("三一八零有咩主修？", "JS3180"),
+        ("電機工程點樣分流？", "JS3170"),
+        ("冇讀 ICT 可唔可以申請？", "JS3180"),
+        ("EEE 有咩人工智能研究？", None),
+    ],
+)
+def test_identify_programme_uses_codes_and_specific_study_cues(
+    question: str,
+    expected: str | None,
+) -> None:
+    assert identify_programme(question) == expected
+
+
+@pytest.mark.parametrize(
+    ("question", "expected"),
+    [
+        ("收生分數係幾多？", True),
+        ("呢個課程有咩主修？", True),
+        ("JS3170 收生分數係幾多？", False),
+        ("EEE 有咩課程？", False),
+        ("分別介紹兩個課程", False),
+        ("HKDSE 高分科有冇額外加分？", True),
+        ("應用學習科計唔計分？", True),
+        ("公民科會唔會計入最佳五科？", True),
+    ],
+)
+def test_programme_question_clarification_only_for_ambiguous_details(
+    question: str,
+    expected: bool,
+) -> None:
+    assert programme_question_needs_clarification(question) is expected
+
+
+def test_polyu_knowledge_filters_the_other_programme_for_explicit_code(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    processed = tmp_path / "processed"
+    processed.mkdir()
+    (processed / "facts.zh.json").write_text("{}", encoding="utf-8")
+    chunks = [
+        {
+            "id": "js3170-score",
+            "source": "JS3170 FAQ.docx",
+            "title": "JS3170 FAQ",
+            "original_text": "JS3170 收生參考分數係 25.9。",
+            "tags": ["JS3170", "收生"],
+        },
+        {
+            "id": "js3180-score",
+            "source": "JS3180 FAQ.docx",
+            "title": "JS3180 FAQ",
+            "original_text": "JS3180 收生參考分數係 24.2。",
+            "tags": ["JS3170", "JS3180", "收生"],
+        },
+    ]
+    (processed / "chunks.zh.jsonl").write_text(
+        "\n".join(json.dumps(chunk, ensure_ascii=False) for chunk in chunks) + "\n",
+        encoding="utf-8",
+    )
+    skill = PolyUKnowledgeSkill(knowledge_dir=tmp_path)
+
+    try:
+        skill.start()
+        result = skill.search_polyu_knowledge("JS3170 收生分數係幾多？")
+    finally:
+        skill.stop()
+
+    assert "25.9" in result
+    assert "24.2" not in result
+
+
+def test_polyu_knowledge_requests_clarification_before_mixing_programmes(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    processed = tmp_path / "processed"
+    processed.mkdir()
+    (processed / "facts.zh.json").write_text("{}", encoding="utf-8")
+    (processed / "chunks.zh.jsonl").write_text("", encoding="utf-8")
+    skill = PolyUKnowledgeSkill(knowledge_dir=tmp_path)
+
+    try:
+        skill.start()
+        result = skill.search_polyu_knowledge("收生分數係幾多？")
+    finally:
+        skill.stop()
+
+    assert result == PROGRAMME_CLARIFICATION_ZH
+
+
+def test_polyu_knowledge_prioritizes_faq_question_over_generic_overlap(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    processed = tmp_path / "processed"
+    processed.mkdir()
+    (processed / "facts.zh.json").write_text("{}", encoding="utf-8")
+    chunks = [
+        {
+            "id": "js3170-m1",
+            "source": "JS3170 FAQ.docx",
+            "title": "JS3170 FAQ",
+            "programme": "JS3170",
+            "original_text": "Q2：我中學冇讀 M1 或 M2，入唔入到？\n答：可以申請。",
+            "tags": ["JS3170"],
+        },
+        {
+            "id": "js3170-physics",
+            "source": "JS3170 FAQ.docx",
+            "title": "JS3170 FAQ",
+            "programme": "JS3170",
+            "original_text": "Q3：我中學冇讀過物理，報唔報得？\n答：可以申請。",
+            "tags": ["JS3170"],
+        },
+        {
+            "id": "generic-page",
+            "source": "programme.html",
+            "title": "JS3170 電機工程課程",
+            "original_text": "JS3170 電機工程課程可以申請入學。" * 4,
+            "tags": ["JS3170", "課程"],
+        },
+    ]
+    (processed / "chunks.zh.jsonl").write_text(
+        "\n".join(json.dumps(chunk, ensure_ascii=False) for chunk in chunks) + "\n",
+        encoding="utf-8",
+    )
+    skill = PolyUKnowledgeSkill(knowledge_dir=tmp_path, max_chunks=1)
+
+    try:
+        skill.start()
+        result = skill.search_polyu_knowledge("JS3170 無讀物理能否申請？")
+    finally:
+        skill.stop()
+
+    assert "Q3：我中學冇讀過物理" in result
+    assert "Q2：我中學冇讀 M1 或 M2" not in result

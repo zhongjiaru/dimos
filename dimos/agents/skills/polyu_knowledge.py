@@ -19,7 +19,7 @@ from collections.abc import Iterable
 import json
 from pathlib import Path
 import re
-from typing import Any
+from typing import Any, Literal
 import unicodedata
 
 from pydantic import Field
@@ -30,6 +30,12 @@ from dimos.core.module import Module, ModuleConfig
 from dimos.utils.logging_config import setup_logger
 
 logger = setup_logger()
+
+ProgrammeCode = Literal["JS3170", "JS3180"]
+
+PROGRAMME_CLARIFICATION_ZH = (
+    "呢條問題要先確認課程：JS3170 電機工程，定係 JS3180 資訊及人工智能工程。"
+)
 
 
 class PolyUKnowledgeConfig(ModuleConfig):
@@ -90,6 +96,8 @@ class PolyUKnowledgeSkill(Module):
         query = question.strip()
         if not query:
             return "問題為空，無法檢索 PolyU/EEE 官方資料。"
+        if programme_question_needs_clarification(query):
+            return PROGRAMME_CLARIFICATION_ZH
         if not self._facts and not self._chunks:
             return (
                 "未搵到離線知識庫檔案。請先運行 "
@@ -189,20 +197,33 @@ class PolyUKnowledgeSkill(Module):
         tokens = _query_tokens(query)
         if not tokens:
             return []
+        programme = identify_programme(query)
+        ranking_tokens = _ranking_tokens(tokens, programme)
+        if ranking_tokens:
+            tokens = ranking_tokens
         scored: list[tuple[float, dict[str, Any]]] = []
         for chunk in self._chunks:
+            chunk_programmes = _chunk_programmes(chunk)
+            if programme is not None and chunk_programmes and programme not in chunk_programmes:
+                continue
             haystack = _normalize(
                 "\n".join(
                     [
                         str(chunk.get("title", "")),
                         str(chunk.get("audience_summary_zh", "")),
                         str(chunk.get("search_text", "")),
+                        " ".join(
+                            str(question) for question in chunk.get("retrieval_questions", [])
+                        ),
                         " ".join(str(tag) for tag in chunk.get("tags", [])),
                         str(chunk.get("original_text", "")),
                     ]
                 )
             )
             score = _score(tokens, haystack)
+            faq_question = _faq_question_line(str(chunk.get("original_text", "")))
+            if faq_question:
+                score += 2.0 * _score(tokens, _normalize(faq_question))
             if score > 0:
                 scored.append((score, chunk))
         scored.sort(key=lambda item: item[0], reverse=True)
@@ -227,6 +248,123 @@ def _normalize(text: str) -> str:
     normalized = re.sub(r"(?<![a-z0-9])三\s*一\s*七\s*零(?![a-z0-9])", "js3170", normalized)
     normalized = _to_hk_traditional(normalized)
     return re.sub(r"\s+", " ", normalized).strip()
+
+
+def identify_programme(question: str) -> ProgrammeCode | None:
+    """Identify one programme from its code, official name, or a specific study cue."""
+    normalized = _normalize(question)
+    code_hits = _programme_codes_in_text(normalized)
+    if len(code_hits) == 1:
+        return next(iter(code_hits))
+    if len(code_hits) > 1:
+        return None
+
+    js3170_strong = ("電機工程", "交通運輸工程", "電力能源")
+    js3180_strong = (
+        "資訊及人工智能工程",
+        "人工智能及資訊工程",
+        "電子系統及物聯網",
+        "資訊安全",
+    )
+    strong_hits: set[ProgrammeCode] = set()
+    if _has_any(normalized, js3170_strong):
+        strong_hits.add("JS3170")
+    if _has_any(normalized, js3180_strong):
+        strong_hits.add("JS3180")
+    if len(strong_hits) == 1:
+        return next(iter(strong_hits))
+
+    if not _has_any(normalized, _PROGRAMME_DETAIL_TERMS):
+        return None
+    weak_hits: set[ProgrammeCode] = set()
+    if _has_any(normalized, ("物理",)):
+        weak_hits.add("JS3170")
+    if _has_any(normalized, ("ict", "物聯網", "資訊安全")):
+        weak_hits.add("JS3180")
+    if len(weak_hits) == 1:
+        return next(iter(weak_hits))
+    return None
+
+
+def programme_question_needs_clarification(question: str) -> bool:
+    """Return whether a programme-specific question lacks enough scope to answer safely."""
+    normalized = _normalize(question)
+    if identify_programme(normalized) is not None or asks_for_both_programmes(normalized):
+        return False
+    if _has_any(normalized, _PROGRAMME_OVERVIEW_TERMS):
+        return False
+    return has_programme_detail(normalized)
+
+
+def has_programme_detail(question: str) -> bool:
+    """Return whether a question asks for programme-specific facts."""
+    return _has_any(_normalize(question), _PROGRAMME_DETAIL_TERMS)
+
+
+def asks_for_both_programmes(question: str) -> bool:
+    normalized = _normalize(question)
+    return _has_any(
+        normalized,
+        (
+            "兩個課程",
+            "两个課程",
+            "兩個都",
+            "两个都",
+            "兩者",
+            "两者",
+            "分別介紹",
+            "分别介绍",
+            "比較兩個",
+            "比较两个",
+            "both programmes",
+            "compare the programmes",
+        ),
+    )
+
+
+def _programme_codes_in_text(text: str) -> set[ProgrammeCode]:
+    normalized = _normalize(text)
+    codes: set[ProgrammeCode] = set()
+    if re.search(r"(?<![a-z0-9])(?:js)?3170(?![a-z0-9])", normalized):
+        codes.add("JS3170")
+    if re.search(r"(?<![a-z0-9])(?:js)?3180(?![a-z0-9])", normalized):
+        codes.add("JS3180")
+    return codes
+
+
+def _chunk_programmes(chunk: dict[str, Any]) -> set[ProgrammeCode]:
+    if "programme" in chunk:
+        programme = chunk["programme"]
+        if programme in ("JS3170", "JS3180"):
+            return {programme}
+        return set()
+
+    source_programmes = _programme_codes_in_text(str(chunk.get("source", "")))
+    if source_programmes:
+        return source_programmes
+
+    metadata = "\n".join(
+        [
+            str(chunk.get("title", "")),
+            str(chunk.get("search_text", "")),
+            " ".join(str(tag) for tag in chunk.get("tags", [])),
+        ]
+    )
+    return _programme_codes_in_text(metadata)
+
+
+def _ranking_tokens(tokens: list[str], programme: ProgrammeCode | None) -> list[str]:
+    stopwords = set(_CONVERSATIONAL_RANKING_STOPWORDS)
+    if programme is not None:
+        stopwords.update(_PROGRAMME_RANKING_STOPWORDS[programme])
+    return [token for token in tokens if token not in stopwords]
+
+
+def _faq_question_line(text: str) -> str | None:
+    return next(
+        (line for line in text.splitlines() if re.match(r"^Q\d+", line, re.IGNORECASE)),
+        None,
+    )
 
 
 def _to_hk_traditional(text: str) -> str:
@@ -291,12 +429,18 @@ _ALIASES = {
     "就业": ["就業", "出路", "僱主"],
     "工作": ["做咩工", "出路", "就業", "僱主"],
     "实习": ["實習", "校外實習", "交流"],
+    "internship": ["實習", "校外實習", "work-integrated education"],
+    "交換生": ["交流", "海外交流", "student exchange"],
     "交流": ["交流", "海外", "歐美", "亞洲"],
     "认证": ["認可", "hkie", "scheme"],
     "认可": ["認可", "hkie", "scheme"],
     "工程师": ["工程師", "hkie", "scheme"],
     "区别": ["分別", "軟硬件", "電子計算"],
     "分别": ["分別", "軟硬件", "電子計算"],
+    "不同": ["分別", "軟硬件", "電子計算"],
+    "comp": ["電子計算", "軟硬件", "純軟件", "演算法"],
+    "內容": ["主要學", "主要讀", "讀啲咩", "學啲咩", "課程特色", "programme aims"],
+    "能否": ["可以", "可唔可以", "報唔報得", "申請"],
     "电子计算": [
         "電子計算",
         "軟硬件",
@@ -315,6 +459,71 @@ _ALIASES = {
     "收分": ["分數", "收生", "最佳五科", "加權", "jupas"],
     "js3180": ["js3180", "3180", "資訊", "人工智能", "工程"],
     "js3170": ["js3170", "3170", "電機", "工程"],
+}
+
+_PROGRAMME_DETAIL_TERMS = (
+    "呢個課程",
+    "這個課程",
+    "这个课程",
+    "主要讀",
+    "讀咩",
+    "學啲咩",
+    "收生",
+    "分數",
+    "入學要求",
+    "申請",
+    "報唔報得",
+    "m1",
+    "m2",
+    "主修",
+    "major",
+    "分流",
+    "畢業",
+    "就業",
+    "出路",
+    "起薪",
+    "hkie",
+    "認可",
+    "工程師牌",
+    "實習",
+    "交流",
+    "this programme",
+    "this program",
+    "admission score",
+    "entry requirement",
+    "career",
+    "hkdse",
+    "高分科",
+    "加分",
+    "應用學習",
+    "第三類",
+    "公民科",
+    "最佳五科",
+)
+
+_PROGRAMME_OVERVIEW_TERMS = (
+    "有咩課程",
+    "有邊啲課程",
+    "有哪些課程",
+    "課程介紹",
+    "介紹課程",
+    "what programmes",
+    "which programmes",
+    "programme overview",
+)
+
+_CONVERSATIONAL_RANKING_STOPWORDS = {
+    "入唔",
+    "唔入",
+    "入到",
+    "可以",
+    "可唔",
+    "唔可",
+}
+
+_PROGRAMME_RANKING_STOPWORDS: dict[ProgrammeCode, set[str]] = {
+    "JS3170": {"js3170", "3170", "電機", "工程"},
+    "JS3180": {"js3180", "3180", "資訊", "人工智能", "工程"},
 }
 
 _SIMPLIFIED_TO_HK_TRADITIONAL = tuple(
@@ -354,6 +563,9 @@ _SIMPLIFIED_TO_HK_TRADITIONAL = tuple(
             "分数": "分數",
             "几多": "幾多",
             "噶": "㗎",
+            "有無": "有冇",
+            "無讀": "冇讀",
+            "無修": "冇修",
         }.items(),
         key=lambda item: len(item[0]),
         reverse=True,

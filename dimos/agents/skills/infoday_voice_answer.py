@@ -29,7 +29,14 @@ from pydantic import Field
 
 from dimos.agents.annotation import skill
 from dimos.agents.infoday_events import InfodayAudioComplete
-from dimos.agents.skills.polyu_knowledge import PolyUKnowledgeSkill
+from dimos.agents.skills.polyu_knowledge import (
+    PolyUKnowledgeSkill,
+    ProgrammeCode,
+    asks_for_both_programmes,
+    has_programme_detail,
+    identify_programme,
+    programme_question_needs_clarification,
+)
 from dimos.core.core import rpc
 from dimos.core.module import Module, ModuleConfig
 from dimos.core.stream import Out
@@ -62,6 +69,12 @@ Write programme and subject codes in their official compact form, for example JS
 Optimize for low speech latency: start with a short, direct Cantonese answer and keep the first sentence to at most 45 characters whenever possible.
 Do not repeat or spell out a full English programme or award title unless the user explicitly asks for its official English name; normally use the programme code and a concise Traditional Chinese name instead.
 Base the answer only on the provided official offline knowledge context.
+Treat JS3170 and JS3180 as separate programmes. Never combine their admission scores,
+major-allocation rules, career figures, or other programme-specific facts.
+If a specific programme question does not identify which programme it means, ask whether the
+user means JS3170 Electrical Engineering or JS3180 Information and Artificial Intelligence
+Engineering; do not guess. If the user broadly asks which EEE programmes are available or asks
+to compare both, briefly introduce both programmes instead of asking for clarification.
 If the context is insufficient, say briefly in Cantonese that the current official offline materials do not include that detail, then invite the user to choose a safe stationary robot demonstration such as waving or dancing.
 Only offer the action; do not claim that it has happened or trigger it before the user explicitly chooses one.
 Answer in exactly two short spoken sentences, ideally under 80 Chinese characters in total.
@@ -74,6 +87,9 @@ INFODAY_IDENTITY_ANSWER = (
 )
 INFODAY_REPEAT_REQUEST = "唔好意思，我啱啱聽唔清楚，可以麻煩你再講一次嗎？"
 INFODAY_ERROR_RESPONSE = "唔好意思，我而家答唔到呢條問題。你可以再講一次，或者問我 EEE 嘅課程。"
+INFODAY_PROGRAMME_CLARIFICATION = (
+    "你想了解 JS3170 電機工程，定係 JS3180 資訊及人工智能工程？你揀一個，我再答你頭先嗰條問題。"
+)
 _IDENTITY_TERMS = (
     "你是誰",
     "你是谁",
@@ -170,12 +186,14 @@ class InfodayVoiceAnswerSkill(Module):
 
     _audio_lock: threading.Lock
     _client: OpenAI | None
+    _pending_programme_question: str | None
     _tts_node: _TTSNode | None
 
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
         self._audio_lock = threading.Lock()
         self._client = None
+        self._pending_programme_question = None
         self._tts_node = None
 
     @rpc
@@ -229,6 +247,7 @@ class InfodayVoiceAnswerSkill(Module):
         with self._audio_lock:
             fast_answer = _fast_infoday_answer(clean_question)
             if fast_answer is not None:
+                self._pending_programme_question = None
                 try:
                     self._speak_locked(fast_answer)
                 except Exception as exc:
@@ -236,9 +255,26 @@ class InfodayVoiceAnswerSkill(Module):
                     return f"Error answering Info Day question: {exc}"
                 return f"Answered Info Day question in Cantonese: {clean_question}"
 
+            effective_question, pending_question, clarification = _prepare_programme_turn(
+                self._pending_programme_question,
+                clean_question,
+            )
+            self._pending_programme_question = pending_question
+            if clarification is not None:
+                try:
+                    self._speak_locked(clarification)
+                except Exception as exc:
+                    logger.error(
+                        "InfoDay programme clarification TTS failed",
+                        error=str(exc),
+                        text=clarification,
+                    )
+                    return f"Error answering Info Day question: {exc}"
+                return f"Asked user to choose an EEE programme: {clean_question}"
+
             answer_started_at = time.monotonic()
             try:
-                knowledge = self.polyu_knowledge.search_polyu_knowledge(clean_question)
+                knowledge = self.polyu_knowledge.search_polyu_knowledge(effective_question)
             except Exception as exc:
                 logger.exception("InfoDay knowledge lookup failed", question=clean_question)
                 try:
@@ -282,7 +318,7 @@ class InfodayVoiceAnswerSkill(Module):
                 )
                 answer_parts: list[str] = []
                 first_tts_chunk = True
-                for delta in self._stream_response(clean_question, knowledge):
+                for delta in self._stream_response(effective_question, knowledge):
                     answer_parts.append(delta)
                     for text_chunk in chunker.feed(delta):
                         if first_tts_chunk:
@@ -721,6 +757,42 @@ def _text_for_speech(text: str) -> str:
         return " ".join(characters)
 
     return _PROGRAMME_CODE_RE.sub(expand_code, speech_text)
+
+
+def _prepare_programme_turn(
+    pending_question: str | None,
+    question: str,
+) -> tuple[str, str | None, str | None]:
+    """Resolve programme clarification turns before retrieval and response generation."""
+    if programme_question_needs_clarification(question):
+        return question, question, INFODAY_PROGRAMME_CLARIFICATION
+
+    programme = _programme_selection(question)
+    asks_for_both = asks_for_both_programmes(question)
+    if pending_question is not None and not has_programme_detail(question):
+        if programme is not None:
+            effective = f"{pending_question}\n用戶已確認想了解 {programme}。"
+            return effective, None, None
+        if asks_for_both:
+            effective = f"{pending_question}\n用戶要求分別比較 JS3170 同 JS3180。"
+            return effective, None, None
+
+    if asks_for_both:
+        return f"{question}\n請分別比較 JS3170 同 JS3180。", None, None
+    return question, None, None
+
+
+def _programme_selection(question: str) -> ProgrammeCode | None:
+    programme = identify_programme(question)
+    if programme is not None:
+        return programme
+
+    normalized = re.sub(r"[\s\W_]+", "", question.casefold(), flags=re.UNICODE)
+    if any(term in normalized for term in ("第一個", "第一个", "前者", "電機", "电机")):
+        return "JS3170"
+    if any(term in normalized for term in ("第二個", "第二个", "後者", "后者", "人工智能", "ai")):
+        return "JS3180"
+    return None
 
 
 def _fast_infoday_answer(question: str) -> str | None:

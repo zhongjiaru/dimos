@@ -21,9 +21,11 @@ from dimos.agents.skills.infoday_voice_answer import (
     INFODAY_CANTONESE_RESPONSE_PROMPT,
     INFODAY_ERROR_RESPONSE,
     INFODAY_IDENTITY_ANSWER,
+    INFODAY_PROGRAMME_CLARIFICATION,
     INFODAY_REPEAT_REQUEST,
     InfodayVoiceAnswerSkill,
     _fast_infoday_answer,
+    _prepare_programme_turn,
     _text_for_speech,
     _TextChunker,
 )
@@ -46,9 +48,51 @@ def test_response_prompt_requests_a_short_direct_first_sentence() -> None:
 
 def test_response_prompt_speaks_as_the_go2_robot_in_first_person() -> None:
     assert '"我" refers to the robot' in INFODAY_CANTONESE_RESPONSE_PROMPT
-    assert 'say "叫我跳隻舞" instead of "叫我隻機械狗跳隻舞"' in (
-        INFODAY_CANTONESE_RESPONSE_PROMPT
-    )
+    assert 'say "叫我跳隻舞" instead of "叫我隻機械狗跳隻舞"' in (INFODAY_CANTONESE_RESPONSE_PROMPT)
+
+
+def test_response_prompt_keeps_programme_specific_facts_separate() -> None:
+    assert "Treat JS3170 and JS3180 as separate programmes" in (INFODAY_CANTONESE_RESPONSE_PROMPT)
+    assert "Never combine their admission scores" in INFODAY_CANTONESE_RESPONSE_PROMPT
+    assert "briefly introduce both programmes" in INFODAY_CANTONESE_RESPONSE_PROMPT
+
+
+def test_programme_turn_preserves_ambiguous_question_for_the_user_selection() -> None:
+    effective, pending, clarification = _prepare_programme_turn(None, "收生分數係幾多？")
+
+    assert effective == "收生分數係幾多？"
+    assert pending == "收生分數係幾多？"
+    assert clarification == INFODAY_PROGRAMME_CLARIFICATION
+
+    effective, pending, clarification = _prepare_programme_turn(pending, "JS3170")
+
+    assert effective == "收生分數係幾多？\n用戶已確認想了解 JS3170。"
+    assert pending is None
+    assert clarification is None
+
+
+def test_programme_turn_keeps_broad_overview_for_both_programmes() -> None:
+    effective, pending, clarification = _prepare_programme_turn(None, "EEE 有咩課程？")
+
+    assert effective == "EEE 有咩課程？"
+    assert pending is None
+    assert clarification is None
+
+
+def test_infoday_voice_answer_asks_for_programme_before_lookup(mocker) -> None:  # type: ignore[no-untyped-def]
+    skill = InfodayVoiceAnswerSkill()
+    skill._client = mocker.Mock()
+    skill.polyu_knowledge = mocker.Mock()
+    speak = mocker.patch.object(skill, "_speak_locked")
+
+    try:
+        result = skill.answer_infoday_question("收生分數係幾多？")
+    finally:
+        skill.stop()
+
+    assert result == "Asked user to choose an EEE programme: 收生分數係幾多？"
+    speak.assert_called_once_with(INFODAY_PROGRAMME_CLARIFICATION)
+    skill.polyu_knowledge.search_polyu_knowledge.assert_not_called()
 
 
 def test_text_chunker_splits_on_comma_after_minimum() -> None:

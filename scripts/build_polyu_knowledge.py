@@ -36,6 +36,7 @@ import requests
 DEFAULT_KNOWLEDGE_DIR = Path("/home/jiaru/infoday/knowledge")
 POLYU_HOST_SUFFIX = "polyu.edu.hk"
 FAQ_QUESTION_RE = re.compile(r"^Q\d+\s*[:：]?", re.IGNORECASE)
+FAQ_QUESTION_NUMBER_RE = re.compile(r"^Q(\d+)", re.IGNORECASE)
 FAQ_PROGRAMME_RE = re.compile(r"(?<![A-Z0-9])(JS\d{4})(?![A-Z0-9])", re.IGNORECASE)
 SOURCE_DATE_RE = re.compile(r"(?<!\d)(20\d{6})(?!\d)")
 
@@ -88,7 +89,17 @@ class _MarkdownHTMLParser(HTMLParser):
         self.in_title = False
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        if tag in {"script", "style", "noscript", "svg"}:
+        if tag in {
+            "script",
+            "style",
+            "noscript",
+            "svg",
+            "header",
+            "nav",
+            "footer",
+            "aside",
+            "form",
+        }:
             self.skip_depth += 1
             return
         if self.skip_depth:
@@ -107,7 +118,21 @@ class _MarkdownHTMLParser(HTMLParser):
             self.href_stack.append(attrs_dict.get("href"))
 
     def handle_endtag(self, tag: str) -> None:
-        if tag in {"script", "style", "noscript", "svg"} and self.skip_depth:
+        if (
+            tag
+            in {
+                "script",
+                "style",
+                "noscript",
+                "svg",
+                "header",
+                "nav",
+                "footer",
+                "aside",
+                "form",
+            }
+            and self.skip_depth
+        ):
             self.skip_depth -= 1
             return
         if self.skip_depth:
@@ -299,13 +324,33 @@ def _load_cached_polyu_page(knowledge_dir: Path, url: str) -> Document | None:
     )
 
 
-def _split_paragraphs(text: str) -> list[str]:
+def _split_paragraphs(
+    text: str,
+    source_type: str,
+    ignored_web_lines: set[str] | None = None,
+) -> list[str]:
     lines = [_normalize_spaces(line) for line in text.splitlines()]
-    return [line for line in lines if line and not _is_boilerplate(line)]
+    paragraphs: list[str] = []
+    seen_web_lines: set[str] = set()
+    for line in lines:
+        if not line or _is_boilerplate(line):
+            continue
+        if source_type == "web":
+            fingerprint = line.casefold()
+            if ignored_web_lines is not None and fingerprint in ignored_web_lines:
+                continue
+            if fingerprint in seen_web_lines:
+                continue
+            seen_web_lines.add(fingerprint)
+        paragraphs.append(line)
+    return paragraphs
 
 
 def _is_boilerplate(text: str) -> bool:
     lowered = text.lower()
+    link_count = len(re.findall(r"\((?:https?://|/)[^)]+\)", lowered))
+    if len(text) > 200 and link_count >= 8:
+        return True
     boilerplate = [
         "skip to main content",
         "open site search popup",
@@ -318,12 +363,70 @@ def _is_boilerplate(text: str) -> bool:
         "copyright",
         "what are you looking for",
         "quick access",
+        "undergraduate student intranet",
+        "research student intranet",
+        "staff intranet",
+        "accessibility",
+        "sitemap",
+        "internal document search",
+        "site search",
+        "upgrade to a newer version",
+        "facebook (",
+        "youtube (",
+        "instagram (",
+        "intranet",
+        "open / close",
+        "tell us who you are",
+        "learn more",
+        "quick links",
+        "what's new",
+        "open for application",
     ]
     return any(item in lowered for item in boilerplate)
 
 
-def _chunk_document(document: Document, max_chars: int = 1800) -> list[dict[str, Any]]:
-    paragraphs = _split_paragraphs(document.text)
+def _shared_web_navigation(documents: Iterable[Document], minimum_documents: int = 4) -> set[str]:
+    """Find repeated menu links while preserving repeated programme facts."""
+    occurrences: dict[str, int] = {}
+    for document in documents:
+        if document.source_type != "web":
+            continue
+        candidates = {
+            line.casefold()
+            for line in (_normalize_spaces(item) for item in document.text.splitlines())
+            if _looks_like_navigation_line(line)
+        }
+        for line in candidates:
+            occurrences[line] = occurrences.get(line, 0) + 1
+    return {
+        line for line, document_count in occurrences.items() if document_count >= minimum_documents
+    }
+
+
+def _looks_like_navigation_line(text: str) -> bool:
+    if text.startswith("#"):
+        return False
+    if text.startswith("- ") and re.search(r"\((?:https?://|/)[^)]+\)", text):
+        return True
+    return text.casefold() in {
+        "about",
+        "experience and opportunities",
+        "home",
+        "news and events",
+        "people",
+        "research",
+        "study",
+    }
+
+
+def _chunk_document(
+    document: Document,
+    max_chars: int = 1800,
+    ignored_web_lines: set[str] | None = None,
+) -> list[dict[str, Any]]:
+    paragraphs = _split_paragraphs(
+        document.text, document.source_type, ignored_web_lines=ignored_web_lines
+    )
     is_faq = any(FAQ_QUESTION_RE.match(paragraph) for paragraph in paragraphs)
     chunks: list[dict[str, Any]] = []
     current: list[str] = []
@@ -336,20 +439,31 @@ def _chunk_document(document: Document, max_chars: int = 1800) -> list[dict[str,
         if not current:
             return
         text = "\n".join(current).strip()
-        summary = _summary_zh(document.title, text)
-        tags = _tags_for(document.title, text)
-        chunks.append(
-            {
-                "id": f"{_safe_name(document.source_id)}_{chunk_index:04d}",
-                "source_type": document.source_type,
-                "source": document.source,
-                "title": document.title,
-                "audience_summary_zh": summary,
-                "search_text": " ".join([document.title, summary, *tags]),
-                "original_text": text,
-                "tags": tags,
-            }
-        )
+        title = document.title
+        tags = _tags_for(title, text)
+        programme = _chunk_programme(document, text)
+        if is_faq and programme is None and _is_eee_general_faq_chunk(document, text):
+            title = "EEE 學系常見問題（FAQ）"
+            tags = [tag for tag in _tags_for(title, text) if not tag.startswith("JS")]
+        questions = _retrieval_questions(title, text, tags, programme)
+        summary = _summary_zh(title, text)
+        if questions and not is_faq:
+            summary = "呢段官方資料可用嚟回答：" + "；".join(questions[:3])
+        elif is_faq and programme is None and _is_eee_general_faq_chunk(document, text):
+            summary = "呢段資料係 EEE 學系通用常見問題，可用嚟回答學系背景、學生機械人活動或海外服務學習問題。"
+        chunk: dict[str, Any] = {
+            "id": f"{_safe_name(document.source_id)}_{chunk_index:04d}",
+            "source_type": document.source_type,
+            "source": document.source,
+            "title": title,
+            "audience_summary_zh": summary,
+            "search_text": " ".join([title, summary, *tags, *questions]),
+            "original_text": text,
+            "tags": tags,
+            "retrieval_questions": questions,
+            "programme": programme,
+        }
+        chunks.append(chunk)
         chunk_index += 1
         current = []
         current_len = 0
@@ -359,12 +473,173 @@ def _chunk_document(document: Document, max_chars: int = 1800) -> list[dict[str,
             if seen_faq_question:
                 flush()
             seen_faq_question = True
+        elif not is_faq and para.startswith("#") and current:
+            flush()
         if current and current_len + len(para) > max_chars:
             flush()
         current.append(para)
         current_len += len(para)
     flush()
     return chunks
+
+
+def _chunk_programme(document: Document, text: str) -> str | None:
+    if _is_eee_general_faq_chunk(document, text):
+        return None
+    source_context = f"{document.source}\n{document.title}".casefold()
+    programmes = _programme_codes(source_context)
+    if "46408" in source_context:
+        programmes.add("JS3170")
+    if "46409" in source_context:
+        programmes.add("JS3180")
+    if len(programmes) == 1:
+        return next(iter(programmes))
+
+    text_programmes = _programme_codes(text)
+    return next(iter(text_programmes)) if len(text_programmes) == 1 else None
+
+
+def _programme_codes(text: str) -> set[str]:
+    return {match.group(1).upper() for match in FAQ_PROGRAMME_RE.finditer(text)}
+
+
+def _is_eee_general_faq_chunk(document: Document, text: str) -> bool:
+    programme_match = FAQ_PROGRAMME_RE.search(f"{document.source}\n{document.title}")
+    question_match = FAQ_QUESTION_NUMBER_RE.match(text)
+    if programme_match is None or question_match is None:
+        return False
+    programme = programme_match.group(1).upper()
+    question_number = int(question_match.group(1))
+    return programme == "JS3180" and 14 <= question_number <= 16
+
+
+def _retrieval_questions(
+    title: str,
+    text: str,
+    tags: list[str],
+    programme: str | None,
+) -> list[str]:
+    faq_question = next(
+        (line for line in text.splitlines() if FAQ_QUESTION_RE.match(line)),
+        None,
+    )
+    if faq_question is not None:
+        question = _faq_question_text(faq_question)
+        if programme is not None and programme.casefold() not in question.casefold():
+            return [f"{programme}：{question}", question]
+        return [question]
+
+    context = f"{title}\n{text}".casefold()
+    subject = programme or ("EEE" if "EEE" in tags else "PolyU")
+    questions: list[str] = []
+
+    def add(question: str) -> None:
+        if question not in questions:
+            questions.append(question)
+
+    if programme is not None:
+        topic_questions = [
+            (
+                ("award title", "awards offered", "preferred award"),
+                f"{subject} 有邊啲主修方向同學位選擇？",
+            ),
+            (
+                ("curriculum", "programme structure", "credit requirement", "credits required"),
+                f"{subject} 課程結構同學分要求係點？",
+            ),
+            (("normal duration", "duration of programme"), f"{subject} 正常修讀年期係幾耐？"),
+            (
+                ("professional recognition", "accreditation", "hkie"),
+                f"{subject} 有冇 HKIE 專業認可？",
+            ),
+            (
+                ("career", "employment", "graduate opportunities"),
+                f"{subject} 畢業後有咩就業出路？",
+            ),
+            (
+                ("admission", "entrance requirement", "jupas", "applicant", "apply now"),
+                f"{subject} 入學同申請要求係點？",
+            ),
+            (("scholarship",), f"{subject} 有咩入學獎學金？"),
+            (
+                ("work-integrated education", "industrial training", "internship"),
+                f"{subject} 有冇實習或工作實習安排？",
+            ),
+            (
+                ("student exchange", "exchange programme", "overseas exchange"),
+                f"{subject} 有冇海外交流機會？",
+            ),
+            (
+                ("aims and characteristics", "programme aims", "programme characteristics"),
+                f"{subject} 主要學啲咩，同埋有咩課程特色？",
+            ),
+            (("programme intake", "intake around"), f"{subject} 收生名額大約有幾多？"),
+        ]
+    else:
+        title_context = title.casefold()
+        if "non-jupas applicants senior year" in title_context:
+            add("EEE 本科課程嘅 Non-JUPAS 高年級入學申請方法同要求係點？")
+        elif "non-jupas applicants year 1" in title_context:
+            add("EEE 本科課程嘅 Non-JUPAS 一年級入學申請方法同要求係點？")
+        elif "international students" in title_context:
+            add("國際學生點樣申請 EEE 本科課程？")
+        elif "mainland students" in title_context:
+            add("內地學生點樣申請 EEE 本科課程？")
+        elif "jupas applicants" in title_context:
+            add("EEE 本科課程嘅 JUPAS 申請方法同要求係點？")
+        if "EEE" in tags:
+            topic_questions = [
+                (
+                    ("programmes for undergraduate students", "undergraduate programmes"),
+                    "EEE 有邊啲本科課程同專業方向？",
+                ),
+                (
+                    ("research themes", "research areas", "research strengths"),
+                    "EEE 有邊啲研究方向同科研優勢？",
+                ),
+                (
+                    ("contact us", "general office", "telephone", "email"),
+                    "EEE 學系辦公室、電話同電郵係咩？",
+                ),
+                (
+                    ("vision and mission", "our vision", "our mission"),
+                    "EEE 嘅願景同使命係咩？",
+                ),
+                (
+                    ("message from head", "formed by merging"),
+                    "EEE 學系有咩背景同發展方向？",
+                ),
+            ]
+        else:
+            topic_questions = [
+                (("university ranking", "rankings", "qs world"), "PolyU 嘅大學排名係點？"),
+                (("polyu in figures", "facts and figures"), "PolyU 有咩主要數據同規模資料？"),
+                (("why polyu",), "點解學生會選擇 PolyU？"),
+                (
+                    ("faculties", "schools and departments"),
+                    "PolyU 有邊啲學院、學校同學系？",
+                ),
+            ]
+    for needles, question in topic_questions:
+        if any(needle in context for needle in needles):
+            add(question)
+
+    return questions[:6]
+
+
+def _faq_question_text(line: str) -> str:
+    question = FAQ_QUESTION_RE.sub("", line, count=1).strip()
+    question = re.split(r"答\s*[:：]", question, maxsplit=1)[0].strip()
+    question = re.split(
+        r"(?<=[?？])\s*(?:唔洗|唔使|不用|答案\s*[:：]?)",
+        question,
+        maxsplit=1,
+    )[0].strip()
+    if len(question) > 180:
+        ending = re.search(r"[?？]", question)
+        if ending is not None:
+            question = question[: ending.end()]
+    return question
 
 
 def _summary_zh(title: str, text: str) -> str:
@@ -521,7 +796,12 @@ def build(knowledge_dir: Path, urls: list[str]) -> None:
     documents = _copy_docx_sources(knowledge_dir)
     documents.extend(_fetch_polyu_pages(knowledge_dir, urls))
 
-    chunks = [chunk for document in documents for chunk in _chunk_document(document)]
+    ignored_web_lines = _shared_web_navigation(documents)
+    chunks = [
+        chunk
+        for document in documents
+        for chunk in _chunk_document(document, ignored_web_lines=ignored_web_lines)
+    ]
     facts = _facts()
     sources = [
         {
@@ -547,14 +827,14 @@ def build(knowledge_dir: Path, urls: list[str]) -> None:
         json.dumps(sources, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
     )
     (processed_dir / "qa_seed.zh.jsonl").write_text(
-        "".join(json.dumps(item, ensure_ascii=False) + "\n" for item in _qa_seed()),
+        "".join(json.dumps(item, ensure_ascii=False) + "\n" for item in _qa_seed(chunks)),
         encoding="utf-8",
     )
 
     print(f"Wrote {len(sources)} sources and {len(chunks)} chunks to {processed_dir}")
 
 
-def _qa_seed() -> list[dict[str, str]]:
+def _qa_seed(chunks: list[dict[str, Any]] | None = None) -> list[dict[str, str]]:
     questions = [
         "香港理工大學係一間點樣嘅學校？",
         "EEE 係咩學系？",
@@ -588,7 +868,15 @@ def _qa_seed() -> list[dict[str, str]]:
         "JS3180 有冇實習同海外交流機會？",
         "JS3180 畢業生嘅起薪同就業率係點？",
     ]
-    return [{"question": question} for question in questions]
+    if chunks is not None:
+        for chunk in chunks:
+            questions.extend(str(question) for question in chunk.get("retrieval_questions", []))
+    return [
+        {"question": question}
+        for question in dict.fromkeys(
+            question.strip() for question in questions if question.strip()
+        )
+    ]
 
 
 def main() -> None:
