@@ -77,6 +77,10 @@ When the user question includes previous-turn context, resolve short follow-ups 
 and answer the current follow-up; do not treat it as an unrelated standalone question.
 Treat JS3170 and JS3180 as separate programmes. Never combine their admission scores,
 major-allocation rules, career figures, or other programme-specific facts.
+Never answer a narrower subgroup question with a broader combined statistic. For example, a
+"local or overseas" combined percentage is not a local-only or overseas-only percentage. If the
+reference information does not split the requested subgroup out, say that no separate figure is
+available instead of repeating the combined figure as the answer.
 When an unscoped question has separate answers for JS3170 and JS3180, answer both directly:
 state the JS3170 answer first, then the JS3180 answer, without asking the user to choose. These
 topics include programme content, admission requirements and scores, careers and salary figures,
@@ -296,6 +300,10 @@ class InfodayVoiceAnswerSkill(Module):
             effective_question = self._question_with_conversation_context(
                 effective_question,
                 followup_text=clean_question,
+            )
+            effective_question = _question_with_statistical_scope_guard(
+                effective_question,
+                user_text=clean_question,
             )
 
             answer_started_at = time.monotonic()
@@ -917,6 +925,43 @@ def _prepare_programme_turn(
     if asks_for_both:
         return f"{question}\n請分別比較 JS3170 同 JS3180。", None, None
     return question, None, None
+
+
+_STATISTICAL_SCOPE_TERMS = (
+    ("本地", ("本地", "local")),
+    ("海外", ("海外", "外地", "國際", "国际", "overseas", "international")),
+)
+_STATISTICAL_METRIC_TERMS = (
+    "比例",
+    "比率",
+    "百分比",
+    "percent",
+    "%",
+    "幾多",
+    "几多",
+    "多少",
+    "數字",
+    "数字",
+)
+
+
+def _question_with_statistical_scope_guard(question: str, *, user_text: str) -> str:
+    normalized = unicodedata.normalize("NFKC", user_text).casefold()
+    requested_scope = next(
+        (
+            label
+            for label, terms in _STATISTICAL_SCOPE_TERMS
+            if any(term in normalized for term in terms)
+        ),
+        None,
+    )
+    if requested_scope is None or not any(term in normalized for term in _STATISTICAL_METRIC_TERMS):
+        return question
+    return (
+        f"{question}\n"
+        f"用戶只問{requested_scope}嘅獨立統計；不可用本地同海外合計數字代替。"
+        "如果資料冇分開列出，必須直接講冇獨立數字。"
+    )
 
 
 _CONTEXTUAL_FOLLOWUP_PATTERNS = (

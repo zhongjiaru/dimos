@@ -26,6 +26,7 @@ from dimos.agents.skills.infoday_voice_answer import (
     _fast_infoday_answer,
     _is_contextual_followup,
     _prepare_programme_turn,
+    _question_with_statistical_scope_guard,
     _text_for_speech,
     _TextChunker,
 )
@@ -57,6 +58,15 @@ def test_response_prompt_keeps_programme_specific_facts_separate() -> None:
     assert "Treat JS3170 and JS3180 as separate programmes" in (INFODAY_CANTONESE_RESPONSE_PROMPT)
     assert "Never combine their admission scores" in INFODAY_CANTONESE_RESPONSE_PROMPT
     assert "briefly introduce both programmes" in INFODAY_CANTONESE_RESPONSE_PROMPT
+
+
+def test_response_prompt_does_not_use_combined_statistics_for_a_subgroup() -> None:
+    prompt = INFODAY_CANTONESE_RESPONSE_PROMPT
+
+    assert "Never answer a narrower subgroup question" in prompt
+    assert '"local or overseas" combined percentage' in prompt
+    assert "no separate figure is" in prompt
+    assert "available instead of repeating the combined figure" in prompt
 
 
 def test_programme_turn_expands_shared_question_for_both_programmes() -> None:
@@ -179,6 +189,69 @@ def test_infoday_voice_answer_does_not_attach_history_to_independent_question() 
         skill.stop()
 
     assert effective == "EEE 有咩研究方向？"
+
+
+@pytest.mark.parametrize(
+    ("user_text", "scope"),
+    [
+        ("想知本地��星學比例。", "本地"),
+        ("海外升學百分比係幾多？", "海外"),
+    ],
+)
+def test_statistical_scope_guard_rejects_combined_data_for_requested_subgroup(
+    user_text: str,
+    scope: str,
+) -> None:
+    question = _question_with_statistical_scope_guard(user_text, user_text=user_text)
+
+    assert question == (
+        f"{user_text}\n"
+        f"用戶只問{scope}嘅獨立統計；不可用本地同海外合計數字代替。"
+        "如果資料冇分開列出，必須直接講冇獨立數字。"
+    )
+
+
+@pytest.mark.parametrize(
+    "user_text",
+    ["想了解升學比例。", "本地有咩課程？", "香港理工大學升學比例係幾多？"],
+)
+def test_statistical_scope_guard_leaves_non_subgroup_questions_unchanged(
+    user_text: str,
+) -> None:
+    assert _question_with_statistical_scope_guard(user_text, user_text=user_text) == user_text
+
+
+def test_infoday_voice_answer_applies_statistical_scope_guard_before_lookup(mocker) -> None:  # type: ignore[no-untyped-def]
+    skill = InfodayVoiceAnswerSkill(min_tts_chunk_chars=8, max_tts_chunk_chars=40)
+    skill._client = mocker.Mock()
+    skill.polyu_knowledge = mocker.Mock()
+    skill.polyu_knowledge.search_polyu_knowledge.return_value = "combined context"
+    skill.infoday_answer = mocker.Mock()
+    skill.operator_audio = mocker.Mock()
+    stream_response = mocker.patch.object(
+        skill,
+        "_stream_response",
+        return_value=iter(["現有資料冇分開本地同海外比例。你想了解整體升學比例嗎？"]),
+    )
+    frame = AudioEvent(np.array([1], dtype=np.int16), 24000, 1.0, 1)
+    tts_node = mocker.Mock()
+    tts_node.iter_audio_events.return_value = [frame]
+    mocker.patch.object(skill, "_make_tts_node", return_value=tts_node)
+    question = "想知本地��星學比例。"
+
+    try:
+        result = skill.answer_infoday_question(question)
+    finally:
+        skill.stop()
+
+    effective = (
+        f"{question}\n"
+        "用戶只問本地嘅獨立統計；不可用本地同海外合計數字代替。"
+        "如果資料冇分開列出，必須直接講冇獨立數字。"
+    )
+    assert result == f"Answered Info Day question in Cantonese: {question}"
+    skill.polyu_knowledge.search_polyu_knowledge.assert_called_once_with(effective)
+    stream_response.assert_called_once_with(effective, "combined context")
 
 
 def test_infoday_voice_answer_resolves_action_offered_in_previous_turn() -> None:
