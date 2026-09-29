@@ -131,6 +131,12 @@ _DEMONSTRATION_PATTERN = (
     r"show|demonstrat|做(?:個|个|一次|下)|表演|示範|示范|俾我睇|畀我睇|給我看|给我看|"
     r"睇下|看看|來一個|来一个"
 )
+_ACTION_OFFER_PATTERN = r"你想|想唔想|想不想|可以揀|可以选|定係|還是|还是|或者|要唔要"
+_ACTION_FOLLOWUP_PATTERNS = (
+    r"^(?:好|好呀|好啊|可以|得|要|就呢個|就呢个|就這個|就这个)[!！。，, ]*$",
+    r"^(?:我)?(?:想|要|可以)?(?:你)?(?:示範|示范|表演|做|試|试|睇|看)"
+    r"(?:下|一下|一次|俾我睇|畀我睇|給我看|给我看)?[!！。，, ]*$",
+)
 _ROBOT_ACTION_INTENT_PATTERNS = (
     r"\b(?:move|walk|turn|follow|jump|navigate|come here)\b",
     r"\b(?:go|take me)\s+to\b",
@@ -284,6 +290,20 @@ def is_robot_action_request(request: str) -> bool:
         or (has_capability_question and wants_demonstration)
         or any(re.search(pattern, normalized) for pattern in _ROBOT_ACTION_INTENT_PATTERNS)
     )
+
+
+def resolve_offered_action_followup(previous_answer: str, request: str) -> str | None:
+    """Resolve a short acceptance of the single action offered in the previous answer."""
+    normalized_answer = _normalize_action_request(previous_answer)
+    normalized_request = _normalize_action_request(request)
+    if not re.search(_ACTION_OFFER_PATTERN, normalized_answer):
+        return None
+    offered_actions = _match_supported_actions(normalized_answer)
+    if len(offered_actions) != 1:
+        return None
+    if not any(re.search(pattern, normalized_request) for pattern in _ACTION_FOLLOWUP_PATTERNS):
+        return None
+    return _ACTION_SPECS[offered_actions[0]].spoken_name
 
 
 def _normalize_action_request(request: str) -> str:

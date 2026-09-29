@@ -132,7 +132,17 @@ class InfodayInputRouter(Module):
         elif not cleaned:
             route = InputRoute.REPEAT
         else:
-            route = classify_infoday_input(cleaned)
+            action_followup = self._resolve_action_followup(cleaned)
+            if action_followup is None:
+                route = classify_infoday_input(cleaned)
+            else:
+                logger.info(
+                    "Expanded InfoDay action follow-up",
+                    original_text=cleaned,
+                    action_request=action_followup,
+                )
+                cleaned = action_followup
+                route = InputRoute.ACTION
         logger.info("Routed human input", route=route.value, text=cleaned)
         if route is InputRoute.DROP:
             return
@@ -163,6 +173,13 @@ class InfodayInputRouter(Module):
             logger.info("InfoDay attention action dispatched", result=result)
         except Exception:
             logger.exception("InfoDay attention action dispatch failed")
+
+    def _resolve_action_followup(self, text: str) -> str | None:
+        try:
+            return self.voice_answer.resolve_action_followup(text)
+        except Exception:
+            logger.exception("InfoDay action follow-up resolution failed", text=text)
+            return None
 
     def _on_agent_error(self, error: str) -> None:
         logger.error("InfoDay agent processing failed", error=error)

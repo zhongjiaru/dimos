@@ -20,7 +20,10 @@ import json
 import pytest
 from unitree_webrtc_connect.constants import SPORT_CMD
 
-from dimos.agents.skills.infoday_action import InfodayActionSkill
+from dimos.agents.skills.infoday_action import (
+    InfodayActionSkill,
+    resolve_offered_action_followup,
+)
 
 
 @pytest.fixture
@@ -55,6 +58,30 @@ def test_infoday_action_accepts_cantonese_and_asr_dance_variants(
 
     assert result == "Completed Info Day action: dance"
     action_skill.go2.sport_command.assert_called_once_with(SPORT_CMD["Dance1"])
+
+
+@pytest.mark.parametrize("followup", ["想你示範。", "示范下", "好呀", "就呢個"])
+def test_action_followup_resolves_single_action_offered_by_previous_answer(
+    followup: str,
+) -> None:
+    previous_answer = "JS3170 舊年平均分 25.9。想我再講收生要求，定係睇我揮手示範？"
+
+    assert resolve_offered_action_followup(previous_answer, followup) == "揮手"
+
+
+@pytest.mark.parametrize(
+    ("previous_answer", "followup"),
+    [
+        ("我識揮手，但而家未開始。", "想你示範。"),
+        ("你想睇我揮手定跳舞？", "想你示範。"),
+        ("你想睇我揮手示範？", "我想問收生分數。"),
+    ],
+)
+def test_action_followup_rejects_missing_ambiguous_or_unrelated_offer(
+    previous_answer: str,
+    followup: str,
+) -> None:
+    assert resolve_offered_action_followup(previous_answer, followup) is None
 
 
 def test_attention_action_starts_silently_and_rotates_safe_actions(

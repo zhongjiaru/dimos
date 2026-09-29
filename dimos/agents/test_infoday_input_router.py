@@ -48,6 +48,7 @@ def router_factory():  # type: ignore[no-untyped-def]
         )
         router.human_input = MagicMock()
         router.voice_answer = MagicMock()
+        router.voice_answer.resolve_action_followup.return_value = None
         router.action = MagicMock()
         routers.append(router)
         return router
@@ -221,6 +222,20 @@ def test_router_directly_runs_action_through_worker(router_factory) -> None:  # 
     router.action.perform_robot_action.assert_called_once_with("立即停低")
     router.action.start_attention_action.assert_not_called()
     router.human_input.publish.assert_not_called()
+    router.voice_answer.answer_infoday_question.assert_not_called()
+
+
+def test_router_expands_action_followup_from_previous_answer(router_factory) -> None:  # type: ignore[no-untyped-def]
+    router = router_factory()
+    router.voice_answer.resolve_action_followup.return_value = "揮手"
+
+    router._on_input("想你示範。")
+    router._answer_queue.put_nowait(None)
+    router._run_answers()
+
+    router.voice_answer.resolve_action_followup.assert_called_once_with("想你示範。")
+    router.action.perform_robot_action.assert_called_once_with("揮手")
+    router.action.start_attention_action.assert_not_called()
     router.voice_answer.answer_infoday_question.assert_not_called()
 
 

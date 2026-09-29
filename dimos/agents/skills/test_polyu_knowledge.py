@@ -234,6 +234,37 @@ def test_polyu_knowledge_reports_missing_files(tmp_path) -> None:  # type: ignor
     assert "未搵到離線知識庫檔案" in result
 
 
+def test_polyu_knowledge_no_match_does_not_expose_internal_storage(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    processed = tmp_path / "processed"
+    processed.mkdir()
+    (processed / "facts.zh.json").write_text("{}", encoding="utf-8")
+    (processed / "chunks.zh.jsonl").write_text(
+        json.dumps(
+            {
+                "id": "eee-contact",
+                "source": "eee.html",
+                "title": "EEE 聯絡資料",
+                "original_text": "EEE 辦公室位於 CF620。",
+                "tags": ["EEE", "聯絡"],
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    skill = PolyUKnowledgeSkill(knowledge_dir=tmp_path)
+
+    try:
+        skill.start()
+        result = skill.search_polyu_knowledge("月球上有幾多棵樹？")
+    finally:
+        skill.stop()
+
+    assert result == "沒有足夠相關資料可回答呢條問題。請唔好編造答案。"
+    assert "離線" not in result
+    assert "知識庫" not in result
+
+
 @pytest.mark.parametrize(
     ("question", "expected"),
     [

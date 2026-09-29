@@ -23,12 +23,14 @@ import re
 import threading
 import time
 from typing import Any, Literal, Protocol
+import unicodedata
 
 from openai import OpenAI
 from pydantic import Field
 
 from dimos.agents.annotation import skill
 from dimos.agents.infoday_events import InfodayAudioComplete
+from dimos.agents.skills.infoday_action import resolve_offered_action_followup
 from dimos.agents.skills.polyu_knowledge import (
     PolyUKnowledgeSkill,
     ProgrammeCode,
@@ -68,7 +70,11 @@ Keep official English names unchanged when needed, for example PolyU, EEE, BEng(
 Write programme and subject codes in their official compact form, for example JS3180 or CLC1104C.
 Optimize for low speech latency: start with a short, direct Cantonese answer and keep the first sentence to at most 45 characters whenever possible.
 Do not repeat or spell out a full English programme or award title unless the user explicitly asks for its official English name; normally use the programme code and a concise Traditional Chinese name instead.
-Base the answer only on the provided official offline knowledge context.
+Base the answer only on the provided reference information.
+Never mention or expose internal implementation details such as offline materials, documents,
+a knowledge base, context, retrieval, search results, or source availability to the visitor.
+When the user question includes previous-turn context, resolve short follow-ups from that context
+and answer the current follow-up; do not treat it as an unrelated standalone question.
 Treat JS3170 and JS3180 as separate programmes. Never combine their admission scores,
 major-allocation rules, career figures, or other programme-specific facts.
 When an unscoped question has separate answers for JS3170 and JS3180, answer both directly:
@@ -81,8 +87,11 @@ merely because a question mentions EEE, study, admissions, or another programme-
 Answer a unique or EEE-general question directly from its matching context. If the user broadly
 asks which EEE programmes are available or asks to compare both, briefly introduce both programmes
 instead of asking for clarification.
-If the context is insufficient, say briefly in Cantonese that the current official offline materials do not include that detail, then invite the user to choose a safe stationary robot demonstration such as waving or dancing.
-Only offer the action; do not claim that it has happened or trigger it before the user explicitly chooses one.
+If the reference information is insufficient, say briefly and naturally in Cantonese that you are
+not sure, for example "呢方面我唔太清楚", then ask one relevant clarifying question or suggest
+a closely related EEE topic. Do not automatically redirect an unanswered question to a robot
+demonstration. If you do offer an action, only offer it; do not claim that it has happened or
+trigger it before the user explicitly chooses one.
 Answer in exactly two short spoken sentences, ideally under 80 Chinese characters in total.
 The first sentence must answer the question directly. The second must invite one relevant next interaction with at most two concrete choices.
 Avoid generic endings such as 仲有咩可以幫你. Vary the invitation to fit the topic.
@@ -154,6 +163,7 @@ class InfodayVoiceAnswerConfig(ModuleConfig):
     # Low-latency mode enqueues each TTS event immediately, then waits only at the end.
     stream_audio_playback: bool = False
     playback_completion_margin_sec: float = 5.0
+    conversation_context_ttl_sec: float = Field(default=90.0, ge=5.0, le=600.0)
     # canto-tts 0.1.x treats this as a local ONNX bundle path. None activates
     # the SDK's Hugging Face download for typangaa/canto-tts-nano.
     canto_tts_checkpoint: str | None = None
@@ -189,6 +199,9 @@ class InfodayVoiceAnswerSkill(Module):
 
     _audio_lock: threading.Lock
     _client: OpenAI | None
+    _last_answer_at: float
+    _last_answer_text: str | None
+    _last_user_question: str | None
     _pending_programme_question: str | None
     _tts_node: _TTSNode | None
 
@@ -196,6 +209,9 @@ class InfodayVoiceAnswerSkill(Module):
         super().__init__(**kwargs)
         self._audio_lock = threading.Lock()
         self._client = None
+        self._last_answer_at = 0.0
+        self._last_answer_text = None
+        self._last_user_question = None
         self._pending_programme_question = None
         self._tts_node = None
 
@@ -229,6 +245,7 @@ class InfodayVoiceAnswerSkill(Module):
         if self._client is not None:
             self._client.close()
             self._client = None
+        self._clear_conversation_context()
         super().stop()
 
     @skill
@@ -256,6 +273,7 @@ class InfodayVoiceAnswerSkill(Module):
                 except Exception as exc:
                     logger.error("InfoDay fast answer TTS failed", error=str(exc), text=fast_answer)
                     return f"Error answering Info Day question: {exc}"
+                self._remember_conversation_turn(clean_question, fast_answer)
                 return f"Answered Info Day question in Cantonese: {clean_question}"
 
             effective_question, pending_question, clarification = _prepare_programme_turn(
@@ -274,6 +292,11 @@ class InfodayVoiceAnswerSkill(Module):
                     )
                     return f"Error answering Info Day question: {exc}"
                 return f"Asked user to choose an EEE programme: {clean_question}"
+
+            effective_question = self._question_with_conversation_context(
+                effective_question,
+                followup_text=clean_question,
+            )
 
             answer_started_at = time.monotonic()
             try:
@@ -383,6 +406,7 @@ class InfodayVoiceAnswerSkill(Module):
                 error = errors.get_nowait()
             except queue.Empty:
                 self.infoday_answer.publish(answer_text)
+                self._remember_conversation_turn(clean_question, answer_text)
                 return f"Answered Info Day question in Cantonese: {clean_question}"
             try:
                 self._speak_locked(INFODAY_ERROR_RESPONSE)
@@ -406,18 +430,73 @@ class InfodayVoiceAnswerSkill(Module):
         return "Asked user to repeat the Info Day question"
 
     @rpc
+    def resolve_action_followup(self, request: str) -> str | None:
+        """Resolve a short acceptance of an action offered in the previous answer."""
+        if self._last_answer_text is None:
+            return None
+        if time.monotonic() - self._last_answer_at > self.config.conversation_context_ttl_sec:
+            self._clear_conversation_context()
+            return None
+        action_request = resolve_offered_action_followup(self._last_answer_text, request)
+        if action_request is not None:
+            logger.info(
+                "Resolved InfoDay action follow-up",
+                followup=request,
+                action_request=action_request,
+            )
+        return action_request
+
+    @rpc
     def speak_message(self, text: str) -> str:
         """Speak one Info Day interaction message through the Go2 speaker."""
         clean_text = text.strip()
         if not clean_text:
             return "Error: no text to speak"
         with self._audio_lock:
+            self._clear_conversation_context()
             try:
                 self._speak_locked(clean_text)
             except Exception as exc:
                 logger.error("InfoDay message TTS failed", error=str(exc), text=clean_text)
                 return f"Error speaking Info Day message: {exc}"
         return f"Spoke Info Day message: {clean_text}"
+
+    def _question_with_conversation_context(
+        self,
+        question: str,
+        *,
+        followup_text: str | None = None,
+    ) -> str:
+        current_text = followup_text or question
+        if not _is_contextual_followup(current_text):
+            return question
+        if self._last_user_question is None or self._last_answer_text is None:
+            return question
+        if time.monotonic() - self._last_answer_at > self.config.conversation_context_ttl_sec:
+            self._clear_conversation_context()
+            return question
+        contextual_question = (
+            f"上一輪用戶問題：{self._last_user_question}\n"
+            f"上一輪機械人回答：{self._last_answer_text}\n"
+            f"目前用戶追問：{current_text}\n"
+            "請承接上一輪語境回答目前追問。"
+        )
+        logger.info(
+            "Resolved InfoDay contextual follow-up",
+            previous_question=self._last_user_question,
+            followup=current_text,
+        )
+        return contextual_question
+
+    def _remember_conversation_turn(self, question: str, answer: str) -> None:
+        self._last_user_question = question[:300]
+        self._last_answer_text = answer[:600]
+        self._last_answer_at = time.monotonic()
+
+    def _clear_conversation_context(self) -> None:
+        self._last_user_question = None
+        self._last_answer_text = None
+        self._last_answer_at = 0.0
 
     def _speak_locked(self, text: str) -> None:
         self._stream_text_to_speaker(text)
@@ -515,10 +594,7 @@ class InfodayVoiceAnswerSkill(Module):
                 {
                     "role": "user",
                     "content": (
-                        "Official offline knowledge context:\n"
-                        f"{knowledge}\n\n"
-                        "User question:\n"
-                        f"{question}"
+                        f"Reference information:\n{knowledge}\n\nUser question:\n{question}"
                     ),
                 },
             ],
@@ -786,6 +862,32 @@ def _prepare_programme_turn(
     if asks_for_both:
         return f"{question}\n請分別比較 JS3170 同 JS3180。", None, None
     return question, None, None
+
+
+_CONTEXTUAL_FOLLOWUP_PATTERNS = (
+    r"^(?:你)?(?:(?:兩個|两个|兩樣|两样|兩者|两者|全部))?"
+    r"(?:都|一齊|一起|分別|分别)(?:講|讲|說|说|介紹|介绍)(?:下|吓|一下)?$",
+    r"^(?:兩個|两个|兩樣|两样|兩者|两者|全部)(?:都)?"
+    r"(?:講|讲|說|说|介紹|介绍)(?:下|吓|一下)?$",
+    r"^(?:繼續|继续)(?:講|讲|說|说)?(?:下|吓|一下)?$",
+    r"^(?:再講|再讲|再說|再说|講|讲|說|说)"
+    r"(?:多|詳細|详细|清楚)(?:啲|些|點|点)?$",
+    r"^(?:第一個|第一个|第二個|第二个|前者|後者|后者)$",
+    r"^(?:咁|那)(?:(?:js)?(?:3170|3180)|呢個|呢个|嗰個|嗰个|這個|这个|那個|那个)?呢$",
+    r"^(?:兩個|两个|佢哋|它們|它们)?有(?:咩|乜|什麼|什么|何)"
+    r"(?:分別|分别|區別|区别|不同)$",
+    r"^(?:邊個|边个|哪個|哪个)(?:好|好啲|更好|適合我|适合我)$",
+    r"^(?:點揀|点拣|點樣揀|点样拣|怎麼選|怎么选|如何選|如何选)$",
+    r"^(?:點解|点解|為什麼|为什么)$",
+    r"^(?:仲有|還有|还有)(?:呢|嗎|吗)?$",
+    r"^(?:具體|具体|詳細|详细)(?:啲|些|點|点)?$",
+)
+
+
+def _is_contextual_followup(question: str) -> bool:
+    normalized = unicodedata.normalize("NFKC", question).casefold()
+    normalized = re.sub(r"[\s\W_]+", "", normalized, flags=re.UNICODE)
+    return any(re.search(pattern, normalized) for pattern in _CONTEXTUAL_FOLLOWUP_PATTERNS)
 
 
 def _programme_selection(question: str) -> ProgrammeCode | None:

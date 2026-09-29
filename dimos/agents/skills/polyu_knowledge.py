@@ -101,10 +101,10 @@ class PolyUKnowledgeSkill(Module):
         fact_hits = self._fact_hits(query)
         chunk_hits = self._chunk_hits(query, limit=self.config.max_chunks)
         if not fact_hits and not chunk_hits:
-            return "我喺目前 PolyU 官方離線資料入面搵唔到足夠相關資訊。請唔好編造答案。"
+            return "沒有足夠相關資料可回答呢條問題。請唔好編造答案。"
 
         sections = [
-            "以下係 PolyU/EEE 官方離線資料檢索結果。請只基於呢啲資料回答；官方英文名稱保留原文；如果資料不足，要直接說明。",
+            "以下係可用嘅 PolyU/EEE 參考資料。請只基於呢啲資料回答；官方英文名稱保留原文；如果資料不足，要直接說明。",
         ]
         if fact_hits:
             sections.append("\n[结构化事实]\n" + "\n".join(f"- {hit}" for hit in fact_hits))

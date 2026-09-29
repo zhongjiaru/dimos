@@ -24,6 +24,7 @@ from dimos.agents.skills.infoday_voice_answer import (
     INFODAY_REPEAT_REQUEST,
     InfodayVoiceAnswerSkill,
     _fast_infoday_answer,
+    _is_contextual_followup,
     _prepare_programme_turn,
     _text_for_speech,
     _TextChunker,
@@ -33,11 +34,13 @@ from dimos.stream.audio.base import AudioEvent
 # ruff: noqa: RUF001
 
 
-def test_response_prompt_offers_an_action_when_official_context_is_insufficient() -> None:
-    assert "invite the user to choose a safe stationary robot demonstration" in (
-        INFODAY_CANTONESE_RESPONSE_PROMPT
-    )
-    assert "do not claim that it has happened" in INFODAY_CANTONESE_RESPONSE_PROMPT
+def test_response_prompt_hides_internal_sources_when_information_is_insufficient() -> None:
+    prompt = INFODAY_CANTONESE_RESPONSE_PROMPT
+
+    assert '"呢方面我唔太清楚"' in prompt
+    assert "Never mention or expose internal implementation details" in prompt
+    assert "Do not automatically redirect" in prompt
+    assert "do not claim that it has happened" in prompt
 
 
 def test_response_prompt_requests_a_short_direct_first_sentence() -> None:
@@ -122,6 +125,109 @@ def test_infoday_voice_answer_answers_both_programmes_without_clarification(mock
     assert result == "Answered Info Day question in Cantonese: 收生分數係幾多？"
     skill.polyu_knowledge.search_polyu_knowledge.assert_called_once_with(effective)
     skill._stream_response.assert_called_once_with(effective, "JS3170 context\nJS3180 context")
+
+
+def test_infoday_voice_answer_uses_previous_turn_for_short_followup(mocker) -> None:  # type: ignore[no-untyped-def]
+    skill = InfodayVoiceAnswerSkill(min_tts_chunk_chars=8, max_tts_chunk_chars=80)
+    skill._client = mocker.Mock()
+    skill.polyu_knowledge = mocker.Mock()
+    skill.polyu_knowledge.search_polyu_knowledge.return_value = "official context"
+    skill.infoday_answer = mocker.Mock()
+    skill.operator_audio = mocker.Mock()
+    first_question = "你介紹下 EE 嘅課程啦。"
+    first_answer = "EE 有 JS3170 同 JS3180。想我講主修方向定收生分數？"
+    followup = "你都講下。"
+    second_answer = "好呀，我分開講兩個課程嘅主修方向同收生分數。"
+    stream_response = mocker.patch.object(
+        skill,
+        "_stream_response",
+        side_effect=[iter([first_answer]), iter([second_answer])],
+    )
+    frame = AudioEvent(np.array([1], dtype=np.int16), 24000, 1.0, 1)
+    tts_node = mocker.Mock()
+    tts_node.iter_audio_events.return_value = [frame]
+    mocker.patch.object(skill, "_make_tts_node", return_value=tts_node)
+
+    try:
+        first_result = skill.answer_infoday_question(first_question)
+        second_result = skill.answer_infoday_question(followup)
+    finally:
+        skill.stop()
+
+    contextual_question = (
+        f"上一輪用戶問題：{first_question}\n"
+        f"上一輪機械人回答：{first_answer}\n"
+        f"目前用戶追問：{followup}\n"
+        "請承接上一輪語境回答目前追問。"
+    )
+    assert first_result == f"Answered Info Day question in Cantonese: {first_question}"
+    assert second_result == f"Answered Info Day question in Cantonese: {followup}"
+    assert skill.polyu_knowledge.search_polyu_knowledge.call_args_list[0].args == (first_question,)
+    assert skill.polyu_knowledge.search_polyu_knowledge.call_args_list[1].args == (
+        contextual_question,
+    )
+    assert stream_response.call_args_list[1].args == (contextual_question, "official context")
+
+
+def test_infoday_voice_answer_does_not_attach_history_to_independent_question() -> None:
+    skill = InfodayVoiceAnswerSkill()
+
+    try:
+        skill._remember_conversation_turn("EEE 有咩課程？", "有 JS3170 同 JS3180。")
+        effective = skill._question_with_conversation_context("EEE 有咩研究方向？")
+    finally:
+        skill.stop()
+
+    assert effective == "EEE 有咩研究方向？"
+
+
+def test_infoday_voice_answer_resolves_action_offered_in_previous_turn() -> None:
+    skill = InfodayVoiceAnswerSkill()
+
+    try:
+        skill._remember_conversation_turn(
+            "想知道收生分數。",
+            "想我再講收生要求，定係睇我揮手示範？",
+        )
+        action_request = skill.resolve_action_followup("想你示範。")
+    finally:
+        skill.stop()
+
+    assert action_request == "揮手"
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "你都講下。",
+        "兩個都講",
+        "全部說一下",
+        "繼續講",
+        "再講詳細啲",
+        "第二個",
+        "咁 JS3180 呢？",
+        "兩個有咩分別？",
+        "邊個好啲？",
+        "點樣揀？",
+        "點解？",
+        "仲有呢？",
+    ],
+)
+def test_contextual_followup_recognizes_common_short_references(question: str) -> None:
+    assert _is_contextual_followup(question)
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "EEE 有咩研究方向？",
+        "JS3180 收生分數係幾多？",
+        "讀書期間有冇實習？",
+        "跳隻舞俾我睇。",
+    ],
+)
+def test_contextual_followup_rejects_complete_new_requests(question: str) -> None:
+    assert not _is_contextual_followup(question)
 
 
 def test_text_chunker_splits_on_comma_after_minimum() -> None:
@@ -579,6 +685,9 @@ def test_infoday_response_forwards_generation_limits_and_extra_body(mocker) -> N
     request = create.call_args.kwargs
     assert request["max_tokens"] == 96
     assert request["extra_body"] == {"thinking": {"type": "disabled"}}
+    user_message = request["messages"][1]["content"]
+    assert user_message.startswith("Reference information:\n")
+    assert "offline" not in user_message.casefold()
 
 
 def test_infoday_voice_answer_speaks_fallback_for_empty_llm_response(mocker) -> None:  # type: ignore[no-untyped-def]
