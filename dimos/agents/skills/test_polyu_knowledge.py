@@ -18,10 +18,9 @@ import pytest
 
 # ruff: noqa: RUF001
 from dimos.agents.skills.polyu_knowledge import (
-    PROGRAMME_CLARIFICATION_ZH,
     PolyUKnowledgeSkill,
     identify_programme,
-    programme_question_needs_clarification,
+    is_shared_programme_question,
 )
 
 
@@ -257,19 +256,27 @@ def test_identify_programme_uses_codes_and_specific_study_cues(
     [
         ("收生分數係幾多？", True),
         ("呢個課程有咩主修？", True),
+        ("呢個課程主要讀啲咩？", True),
+        ("畢業之後有咩就業出路？", True),
+        ("讀書期間有冇實習或者海外交流機會㗎？", False),
+        ("冇讀 M1/M2 入唔入到？", False),
+        ("有冇 HKIE 專業認可？", False),
         ("JS3170 收生分數係幾多？", False),
         ("EEE 有咩課程？", False),
         ("分別介紹兩個課程", False),
-        ("HKDSE 高分科有冇額外加分？", True),
-        ("應用學習科計唔計分？", True),
-        ("公民科會唔會計入最佳五科？", True),
+        ("HKDSE 高分科有冇額外加分？", False),
+        ("應用學習科計唔計分？", False),
+        ("公民科會唔會計入最佳五科？", False),
+        ("如果我鍾意寫 Code，EEE 有冇機械人活動？", False),
+        ("國際學生點樣申請 EEE 本科課程？", False),
+        ("你係邊個？", False),
     ],
 )
-def test_programme_question_clarification_only_for_ambiguous_details(
+def test_shared_programme_question_only_matches_topics_with_two_answers(
     question: str,
     expected: bool,
 ) -> None:
-    assert programme_question_needs_clarification(question) is expected
+    assert is_shared_programme_question(question) is expected
 
 
 def test_polyu_knowledge_filters_the_other_programme_for_explicit_code(tmp_path) -> None:  # type: ignore[no-untyped-def]
@@ -277,6 +284,14 @@ def test_polyu_knowledge_filters_the_other_programme_for_explicit_code(tmp_path)
     processed.mkdir()
     (processed / "facts.zh.json").write_text("{}", encoding="utf-8")
     chunks = [
+        {
+            "id": "js3170-generic",
+            "source": "JS3170 programme handbook.docx",
+            "title": "JS3170 admission scores",
+            "programme": "JS3170",
+            "original_text": "JS3170 收生分數 入學分數 " * 10,
+            "tags": ["JS3170", "收生"],
+        },
         {
             "id": "js3170-score",
             "source": "JS3170 FAQ.docx",
@@ -308,11 +323,40 @@ def test_polyu_knowledge_filters_the_other_programme_for_explicit_code(tmp_path)
     assert "24.2" not in result
 
 
-def test_polyu_knowledge_requests_clarification_before_mixing_programmes(tmp_path) -> None:  # type: ignore[no-untyped-def]
+def test_polyu_knowledge_returns_both_programmes_for_shared_question(tmp_path) -> None:  # type: ignore[no-untyped-def]
     processed = tmp_path / "processed"
     processed.mkdir()
     (processed / "facts.zh.json").write_text("{}", encoding="utf-8")
-    (processed / "chunks.zh.jsonl").write_text("", encoding="utf-8")
+    chunks = [
+        {
+            "id": "js3170-score",
+            "source": "JS3170 FAQ.docx",
+            "title": "JS3170 FAQ",
+            "programme": "JS3170",
+            "original_text": "Q4：JS3170 收生分數係幾多？\n答：25.9。",
+            "tags": ["JS3170", "收生"],
+        },
+        {
+            "id": "js3180-score",
+            "source": "JS3180 FAQ.docx",
+            "title": "JS3180 FAQ",
+            "programme": "JS3180",
+            "original_text": "Q6：JS3180 收生分數係幾多？\n答：24.2。",
+            "tags": ["JS3180", "收生"],
+        },
+        {
+            "id": "js3180-generic",
+            "source": "JS3180 programme handbook.docx",
+            "title": "JS3180 admission scores",
+            "programme": "JS3180",
+            "original_text": "JS3180 收生分數 入學分數 " * 10,
+            "tags": ["JS3180", "收生"],
+        },
+    ]
+    (processed / "chunks.zh.jsonl").write_text(
+        "\n".join(json.dumps(chunk, ensure_ascii=False) for chunk in chunks) + "\n",
+        encoding="utf-8",
+    )
     skill = PolyUKnowledgeSkill(knowledge_dir=tmp_path)
 
     try:
@@ -321,7 +365,10 @@ def test_polyu_knowledge_requests_clarification_before_mixing_programmes(tmp_pat
     finally:
         skill.stop()
 
-    assert result == PROGRAMME_CLARIFICATION_ZH
+    assert result.index("JS3170 FAQ.docx") < result.index("JS3180 FAQ.docx")
+    assert result.index("JS3180 FAQ.docx") < result.index("programme handbook.docx")
+    assert "25.9" in result
+    assert "24.2" in result
 
 
 def test_polyu_knowledge_prioritizes_faq_question_over_generic_overlap(tmp_path) -> None:  # type: ignore[no-untyped-def]

@@ -33,10 +33,6 @@ logger = setup_logger()
 
 ProgrammeCode = Literal["JS3170", "JS3180"]
 
-PROGRAMME_CLARIFICATION_ZH = (
-    "呢條問題要先確認課程：JS3170 電機工程，定係 JS3180 資訊及人工智能工程。"
-)
-
 
 class PolyUKnowledgeConfig(ModuleConfig):
     knowledge_dir: Path = Path("/home/jiaru/infoday/knowledge")
@@ -96,8 +92,6 @@ class PolyUKnowledgeSkill(Module):
         query = question.strip()
         if not query:
             return "問題為空，無法檢索 PolyU/EEE 官方資料。"
-        if programme_question_needs_clarification(query):
-            return PROGRAMME_CLARIFICATION_ZH
         if not self._facts and not self._chunks:
             return (
                 "未搵到離線知識庫檔案。請先運行 "
@@ -227,6 +221,8 @@ class PolyUKnowledgeSkill(Module):
             if score > 0:
                 scored.append((score, chunk))
         scored.sort(key=lambda item: item[0], reverse=True)
+        if programme is None and is_shared_programme_question(query):
+            scored = _prioritize_both_programmes(scored)
         return [chunk for _score_value, chunk in scored[:limit]]
 
 
@@ -287,13 +283,46 @@ def identify_programme(question: str) -> ProgrammeCode | None:
 
 
 def programme_question_needs_clarification(question: str) -> bool:
-    """Return whether a programme-specific question lacks enough scope to answer safely."""
+    """Compatibility helper: shared questions are now answered for both programmes."""
+    return False
+
+
+def is_shared_programme_question(question: str) -> bool:
+    """Return whether an unscoped question needs separate answers for both programmes."""
     normalized = _normalize(question)
     if identify_programme(normalized) is not None or asks_for_both_programmes(normalized):
         return False
     if _has_any(normalized, _PROGRAMME_OVERVIEW_TERMS):
         return False
-    return has_programme_detail(normalized)
+    return _has_any(normalized, _SHARED_PROGRAMME_FAQ_TERMS)
+
+
+def _prioritize_both_programmes(
+    scored: list[tuple[float, dict[str, Any]]],
+) -> list[tuple[float, dict[str, Any]]]:
+    prioritized: list[tuple[float, dict[str, Any]]] = []
+    selected_ids: set[int] = set()
+    for programme in ("JS3170", "JS3180"):
+        candidates = [
+            (index, item)
+            for index, item in enumerate(scored)
+            if programme in _chunk_programmes(item[1])
+        ]
+        faq_candidate = next(
+            (
+                candidate
+                for candidate in candidates
+                if "faq" in str(candidate[1][1].get("source", "")).casefold()
+            ),
+            None,
+        )
+        selected = faq_candidate or (candidates[0] if candidates else None)
+        if selected is not None:
+            index, item = selected
+            prioritized.append(item)
+            selected_ids.add(index)
+    prioritized.extend(item for index, item in enumerate(scored) if index not in selected_ids)
+    return prioritized
 
 
 def has_programme_detail(question: str) -> bool:
@@ -510,6 +539,29 @@ _PROGRAMME_OVERVIEW_TERMS = (
     "what programmes",
     "which programmes",
     "programme overview",
+)
+
+_SHARED_PROGRAMME_FAQ_TERMS = (
+    "主要讀",
+    "讀咩",
+    "學啲咩",
+    "課程內容",
+    "programme content",
+    "收生",
+    "收幾多分",
+    "入學要求",
+    "admission score",
+    "entry requirement",
+    "主修",
+    "major",
+    "分流",
+    "做咩工",
+    "就業",
+    "出路",
+    "起薪",
+    "畢業人工",
+    "career",
+    "employment",
 )
 
 _CONVERSATIONAL_RANKING_STOPWORDS = {

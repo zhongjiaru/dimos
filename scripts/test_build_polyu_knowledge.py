@@ -87,6 +87,26 @@ def test_js3180_q14_to_q16_are_tagged_as_eee_general_knowledge() -> None:
     assert all("JS3180" not in chunk["tags"] for chunk in chunks[1:])
 
 
+def test_general_faq_questions_are_not_assigned_to_a_programme() -> None:
+    document = Document(
+        source_id="docx:general_qa.docx",
+        source_type="docx",
+        source="general_qa.docx",
+        title="常見問題（FAQ）– general",
+        text=(
+            "Q2：我中學冇讀 M1 或 M2，入唔入到？\n答：唔係必修條件。\n"
+            "Q8：讀書期間有冇實習或者海外交流機會？\n答：兩個課程都有。"
+        ),
+    )
+
+    chunks = _chunk_document(document)
+
+    assert [chunk["programme"] for chunk in chunks] == [None, None]
+    assert all("JS3170" not in chunk["tags"] for chunk in chunks)
+    assert all("JS3180" not in chunk["tags"] for chunk in chunks)
+    assert chunks[0]["retrieval_questions"] == ["我中學冇讀 M1 或 M2，入唔入到？"]
+
+
 def test_newest_dated_faq_replaces_older_programme_version(tmp_path) -> None:
     sources = [
         tmp_path / "general.docx",

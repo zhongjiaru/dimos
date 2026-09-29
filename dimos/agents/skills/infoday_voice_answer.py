@@ -35,7 +35,7 @@ from dimos.agents.skills.polyu_knowledge import (
     asks_for_both_programmes,
     has_programme_detail,
     identify_programme,
-    programme_question_needs_clarification,
+    is_shared_programme_question,
 )
 from dimos.core.core import rpc
 from dimos.core.module import Module, ModuleConfig
@@ -71,10 +71,16 @@ Do not repeat or spell out a full English programme or award title unless the us
 Base the answer only on the provided official offline knowledge context.
 Treat JS3170 and JS3180 as separate programmes. Never combine their admission scores,
 major-allocation rules, career figures, or other programme-specific facts.
-If a specific programme question does not identify which programme it means, ask whether the
-user means JS3170 Electrical Engineering or JS3180 Information and Artificial Intelligence
-Engineering; do not guess. If the user broadly asks which EEE programmes are available or asks
-to compare both, briefly introduce both programmes instead of asking for clarification.
+When an unscoped question has separate answers for JS3170 and JS3180, answer both directly:
+state the JS3170 answer first, then the JS3180 answer, without asking the user to choose. These
+topics include programme content, admission requirements and scores, careers and salary figures,
+or major allocation. M1/M2 and ICT prerequisites, HKIE recognition,
+internships and overseas exchange, HKDSE scoring, and EEE-wide activities have shared general
+answers, so answer those directly without asking the user to choose a programme. Do not ask
+merely because a question mentions EEE, study, admissions, or another programme-related detail.
+Answer a unique or EEE-general question directly from its matching context. If the user broadly
+asks which EEE programmes are available or asks to compare both, briefly introduce both programmes
+instead of asking for clarification.
 If the context is insufficient, say briefly in Cantonese that the current official offline materials do not include that detail, then invite the user to choose a safe stationary robot demonstration such as waving or dancing.
 Only offer the action; do not claim that it has happened or trigger it before the user explicitly chooses one.
 Answer in exactly two short spoken sentences, ideally under 80 Chinese characters in total.
@@ -87,9 +93,6 @@ INFODAY_IDENTITY_ANSWER = (
 )
 INFODAY_REPEAT_REQUEST = "唔好意思，我啱啱聽唔清楚，可以麻煩你再講一次嗎？"
 INFODAY_ERROR_RESPONSE = "唔好意思，我而家答唔到呢條問題。你可以再講一次，或者問我 EEE 嘅課程。"
-INFODAY_PROGRAMME_CLARIFICATION = (
-    "你想了解 JS3170 電機工程，定係 JS3180 資訊及人工智能工程？你揀一個，我再答你頭先嗰條問題。"
-)
 _IDENTITY_TERMS = (
     "你是誰",
     "你是谁",
@@ -763,10 +766,7 @@ def _prepare_programme_turn(
     pending_question: str | None,
     question: str,
 ) -> tuple[str, str | None, str | None]:
-    """Resolve programme clarification turns before retrieval and response generation."""
-    if programme_question_needs_clarification(question):
-        return question, question, INFODAY_PROGRAMME_CLARIFICATION
-
+    """Resolve programme scope before retrieval and response generation."""
     programme = _programme_selection(question)
     asks_for_both = asks_for_both_programmes(question)
     if pending_question is not None and not has_programme_detail(question):
@@ -777,6 +777,12 @@ def _prepare_programme_turn(
             effective = f"{pending_question}\n用戶要求分別比較 JS3170 同 JS3180。"
             return effective, None, None
 
+    if is_shared_programme_question(question):
+        return (
+            f"{question}\n用戶未指定課程；請先答 JS3170，再答 JS3180，分開說明。",
+            None,
+            None,
+        )
     if asks_for_both:
         return f"{question}\n請分別比較 JS3170 同 JS3180。", None, None
     return question, None, None

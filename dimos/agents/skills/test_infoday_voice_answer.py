@@ -21,7 +21,6 @@ from dimos.agents.skills.infoday_voice_answer import (
     INFODAY_CANTONESE_RESPONSE_PROMPT,
     INFODAY_ERROR_RESPONSE,
     INFODAY_IDENTITY_ANSWER,
-    INFODAY_PROGRAMME_CLARIFICATION,
     INFODAY_REPEAT_REQUEST,
     InfodayVoiceAnswerSkill,
     _fast_infoday_answer,
@@ -57,16 +56,10 @@ def test_response_prompt_keeps_programme_specific_facts_separate() -> None:
     assert "briefly introduce both programmes" in INFODAY_CANTONESE_RESPONSE_PROMPT
 
 
-def test_programme_turn_preserves_ambiguous_question_for_the_user_selection() -> None:
+def test_programme_turn_expands_shared_question_for_both_programmes() -> None:
     effective, pending, clarification = _prepare_programme_turn(None, "收生分數係幾多？")
 
-    assert effective == "收生分數係幾多？"
-    assert pending == "收生分數係幾多？"
-    assert clarification == INFODAY_PROGRAMME_CLARIFICATION
-
-    effective, pending, clarification = _prepare_programme_turn(pending, "JS3170")
-
-    assert effective == "收生分數係幾多？\n用戶已確認想了解 JS3170。"
+    assert effective == ("收生分數係幾多？\n用戶未指定課程；請先答 JS3170，再答 JS3180，分開說明。")
     assert pending is None
     assert clarification is None
 
@@ -79,20 +72,56 @@ def test_programme_turn_keeps_broad_overview_for_both_programmes() -> None:
     assert clarification is None
 
 
-def test_infoday_voice_answer_asks_for_programme_before_lookup(mocker) -> None:  # type: ignore[no-untyped-def]
-    skill = InfodayVoiceAnswerSkill()
+def test_programme_turn_only_expands_topics_with_two_answers() -> None:
+    effective, pending, clarification = _prepare_programme_turn(None, "HKDSE 高分科有冇額外加分？")
+
+    assert effective == "HKDSE 高分科有冇額外加分？"
+    assert pending is None
+    assert clarification is None
+
+    effective, pending, clarification = _prepare_programme_turn(
+        None, "讀書期間有冇實習或者海外交流機會㗎？"
+    )
+
+    assert effective == "讀書期間有冇實習或者海外交流機會㗎？"
+    assert pending is None
+    assert clarification is None
+
+    effective, pending, clarification = _prepare_programme_turn(None, "呢個課程主要讀啲咩？")
+
+    assert effective == (
+        "呢個課程主要讀啲咩？\n用戶未指定課程；請先答 JS3170，再答 JS3180，分開說明。"
+    )
+    assert pending is None
+    assert clarification is None
+
+
+def test_infoday_voice_answer_answers_both_programmes_without_clarification(mocker) -> None:  # type: ignore[no-untyped-def]
+    skill = InfodayVoiceAnswerSkill(min_tts_chunk_chars=8, max_tts_chunk_chars=40)
     skill._client = mocker.Mock()
     skill.polyu_knowledge = mocker.Mock()
-    speak = mocker.patch.object(skill, "_speak_locked")
+    skill.polyu_knowledge.search_polyu_knowledge.return_value = "JS3170 context\nJS3180 context"
+    skill.infoday_answer = mocker.Mock()
+    skill.operator_audio = mocker.Mock()
+    mocker.patch.object(
+        skill,
+        "_stream_response",
+        return_value=iter(["JS3170 收生分數係 25.9。JS3180 收生分數係 24.2。"]),
+    )
+    frame = AudioEvent(np.array([1], dtype=np.int16), 24000, 1.0, 1)
+    tts_node = mocker.Mock()
+    tts_node.iter_audio_events.return_value = [frame]
+    mocker.patch.object(skill, "_make_tts_node", return_value=tts_node)
 
     try:
         result = skill.answer_infoday_question("收生分數係幾多？")
     finally:
         skill.stop()
 
-    assert result == "Asked user to choose an EEE programme: 收生分數係幾多？"
-    speak.assert_called_once_with(INFODAY_PROGRAMME_CLARIFICATION)
-    skill.polyu_knowledge.search_polyu_knowledge.assert_not_called()
+    effective = "收生分數係幾多？\n用戶未指定課程；請先答 JS3170，再答 JS3180，分開說明。"
+    assert result == "Answered Info Day question in Cantonese: 收生分數係幾多？"
+    skill.polyu_knowledge.search_polyu_knowledge.assert_called_once_with(effective)
+    skill._stream_response.assert_called_once_with(effective, "JS3170 context\nJS3180 context")
 
 
 def test_text_chunker_splits_on_comma_after_minimum() -> None:
