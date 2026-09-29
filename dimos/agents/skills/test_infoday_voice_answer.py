@@ -839,6 +839,16 @@ def test_fast_answer_does_not_discard_substantive_questions(question: str) -> No
     assert _fast_infoday_answer(question) is None
 
 
+@pytest.mark.parametrize(
+    "question",
+    ["你係邊個？", "你叫咩名？", "你叫什么名字？", "What's your name?", "你好"],
+)
+def test_fast_identity_answer_introduces_named_persona(question: str) -> None:
+    assert _fast_infoday_answer(question) == (
+        "我係理大 EEE 嘅機械狗電電，好開心喺開放日見到你！你想同我傾下 EEE 課程，定係睇我表演？"
+    )
+
+
 def test_infoday_voice_answer_fast_identity_skips_response_llm(mocker) -> None:  # type: ignore[no-untyped-def]
     """Identity answers use the low-latency fixed phrase path."""
     skill = InfodayVoiceAnswerSkill(min_tts_chunk_chars=4, max_tts_chunk_chars=12)

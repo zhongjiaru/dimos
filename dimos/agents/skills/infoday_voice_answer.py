@@ -104,7 +104,7 @@ Avoid generic endings such as 仲有咩可以幫你. Vary the invitation to fit 
 """.strip()
 
 INFODAY_IDENTITY_ANSWER = (
-    "我係理大 EEE 開放日嘅 Go2 機械人講解助手。你想問下 EEE 嘅課程，定係睇我做個動作？"
+    "我係理大 EEE 嘅機械狗電電，好開心喺開放日見到你！你想同我傾下 EEE 課程，定係睇我表演？"
 )
 INFODAY_REPEAT_REQUEST = "唔好意思，我啱啱聽唔清楚，可以麻煩你再講一次嗎？"
 INFODAY_ERROR_RESPONSE = "唔好意思，我而家答唔到呢條問題。你可以再講一次，或者問我 EEE 嘅課程。"
@@ -123,6 +123,14 @@ _IDENTITY_TERMS = (
     "介绍你自己",
     "介紹一下你自己",
     "介绍一下你自己",
+    "你叫咩名",
+    "你叫乜名",
+    "你個名係咩",
+    "你个名系咩",
+    "你叫什麼名字",
+    "你叫什么名字",
+    "what is your name",
+    "what's your name",
     "who are you",
     "introduce yourself",
 )
