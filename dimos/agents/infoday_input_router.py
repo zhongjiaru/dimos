@@ -132,7 +132,7 @@ class InfodayInputRouter(Module):
         elif not cleaned:
             route = InputRoute.REPEAT
         else:
-            route = classify_infoday_input(original)
+            route = classify_infoday_input(cleaned)
         logger.info("Routed human input", route=route.value, text=cleaned)
         if route is InputRoute.DROP:
             return

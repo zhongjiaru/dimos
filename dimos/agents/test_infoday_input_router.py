@@ -80,6 +80,8 @@ def test_classifier_routes_clear_infoday_questions_directly(text: str) -> None:
     ("text", "expected"),
     [
         ("向前行兩米", InputRoute.ACTION),
+        ("跳个舞嚟睇下。", InputRoute.ACTION),
+        ("跳正舞。", InputRoute.ACTION),
         ("stop", InputRoute.ACTION),
         ("follow that person", InputRoute.ACTION),
         ("帶我去 EEE office", InputRoute.AGENT),
@@ -170,6 +172,19 @@ def test_router_sends_question_without_asr_prompt_to_voice_answer(
     router.human_input.publish.assert_not_called()
 
 
+def test_router_classifies_action_after_removing_asr_prompt(router_factory) -> None:  # type: ignore[no-untyped-def]
+    router = router_factory(asr_initial_prompt=ASR_INITIAL_PROMPT)
+    action_request = "跳个舞嚟睇下。"
+
+    router._on_input(f"{ASR_INITIAL_PROMPT}{action_request}")
+    router._answer_queue.put_nowait(None)
+    router._run_answers()
+
+    router.action.perform_robot_action.assert_called_once_with(action_request)
+    router.human_input.publish.assert_not_called()
+    router.voice_answer.answer_infoday_question.assert_not_called()
+
+
 def test_router_asks_user_to_repeat_when_asr_returns_only_prompt(
     router_factory,
 ) -> None:  # type: ignore[no-untyped-def]
@@ -206,6 +221,22 @@ def test_router_directly_runs_action_through_worker(router_factory) -> None:  # 
     router.action.perform_robot_action.assert_called_once_with("立即停低")
     router.action.start_attention_action.assert_not_called()
     router.human_input.publish.assert_not_called()
+    router.voice_answer.answer_infoday_question.assert_not_called()
+
+
+@pytest.mark.parametrize("user_text", ["跳个舞嚟睇下。", "跳正舞。"])
+def test_router_sends_dance_asr_variants_to_action_worker(
+    router_factory,
+    user_text: str,
+) -> None:  # type: ignore[no-untyped-def]
+    router = router_factory()
+
+    router._on_input(user_text)
+    router._answer_queue.put_nowait(None)
+    router._run_answers()
+
+    router.action.perform_robot_action.assert_called_once_with(user_text)
+    router.action.start_attention_action.assert_not_called()
     router.voice_answer.answer_infoday_question.assert_not_called()
 
 

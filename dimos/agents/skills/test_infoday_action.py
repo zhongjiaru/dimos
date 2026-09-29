@@ -46,6 +46,17 @@ def test_infoday_action_speaks_and_runs_safe_stationary_command(action_skill) ->
     ]
 
 
+@pytest.mark.parametrize("user_text", ["跳个舞嚟睇下。", "跳正舞。", "跳支舞俾我睇"])
+def test_infoday_action_accepts_cantonese_and_asr_dance_variants(
+    action_skill,
+    user_text: str,
+) -> None:  # type: ignore[no-untyped-def]
+    result = action_skill.perform_robot_action(user_text)
+
+    assert result == "Completed Info Day action: dance"
+    action_skill.go2.sport_command.assert_called_once_with(SPORT_CMD["Dance1"])
+
+
 def test_attention_action_starts_silently_and_rotates_safe_actions(
     action_skill,
     mocker,

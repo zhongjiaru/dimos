@@ -90,7 +90,7 @@ _ACTION_SPECS: dict[InfodayAction, _ActionSpec] = {
         8.0,
         "好呀，我跳隻舞俾你睇！",
         "跳舞",
-        (r"\bdance\b", r"跳舞|跳隻舞|跳只舞"),
+        (r"\bdance\b", r"跳(?:返|一)?(?:隻|只|個|个|支|正)?舞"),
     ),
     "wiggle_hips": _ActionSpec(
         "WiggleHips",
