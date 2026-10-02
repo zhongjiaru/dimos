@@ -68,6 +68,8 @@ Do not use Mainland Mandarin written style. Avoid phrases like 因此、此外�
 Use concise spoken Cantonese phrases like 呢個、可以、如果你想知、我哋、會、係.
 Keep official English names unchanged when needed, for example PolyU, EEE, BEng(Hons), BSc(Hons).
 Write programme and subject codes in their official compact form, for example JS3180 or CLC1104C.
+Always write JUPAS in this exact compact uppercase form; never split it into pieces such as JU
+and PAS. Treat HKDSE and DSE as the same qualification, and prefer the shorter DSE in spoken answers.
 Do not use slash punctuation in spoken answers. Write natural Cantonese connectors such as 同,
 或者, or 至 instead.
 Optimize for low speech latency: start with a short, direct Cantonese answer and keep the first sentence to at most 45 characters whenever possible.
@@ -87,7 +89,7 @@ When an unscoped question has separate answers for JS3170 and JS3180, answer bot
 state the JS3170 answer first, then the JS3180 answer, without asking the user to choose. These
 topics include programme content, admission requirements and scores, careers and salary figures,
 or major allocation. M1/M2 and ICT prerequisites, HKIE recognition,
-internships and overseas exchange, HKDSE scoring, and EEE-wide activities have shared general
+internships and overseas exchange, DSE scoring, and EEE-wide activities have shared general
 answers, so answer those directly without asking the user to choose a programme. Do not ask
 merely because a question mentions EEE, study, admissions, or another programme-related detail.
 Answer a unique or EEE-general question directly from its matching context. If the user broadly
@@ -848,6 +850,11 @@ _SPOKEN_ENGLISH_NAMES: tuple[tuple[re.Pattern[str], str], ...] = (
     ),
     (re.compile(r"Information\s+Security", flags=re.IGNORECASE), "資訊保安"),
 )
+_SPOKEN_ACRONYMS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"(?<![A-Za-z])JUPAS(?![A-Za-z])", flags=re.IGNORECASE), "Jupas"),
+    (re.compile(r"(?<![A-Za-z])HKDSE(?![A-Za-z])", flags=re.IGNORECASE), "D S E"),
+    (re.compile(r"(?<![A-Za-z])DSE(?![A-Za-z])", flags=re.IGNORECASE), "D S E"),
+)
 
 
 def _text_for_speech(text: str) -> str:
@@ -855,6 +862,8 @@ def _text_for_speech(text: str) -> str:
 
     speech_text = text
     for pattern, replacement in _SPOKEN_ENGLISH_NAMES:
+        speech_text = pattern.sub(replacement, speech_text)
+    for pattern, replacement in _SPOKEN_ACRONYMS:
         speech_text = pattern.sub(replacement, speech_text)
     speech_text = _HKD_AMOUNT_RE.sub(_spoken_hkd_amount, speech_text)
     speech_text = _NUMERIC_SLASH_RE.sub("至", speech_text)

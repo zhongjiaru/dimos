@@ -17,6 +17,7 @@ from __future__ import annotations
 # ruff: noqa: RUF001
 from collections.abc import Iterable
 import json
+import math
 from pathlib import Path
 import re
 from typing import Any, Literal
@@ -111,7 +112,11 @@ class PolyUKnowledgeSkill(Module):
         if chunk_hits:
             rendered_chunks = []
             for index, chunk in enumerate(chunk_hits, start=1):
-                text = str(chunk.get("original_text", ""))[: self.config.max_chunk_chars]
+                text = _relevant_excerpt(
+                    str(chunk.get("original_text", "")),
+                    query,
+                    self.config.max_chunk_chars,
+                )
                 rendered_chunks.append(
                     "\n".join(
                         [
@@ -195,7 +200,7 @@ class PolyUKnowledgeSkill(Module):
         ranking_tokens = _ranking_tokens(tokens, programme)
         if ranking_tokens:
             tokens = ranking_tokens
-        scored: list[tuple[float, dict[str, Any]]] = []
+        candidates: list[tuple[dict[str, Any], str]] = []
         for chunk in self._chunks:
             chunk_programmes = _chunk_programmes(chunk)
             if programme is not None and chunk_programmes and programme not in chunk_programmes:
@@ -214,10 +219,29 @@ class PolyUKnowledgeSkill(Module):
                     ]
                 )
             )
-            score = _score(tokens, haystack)
+            candidates.append((chunk, haystack))
+
+        document_count = len(candidates)
+        document_frequencies = {
+            token: sum(token.casefold() in haystack for _chunk, haystack in candidates)
+            for token in tokens
+        }
+        scored: list[tuple[float, dict[str, Any]]] = []
+        for chunk, haystack in candidates:
+            score = _score(
+                tokens,
+                haystack,
+                document_frequencies=document_frequencies,
+                document_count=document_count,
+            )
             faq_question = _faq_question_line(str(chunk.get("original_text", "")))
             if faq_question:
-                score += 2.0 * _score(tokens, _normalize(faq_question))
+                score += 2.0 * _score(
+                    tokens,
+                    _normalize(faq_question),
+                    document_frequencies=document_frequencies,
+                    document_count=document_count,
+                )
             if score > 0:
                 scored.append((score, chunk))
         scored.sort(key=lambda item: item[0], reverse=True)
@@ -239,6 +263,8 @@ def _programme_hits(label: str, data: dict[str, Any]) -> list[str]:
 
 def _normalize(text: str) -> str:
     normalized = unicodedata.normalize("NFKC", text).casefold()
+    normalized = re.sub(r"(?<![a-z0-9])iaie(?![a-z0-9])", "js3180", normalized)
+    normalized = re.sub(r"(?<![a-z0-9])ee(?![a-z0-9])", "js3170", normalized)
     normalized = re.sub(r"(?<![a-z0-9])三\s*一\s*八\s*零(?![a-z0-9])", "js3180", normalized)
     normalized = re.sub(r"(?<![a-z0-9])三千一百八十(?![a-z0-9])", "js3180", normalized)
     normalized = re.sub(r"(?<![a-z0-9])三\s*一\s*七\s*零(?![a-z0-9])", "js3170", normalized)
@@ -420,13 +446,78 @@ def _query_tokens(query: str) -> list[str]:
     return sorted(token for token in tokens if len(token) > 1)
 
 
-def _score(tokens: list[str], haystack: str) -> float:
+def _score(
+    tokens: list[str],
+    haystack: str,
+    *,
+    document_frequencies: dict[str, int] | None = None,
+    document_count: int = 0,
+) -> float:
     score = 0.0
     for token in tokens:
         count = haystack.count(token.casefold())
         if count:
-            score += 1.0 + min(count, 5) * 0.4
+            weight = 1.0
+            if document_frequencies is not None and document_count:
+                frequency = document_frequencies.get(token, 0)
+                weight += math.log((document_count + 1) / (frequency + 1))
+            score += weight * (1.0 + min(count, 5) * 0.4)
     return score
+
+
+def _relevant_excerpt(text: str, query: str, max_chars: int) -> str:
+    """Return complete query-relevant lines instead of a blind prefix slice."""
+    if len(text) <= max_chars:
+        return text
+
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    tokens = _ranking_tokens(_query_tokens(query), identify_programme(query))
+    ranked = sorted(
+        ((_score(tokens, _normalize(line)), index) for index, line in enumerate(lines)),
+        reverse=True,
+    )
+    anchors = [index for score, index in ranked if score > 0]
+    if not anchors:
+        return text[:max_chars]
+
+    selected: set[int] = set()
+    selected_chars = 0
+    for anchor in anchors:
+        for index in (anchor, anchor + 1, anchor - 1):
+            if index < 0 or index >= len(lines) or index in selected:
+                continue
+            line = lines[index]
+            separator_budget = 5 if selected else 0
+            if len(line) + selected_chars + separator_budget > max_chars:
+                if not selected:
+                    return _line_excerpt(line, tokens, max_chars)
+                continue
+            selected.add(index)
+            selected_chars += len(line) + separator_budget
+
+    rendered: list[str] = []
+    previous: int | None = None
+    for index in sorted(selected):
+        if previous is not None and index != previous + 1:
+            rendered.append("[…]")
+        rendered.append(lines[index])
+        previous = index
+    return "\n".join(rendered)[:max_chars]
+
+
+def _line_excerpt(line: str, tokens: list[str], max_chars: int) -> str:
+    normalized = _normalize(line)
+    positions = [normalized.find(token) for token in tokens if normalized.find(token) >= 0]
+    if not positions:
+        return line[:max_chars]
+    match_position = min(positions)
+    start = max(0, match_position - max_chars // 3)
+    end = min(len(line), start + max_chars)
+    start = max(0, end - max_chars)
+    prefix = "[…]" if start else ""
+    suffix = "[…]" if end < len(line) else ""
+    available = max_chars - len(prefix) - len(suffix)
+    return f"{prefix}{line[start : start + available]}{suffix}"
 
 
 _ALIASES = {
@@ -486,6 +577,38 @@ _ALIASES = {
     "分数": ["分數", "收生", "最佳", "加權"],
     "幾多分": ["分數", "收生", "最佳五科", "加權", "jupas"],
     "收分": ["分數", "收生", "最佳五科", "加權", "jupas"],
+    "scholarship": [
+        "獎學金",
+        "entry scholarship",
+        "academic scholarships",
+        "departmental entry academic scholarships",
+    ],
+    "獎學金": [
+        "scholarship",
+        "entry scholarship",
+        "academic scholarships",
+        "departmental entry academic scholarships",
+    ],
+    "ju pas": ["jupas"],
+    "j u p a s": ["jupas"],
+    "dse": ["hkdse"],
+    "hkdse": ["dse"],
+    "d s e": ["dse", "hkdse"],
+    "d a c": ["dse", "hkdse"],
+    "terminate": [
+        "deregistered",
+        "deregistration",
+        "de-register",
+        "academic probation",
+        "1.70",
+    ],
+    "退學": [
+        "deregistered",
+        "deregistration",
+        "de-register",
+        "academic probation",
+        "1.70",
+    ],
     "js3180": ["js3180", "3180", "資訊", "人工智能", "工程"],
     "js3170": ["js3170", "3170", "電機", "工程"],
 }
@@ -565,6 +688,16 @@ _SHARED_PROGRAMME_FAQ_TERMS = (
 )
 
 _CONVERSATIONAL_RANKING_STOPWORDS = {
+    "如果",
+    "果我",
+    "嘅話",
+    "係咪",
+    "會唔",
+    "唔會",
+    "會有",
+    "俾我",
+    "俾人",
+    "先會",
     "入唔",
     "唔入",
     "入到",
@@ -613,6 +746,10 @@ _SIMPLIFIED_TO_HK_TRADITIONAL = tuple(
             "区别": "分別",
             "分别": "分別",
             "分数": "分數",
+            "奖学金": "獎學金",
+            "退学": "退學",
+            "会": "會",
+            "读": "讀",
             "几多": "幾多",
             "噶": "㗎",
             "有無": "有冇",

@@ -263,6 +263,7 @@ all_modules = {
     "point-lio": "dimos.hardware.sensors.lidar.pointlio.module.PointLio",
     "pointlio-recorder": "dimos.hardware.sensors.lidar.pointlio.recorder.PointlioRecorder",
     "poly-u-knowledge-skill": "dimos.agents.skills.polyu_knowledge.PolyUKnowledgeSkill",
+    "push-to-talk-input": "dimos.agents.push_to_talk_input.PushToTalkInput",
     "quest-teleop-module": "dimos.teleop.quest.quest_teleop_module.QuestTeleopModule",
     "ray-tracing-voxel-map": "dimos.mapping.ray_tracing.module.RayTracingVoxelMap",
     "real-sense-camera": "dimos.hardware.sensors.camera.realsense.camera.RealSenseCamera",

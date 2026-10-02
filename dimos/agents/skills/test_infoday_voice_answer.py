@@ -49,6 +49,14 @@ def test_response_prompt_requests_a_short_direct_first_sentence() -> None:
     assert "full English programme or award title" in INFODAY_CANTONESE_RESPONSE_PROMPT
 
 
+def test_response_prompt_keeps_common_admission_acronyms_compact() -> None:
+    prompt = INFODAY_CANTONESE_RESPONSE_PROMPT
+
+    assert "Always write JUPAS in this exact compact uppercase form" in prompt
+    assert "Treat HKDSE and DSE as the same qualification" in prompt
+    assert "prefer the shorter DSE" in prompt
+
+
 def test_response_prompt_speaks_as_the_go2_robot_in_first_person() -> None:
     assert '"我" refers to the robot' in INFODAY_CANTONESE_RESPONSE_PROMPT
     assert 'say "叫我跳隻舞" instead of "叫我隻機械狗跳隻舞"' in (INFODAY_CANTONESE_RESPONSE_PROMPT)
@@ -317,6 +325,12 @@ def test_text_chunker_splits_on_comma_after_minimum() -> None:
 def test_tts_expands_programme_code_digits_without_changing_other_numbers() -> None:
     assert _text_for_speech("JS3180 參考分數係 23.4 分。") == (
         "J S 三 一 八 零 參考分數係 23.4 分。"
+    )
+
+
+def test_tts_pronounces_jupas_as_one_word_and_prefers_dse() -> None:
+    assert _text_for_speech("JUPAS 申請人要睇 HKDSE 或 DSE 成績。") == (
+        "Jupas 申請人要睇 D S E 或 D S E 成績。"
     )
 
 

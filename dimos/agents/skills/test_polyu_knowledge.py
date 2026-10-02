@@ -222,6 +222,145 @@ def test_polyu_knowledge_matches_spoken_code_and_script_variants(
     assert "JS3180_FAQ.docx" in result
 
 
+def test_polyu_knowledge_prioritizes_topic_over_conversational_overlap(
+    tmp_path,
+) -> None:  # type: ignore[no-untyped-def]
+    processed = tmp_path / "processed"
+    processed.mkdir()
+    (processed / "facts.zh.json").write_text("{}", encoding="utf-8")
+    chunks = [
+        {
+            "id": "major-allocation",
+            "source": "major-allocation.docx",
+            "title": "JS3180 主修分配",
+            "original_text": ("Q：如果我入到 JS3180，揀主修會唔會睇 GPA？\n答：主修分配不設配額。"),
+            "tags": ["JS3180", "主修"],
+        },
+        {
+            "id": "entry-scholarship",
+            "source": "entry-scholarship.html",
+            "title": "Entry Scholarship",
+            "search_text": "HKDSE JUPAS entry scholarship 獎學金",
+            "original_text": (
+                "EEE provides Departmental Entry Academic Scholarships for "
+                "JUPAS applicants with outstanding HKDSE performance."
+            ),
+            "tags": ["HKDSE", "獎學金"],
+        },
+    ]
+    (processed / "chunks.zh.jsonl").write_text(
+        "\n".join(json.dumps(chunk, ensure_ascii=False) for chunk in chunks) + "\n",
+        encoding="utf-8",
+    )
+    skill = PolyUKnowledgeSkill(knowledge_dir=tmp_path, max_chunks=1)
+
+    try:
+        skill.start()
+        result = skill.search_polyu_knowledge(
+            "如果我 D A C 有四粒星嘅話，學校會唔會有 scholarship 俾我？"
+        )
+    finally:
+        skill.stop()
+
+    assert "entry-scholarship.html" in result
+    assert "major-allocation.docx" not in result
+
+
+@pytest.mark.parametrize("question", ["HKDSE 點計分？", "D S E 點計分？"])
+def test_polyu_knowledge_treats_hkdse_and_spoken_dse_as_equivalent(
+    tmp_path,
+    question: str,
+) -> None:  # type: ignore[no-untyped-def]
+    processed = tmp_path / "processed"
+    processed.mkdir()
+    (processed / "facts.zh.json").write_text("{}", encoding="utf-8")
+    chunk = {
+        "id": "dse-scoring",
+        "source": "dse-scoring.docx",
+        "title": "Public examination scoring",
+        "original_text": "DSE level 5** is converted to 8.5 points.",
+        "tags": ["入學"],
+    }
+    (processed / "chunks.zh.jsonl").write_text(
+        json.dumps(chunk, ensure_ascii=False) + "\n", encoding="utf-8"
+    )
+    skill = PolyUKnowledgeSkill(knowledge_dir=tmp_path, max_chunks=1)
+
+    try:
+        skill.start()
+        result = skill.search_polyu_knowledge(question)
+    finally:
+        skill.stop()
+
+    assert "DSE level 5** is converted to 8.5 points" in result
+
+
+@pytest.mark.parametrize("question", ["Jupas 點申請？", "JU PAS 點申請？"])
+def test_polyu_knowledge_matches_jupas_spoken_as_one_word_or_split_by_asr(
+    tmp_path,
+    question: str,
+) -> None:  # type: ignore[no-untyped-def]
+    processed = tmp_path / "processed"
+    processed.mkdir()
+    (processed / "facts.zh.json").write_text("{}", encoding="utf-8")
+    chunk = {
+        "id": "jupas-application",
+        "source": "jupas-application.docx",
+        "title": "Application route",
+        "original_text": "JUPAS applicants submit their application through the JUPAS system.",
+        "tags": ["入學"],
+    }
+    (processed / "chunks.zh.jsonl").write_text(
+        json.dumps(chunk, ensure_ascii=False) + "\n", encoding="utf-8"
+    )
+    skill = PolyUKnowledgeSkill(knowledge_dir=tmp_path, max_chunks=1)
+
+    try:
+        skill.start()
+        result = skill.search_polyu_knowledge(question)
+    finally:
+        skill.stop()
+
+    assert "submit their application through the JUPAS system" in result
+
+
+def test_polyu_knowledge_extracts_relevant_evidence_from_end_of_long_chunk(
+    tmp_path,
+) -> None:  # type: ignore[no-untyped-def]
+    processed = tmp_path / "processed"
+    processed.mkdir()
+    (processed / "facts.zh.json").write_text("{}", encoding="utf-8")
+    irrelevant_prefix = "General programme administration information. " * 20
+    chunk = {
+        "id": "academic-progression",
+        "source": "programme-requirements.docx",
+        "title": "Academic progression rules",
+        "original_text": (
+            f"{irrelevant_prefix}\n"
+            "A student's GPA lower than 1.70 for three consecutive semesters "
+            "is grounds for deregistration from the programme."
+        ),
+        "tags": ["本科", "課程"],
+    }
+    (processed / "chunks.zh.jsonl").write_text(
+        json.dumps(chunk, ensure_ascii=False) + "\n", encoding="utf-8"
+    )
+    skill = PolyUKnowledgeSkill(
+        knowledge_dir=tmp_path,
+        max_chunks=1,
+        max_chunk_chars=240,
+    )
+
+    try:
+        skill.start()
+        result = skill.search_polyu_knowledge("GPA 幾低會俾人 terminate？")
+    finally:
+        skill.stop()
+
+    assert "lower than 1.70 for three consecutive semesters" in result
+    assert irrelevant_prefix not in result
+
+
 def test_polyu_knowledge_reports_missing_files(tmp_path) -> None:  # type: ignore[no-untyped-def]
     skill = PolyUKnowledgeSkill(knowledge_dir=tmp_path)
 
@@ -269,6 +408,10 @@ def test_polyu_knowledge_no_match_does_not_expose_internal_storage(tmp_path) -> 
     ("question", "expected"),
     [
         ("JS3170 收生分數係幾多？", "JS3170"),
+        ("3170 收生分數係幾多？", "JS3170"),
+        ("EE 收生分數係幾多？", "JS3170"),
+        ("3180 有咩主修？", "JS3180"),
+        ("IAIE 有咩主修？", "JS3180"),
         ("三一八零有咩主修？", "JS3180"),
         ("電機工程點樣分流？", "JS3170"),
         ("冇讀 ICT 可唔可以申請？", "JS3180"),

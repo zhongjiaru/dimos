@@ -20,10 +20,10 @@ from unitree_webrtc_connect.constants import WebRTCConnectionMethod
 from dimos.agents.infoday_input_router import InfodayInputRouter
 from dimos.agents.mcp.mcp_client import McpClient
 from dimos.agents.mcp.mcp_server import McpServer
+from dimos.agents.push_to_talk_input import PushToTalkInput
 from dimos.agents.skills.infoday_action import InfodayActionSkill
 from dimos.agents.skills.infoday_voice_answer import InfodayVoiceAnswerSkill
 from dimos.agents.skills.polyu_knowledge import PolyUKnowledgeSkill
-from dimos.agents.web_human_input import WebInput
 from dimos.core.coordination.blueprints import autoconnect
 from dimos.robot.unitree.audio_track import GO2_AUDIO_SAMPLE_RATE
 from dimos.robot.unitree.go2.connection import GO2Connection
@@ -31,7 +31,7 @@ from dimos.teleop.hosted.go2_audio_bridge import Go2AudioBridgeModule
 
 INFODAY_STT_INITIAL_PROMPT = (
     "香港理工大學，理大，PolyU，電機及電子工程學系，EEE，開放日，"
-    "JS3170，JS3180，JUPAS，HKDSE，M1，M2，ICT，HKIE，"
+    "JS3170，3170，EE，JS3180，3180，IAIE，JUPAS，Jupas，HKDSE，DSE，M1，M2，ICT，HKIE，"
     "電機工程，交通系統工程，資訊及人工智能工程，電子系統及物聯網，"
     "人工智能及資訊工程，資訊安全，課程，主修，入學要求，收生分數，"
     "學費，獎學金，實習，海外交流，就業，起薪，專業認可。"
@@ -108,12 +108,14 @@ unitree_go2_infoday_agentic = autoconnect(
         suppress_final_ai_after_tool_call=True,
     ),
     InfodayActionSkill.blueprint(),
-    WebInput.blueprint(
-        stt_backend="qwen3_asr",
+    PushToTalkInput.blueprint(
+        button_device="Smart 2.4G Receiver",
+        button_keycode=117,
         stt_model="Qwen/Qwen3-ASR-0.6B",
         stt_language="Cantonese",
         stt_endpoint="http://localhost:8000",
         stt_initial_prompt=INFODAY_STT_INITIAL_PROMPT,
+        debug_recording_dir="/tmp/infoday-input-debug",
     ),
     Go2AudioBridgeModule.blueprint(
         speaker="auto",
@@ -147,4 +149,4 @@ unitree_go2_infoday_agentic = autoconnect(
         wait_for_audio_playback=False,
         stream_audio_playback=True,
     ),
-).remappings([(WebInput, "human_input", "infoday_input")])
+).remappings([(PushToTalkInput, "human_input", "infoday_input")])
