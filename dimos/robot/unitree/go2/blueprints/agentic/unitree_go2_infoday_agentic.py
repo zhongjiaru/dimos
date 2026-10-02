@@ -116,6 +116,10 @@ unitree_go2_infoday_agentic = autoconnect(
         stt_endpoint="http://localhost:8000",
         stt_initial_prompt=INFODAY_STT_INITIAL_PROMPT,
         debug_recording_dir="/tmp/infoday-input-debug",
+        pulse_webrtc_noise_suppression=True,
+        pulse_source_volume_percent=50,
+        alsa_capture_card=0,
+        alsa_mic_boost_level=1,
     ),
     Go2AudioBridgeModule.blueprint(
         speaker="auto",

@@ -141,6 +141,10 @@ def test_infoday_blueprint_uses_usb_button_push_to_talk_instead_of_web_input() -
     assert push_to_talk.kwargs["stt_language"] == "Cantonese"
     assert push_to_talk.kwargs["stt_initial_prompt"] == INFODAY_STT_INITIAL_PROMPT
     assert push_to_talk.kwargs["debug_recording_dir"] == "/tmp/infoday-input-debug"
+    assert push_to_talk.kwargs["pulse_webrtc_noise_suppression"] is True
+    assert push_to_talk.kwargs["pulse_source_volume_percent"] == 50
+    assert push_to_talk.kwargs["alsa_capture_card"] == 0
+    assert push_to_talk.kwargs["alsa_mic_boost_level"] == 1
     assert unitree_go2_infoday_agentic.remapping_map == {
         ("pushtotalkinput", "human_input"): "infoday_input"
     }

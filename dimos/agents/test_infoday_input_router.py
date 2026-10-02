@@ -28,7 +28,7 @@ from dimos.agents.infoday_input_router import (
 
 ASR_INITIAL_PROMPT = (
     "香港理工大學，理大，PolyU，電機及電子工程學系，EEE，開放日，"
-    "JS3170，JS3180，JUPAS，HKDSE，M1，M2，ICT，HKIE，"
+    "JS3170，3170，EE，JS3180，3180，IAIE，JUPAS，Jupas，HKDSE，DSE，M1，M2，ICT，HKIE，"
     "電機工程，交通系統工程，資訊及人工智能工程，電子系統及物聯網，"
     "人工智能及資訊工程，資訊安全，課程，主修，入學要求，收生分數，"
     "學費，獎學金，實習，海外交流，就業，起薪，專業認可。"
@@ -136,6 +136,19 @@ def test_strip_asr_prompt_prefix_preserves_normal_questions(transcript: str) -> 
     assert strip_asr_prompt_prefix(transcript, ASR_INITIAL_PROMPT) == transcript
 
 
+def test_strip_asr_prompt_prefix_removes_dominant_prompt_list_echo() -> None:
+    prompt_suffix = ASR_INITIAL_PROMPT[ASR_INITIAL_PROMPT.index("JUPAS") :]
+
+    assert strip_asr_prompt_prefix(f"想問下{prompt_suffix}", ASR_INITIAL_PROMPT) == ""
+
+
+def test_strip_asr_prompt_prefix_preserves_question_after_prompt_list_echo() -> None:
+    prompt_suffix = ASR_INITIAL_PROMPT[ASR_INITIAL_PROMPT.index("JUPAS") :]
+    transcript = f"想問下{prompt_suffix}JS3180 收生分數係幾多？"
+
+    assert strip_asr_prompt_prefix(transcript, ASR_INITIAL_PROMPT) == "JS3180 收生分數係幾多"
+
+
 def test_router_directly_calls_voice_answer_once(router_factory) -> None:  # type: ignore[no-untyped-def]
     router = router_factory()
 
@@ -193,6 +206,21 @@ def test_router_asks_user_to_repeat_when_asr_returns_only_prompt(
     router = router_factory(asr_initial_prompt=ASR_INITIAL_PROMPT)
 
     router._on_input(ASR_INITIAL_PROMPT)
+    router._answer_queue.put_nowait(None)
+    router._run_answers()
+
+    router.voice_answer.ask_user_to_repeat.assert_called_once_with()
+    router.voice_answer.answer_infoday_question.assert_not_called()
+    router.human_input.publish.assert_not_called()
+
+
+def test_router_asks_user_to_repeat_when_asr_returns_prompt_list_echo(
+    router_factory,
+) -> None:  # type: ignore[no-untyped-def]
+    router = router_factory(asr_initial_prompt=ASR_INITIAL_PROMPT)
+    prompt_suffix = ASR_INITIAL_PROMPT[ASR_INITIAL_PROMPT.index("JUPAS") :]
+
+    router._on_input(f"想問下{prompt_suffix}")
     router._answer_queue.put_nowait(None)
     router._run_answers()
 

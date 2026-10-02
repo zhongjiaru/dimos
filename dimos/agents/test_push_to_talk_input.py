@@ -15,7 +15,9 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterator
+import os
 from pathlib import Path
+import subprocess
 from typing import Any
 import wave
 
@@ -222,3 +224,106 @@ def test_start_wires_microphone_asr_and_transcript_output(mocker) -> None:  # ty
     input_stream.close.assert_called_once_with()
     module.human_input.publish.assert_called_once_with("理大 EEE 有咩課程？")
     assert stt.disposed is True
+
+
+def test_start_uses_webrtc_noise_suppression_with_fixed_gain_and_no_agc(
+    mocker, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    stt = mocker.Mock()
+    stt.consume_audio.return_value = stt
+    stt.consume_end.return_value = stt
+    stt.emit_text.return_value = Subject()
+    mocker.patch(
+        "dimos.agents.push_to_talk_input.Qwen3AsrStreamingNode",
+        return_value=stt,
+    )
+    mocker.patch.object(PushToTalkInput, "_run_button_monitor")
+    mocker.patch(
+        "dimos.agents.push_to_talk_input.shutil.which",
+        side_effect=lambda command: f"/usr/bin/{command}",
+    )
+
+    commands: list[list[str]] = []
+
+    def run_command(command: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        commands.append(command)
+        outputs = {
+            ("/usr/bin/pactl", "get-default-source"): (
+                "alsa_input.pci-0000_00_1f.3.analog-stereo\n"
+            ),
+            ("/usr/bin/pactl", "get-default-sink"): (
+                "alsa_output.pci-0000_00_1f.3.analog-stereo\n"
+            ),
+            ("/usr/bin/pactl", "list", "short", "sources"): (
+                "2\talsa_input.pci-0000_00_1f.3.analog-stereo\tmodule-alsa-card.c\n"
+            ),
+        }
+        stdout = outputs.get(tuple(command), "41\n" if "load-module" in command else "")
+        return subprocess.CompletedProcess(command, 0, stdout=stdout, stderr="")
+
+    mocker.patch(
+        "dimos.agents.push_to_talk_input.subprocess.run",
+        side_effect=run_command,
+    )
+    observed_pulse_sources: list[str | None] = []
+    input_stream = mocker.Mock()
+
+    def create_input_stream(**_kwargs: Any) -> Any:
+        observed_pulse_sources.append(os.environ.get("PULSE_SOURCE"))
+        return input_stream
+
+    input_stream_class = mocker.patch(
+        "dimos.agents.push_to_talk_input.sd.InputStream",
+        side_effect=create_input_stream,
+    )
+    monkeypatch.setenv("PULSE_SOURCE", "original_source")
+    module = PushToTalkInput(
+        button_device="Smart 2.4G Receiver",
+        button_keycode=117,
+        pulse_webrtc_noise_suppression=True,
+        pulse_source_volume_percent=50,
+        alsa_capture_card=0,
+        alsa_mic_boost_level=1,
+        rpc_transport=_FakeRPC,
+    )
+
+    try:
+        module.start()
+        module.toggle_recording()
+    finally:
+        module.stop()
+
+    assert observed_pulse_sources == ["infoday_denoised"]
+    assert os.environ["PULSE_SOURCE"] == "original_source"
+    input_stream_class.assert_called_once_with(
+        device="pulse",
+        samplerate=16000,
+        channels=1,
+        blocksize=1024,
+        dtype=np.float32,
+        callback=module._audio_callback,
+    )
+    set_volume_command = [
+        "/usr/bin/pactl",
+        "set-source-volume",
+        "alsa_input.pci-0000_00_1f.3.analog-stereo",
+        "50%",
+    ]
+    mic_boost_command = [
+        "/usr/bin/amixer",
+        "-c",
+        "0",
+        "sset",
+        "Mic Boost",
+        "1",
+    ]
+    assert commands.count(set_volume_command) == 2
+    assert commands.count(mic_boost_command) == 2
+    load_command = next(command for command in commands if "load-module" in command)
+    assert "use_volume_sharing=no" in load_command
+    assert "aec_method=webrtc" in load_command
+    assert (
+        'aec_args="high_pass_filter=1 noise_suppression=1 analog_gain_control=0 '
+        'digital_gain_control=0 voice_detection=0"'
+    ) in load_command
+    assert ["/usr/bin/pactl", "unload-module", "41"] in commands

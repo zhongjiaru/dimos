@@ -234,7 +234,7 @@ def classify_infoday_input(text: str) -> InputRoute:
 
 
 def strip_asr_prompt_prefix(text: str, initial_prompt: str | None) -> str:
-    """Remove an exact, sufficiently long initial-prompt prefix from an ASR result."""
+    """Remove an exact prompt prefix or a dominant prompt-list echo."""
     cleaned = text.strip()
     if not initial_prompt:
         return cleaned
@@ -248,7 +248,67 @@ def strip_asr_prompt_prefix(text: str, initial_prompt: str | None) -> str:
         candidate = prompt[start:].lstrip()
         if cleaned.startswith(candidate):
             return cleaned[len(candidate) :].lstrip()
-    return cleaned
+
+    prompt_items = _asr_prompt_items(prompt)
+    transcript_items = _asr_prompt_items(cleaned)
+    if not prompt_items or not transcript_items:
+        return cleaned
+
+    matched_items: set[int] = set()
+    prompt_cursor = 0
+    for transcript_index, transcript_item in enumerate(transcript_items):
+        match_index = next(
+            (
+                index
+                for index in range(prompt_cursor, len(prompt_items))
+                if _matches_prompt_item(transcript_item, prompt_items[index])
+            ),
+            None,
+        )
+        if match_index is None:
+            continue
+        matched_items.add(transcript_index)
+        prompt_cursor = match_index + 1
+
+    minimum_echo_items = min(10, max(4, len(prompt_items) // 3))
+    if len(matched_items) < minimum_echo_items:
+        return cleaned
+    if len(matched_items) / len(transcript_items) < 0.7:
+        return cleaned
+
+    remaining = [
+        item
+        for index, item in enumerate(transcript_items)
+        if index not in matched_items and not _is_asr_prompt_lead_in(item)
+    ]
+    return "，".join(remaining)
+
+
+def _asr_prompt_items(text: str) -> list[str]:
+    return [item.strip() for item in re.split(r"[，,、；;。.!！?？]+", text) if item.strip()]
+
+
+def _matches_prompt_item(transcript_item: str, prompt_item: str) -> bool:
+    normalized_transcript = _normalize(transcript_item)
+    normalized_prompt = _normalize(prompt_item)
+    if normalized_transcript == normalized_prompt:
+        return True
+    if not normalized_transcript.endswith(normalized_prompt):
+        return False
+    lead_in = normalized_transcript[: -len(normalized_prompt)].strip()
+    return _is_asr_prompt_lead_in(lead_in)
+
+
+def _is_asr_prompt_lead_in(text: str) -> bool:
+    normalized = re.sub(r"[\s:：，,。.!！?？]+", "", _normalize(text))
+    return normalized in {
+        "想問下",
+        "我想問下",
+        "請問",
+        "我想請問",
+        "想了解下",
+        "我想了解下",
+    }
 
 
 def _normalize(text: str) -> str:

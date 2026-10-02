@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+import os
 from pathlib import Path
 import re
 import shutil
@@ -42,6 +43,10 @@ from dimos.utils.logging_config import setup_logger
 logger = setup_logger()
 
 _XINPUT_KEY_EVENT = re.compile(r"^key\s+(press|release)\s+(\d+)\s*$")
+_PULSE_WEBRTC_AEC_ARGS = (
+    '"high_pass_filter=1 noise_suppression=1 analog_gain_control=0 '
+    'digital_gain_control=0 voice_detection=0"'
+)
 
 
 class PushToTalkInputConfig(ModuleConfig):
@@ -61,6 +66,15 @@ class PushToTalkInputConfig(ModuleConfig):
     stt_request_chunk_sec: float = Field(default=0.5, gt=0.0)
     stt_timeout_sec: float = Field(default=30.0, gt=0.0)
     debug_recording_dir: str | None = None
+    pulse_webrtc_noise_suppression: bool = False
+    pulse_source_master: str | None = None
+    pulse_sink_master: str | None = None
+    pulse_filtered_source_name: str = "infoday_denoised"
+    pulse_filtered_sink_name: str = "infoday_aec_sink"
+    pulse_source_volume_percent: int | None = Field(default=None, ge=0, le=150)
+    alsa_capture_card: int | None = Field(default=None, ge=0)
+    alsa_mic_boost_control: str = "Mic Boost"
+    alsa_mic_boost_level: int | None = Field(default=None, ge=0)
 
 
 class PushToTalkInput(Module):
@@ -85,11 +99,16 @@ class PushToTalkInput(Module):
         self._recording_started_at = 0.0
         self._recording_chunks = 0
         self._debug_recording_chunks: list[NDArray[np.float32]] = []
+        self._pulse_module_id: int | None = None
+        self._pulse_source_master: str | None = None
+        self._pactl: str | None = None
 
     @rpc
     def start(self) -> None:
         super().start()
         self._stop_event.clear()
+
+        filtered_source = self._start_pulse_webrtc_filter()
 
         self._stt_node = Qwen3AsrStreamingNode(
             endpoint=self.config.stt_endpoint,
@@ -104,14 +123,29 @@ class PushToTalkInput(Module):
         self._stt_node.consume_audio(self._audio_subject).consume_end(self._audio_end_subject)
         self._text_subscription = self._stt_node.emit_text().subscribe(self._publish_transcript)
 
-        self._audio_stream = sd.InputStream(
-            device=self.config.microphone_device,
-            samplerate=self.config.sample_rate,
-            channels=self.config.channels,
-            blocksize=self.config.block_size,
-            dtype=np.float32,
-            callback=self._audio_callback,
-        )
+        input_device = self.config.microphone_device
+        previous_pulse_source = os.environ.get("PULSE_SOURCE")
+        if filtered_source is not None:
+            os.environ["PULSE_SOURCE"] = filtered_source
+            input_device = "pulse"
+        try:
+            self._audio_stream = sd.InputStream(
+                device=input_device,
+                samplerate=self.config.sample_rate,
+                channels=self.config.channels,
+                blocksize=self.config.block_size,
+                dtype=np.float32,
+                callback=self._audio_callback,
+            )
+        except Exception:
+            self._stop_pulse_webrtc_filter()
+            raise
+        finally:
+            if filtered_source is not None:
+                if previous_pulse_source is None:
+                    os.environ.pop("PULSE_SOURCE", None)
+                else:
+                    os.environ["PULSE_SOURCE"] = previous_pulse_source
         self._audio_stream.start()
 
         self._button_thread = threading.Thread(
@@ -130,6 +164,8 @@ class PushToTalkInput(Module):
                 else self.config.microphone_device
             ),
             sample_rate=self.config.sample_rate,
+            pulse_source=filtered_source,
+            pulse_webrtc_noise_suppression=(filtered_source is not None),
         )
 
     @rpc
@@ -145,6 +181,7 @@ class PushToTalkInput(Module):
                 chunks = self._recording_chunks
                 debug_chunks = self._take_debug_recording_chunks()
             else:
+                self._configure_input_gain()
                 self._recording = True
                 self._recording_started_at = time.monotonic()
                 self._recording_chunks = 0
@@ -181,6 +218,7 @@ class PushToTalkInput(Module):
             self._audio_stream.stop()
             self._audio_stream.close()
             self._audio_stream = None
+        self._stop_pulse_webrtc_filter()
 
         with self._recording_lock:
             was_recording = self._recording
@@ -199,6 +237,123 @@ class PushToTalkInput(Module):
         self._audio_subject.on_completed()
         self._audio_end_subject.on_completed()
         super().stop()
+
+    def _start_pulse_webrtc_filter(self) -> str | None:
+        if not self.config.pulse_webrtc_noise_suppression:
+            return None
+
+        self._pactl = shutil.which("pactl")
+        if self._pactl is None:
+            raise RuntimeError("PulseAudio WebRTC noise suppression requires pactl")
+
+        self._pulse_source_master = self.config.pulse_source_master or self._run_command(
+            [self._pactl, "get-default-source"]
+        )
+        sink_master = self.config.pulse_sink_master or self._run_command(
+            [self._pactl, "get-default-sink"]
+        )
+        self._configure_input_gain()
+
+        source_name = self.config.pulse_filtered_source_name
+        sources = self._run_command([self._pactl, "list", "short", "sources"])
+        if _pulse_source_exists(sources, source_name):
+            logger.warning(
+                "Reusing existing PulseAudio WebRTC noise-suppressed source",
+                pulse_source=source_name,
+            )
+            return source_name
+
+        module_id = self._run_command(
+            [
+                self._pactl,
+                "load-module",
+                "module-echo-cancel",
+                f"source_master={self._pulse_source_master}",
+                f"sink_master={sink_master}",
+                f"source_name={source_name}",
+                f"sink_name={self.config.pulse_filtered_sink_name}",
+                "use_volume_sharing=no",
+                "aec_method=webrtc",
+                f"aec_args={_PULSE_WEBRTC_AEC_ARGS}",
+            ]
+        )
+        try:
+            self._pulse_module_id = int(module_id)
+        except ValueError as exc:
+            raise RuntimeError(f"pactl returned an invalid module id: {module_id!r}") from exc
+        logger.info(
+            "PulseAudio WebRTC noise suppression ready",
+            pulse_module_id=self._pulse_module_id,
+            source_master=self._pulse_source_master,
+            filtered_source=source_name,
+            high_pass_filter=True,
+            noise_suppression=True,
+            analog_gain_control=False,
+            digital_gain_control=False,
+        )
+        return source_name
+
+    def _configure_input_gain(self) -> None:
+        if self._pulse_source_master is None:
+            return
+        if self.config.pulse_source_volume_percent is not None:
+            assert self._pactl is not None
+            self._run_command(
+                [
+                    self._pactl,
+                    "set-source-volume",
+                    self._pulse_source_master,
+                    f"{self.config.pulse_source_volume_percent}%",
+                ]
+            )
+
+        if self.config.alsa_mic_boost_level is None:
+            return
+        if self.config.alsa_capture_card is None:
+            raise RuntimeError(
+                "alsa_capture_card is required when alsa_mic_boost_level is configured"
+            )
+        amixer = shutil.which("amixer")
+        if amixer is None:
+            raise RuntimeError("Fixed ALSA microphone boost requires amixer")
+        self._run_command(
+            [
+                amixer,
+                "-c",
+                str(self.config.alsa_capture_card),
+                "sset",
+                self.config.alsa_mic_boost_control,
+                str(self.config.alsa_mic_boost_level),
+            ]
+        )
+
+    def _stop_pulse_webrtc_filter(self) -> None:
+        module_id = self._pulse_module_id
+        self._pulse_module_id = None
+        if module_id is None or self._pactl is None:
+            return
+        try:
+            self._run_command([self._pactl, "unload-module", str(module_id)])
+        except RuntimeError:
+            logger.exception(
+                "Could not unload PulseAudio WebRTC noise suppression",
+                pulse_module_id=module_id,
+            )
+
+    @staticmethod
+    def _run_command(command: list[str]) -> str:
+        try:
+            result = subprocess.run(
+                command,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        except (OSError, subprocess.CalledProcessError) as exc:
+            stderr = getattr(exc, "stderr", "")
+            detail = str(stderr or exc).strip()
+            raise RuntimeError(f"Audio setup command failed: {detail}") from exc
+        return result.stdout.strip()
 
     def _audio_callback(
         self,
@@ -356,3 +511,11 @@ def parse_xinput_key_event(line: str) -> tuple[Literal["press", "release"], int]
 def is_xinput_key_press(line: str, keycode: int) -> bool:
     """Return whether an XInput line is a press of the configured button."""
     return parse_xinput_key_event(line) == ("press", keycode)
+
+
+def _pulse_source_exists(sources: str, source_name: str) -> bool:
+    for line in sources.splitlines():
+        fields = line.split("\t")
+        if len(fields) >= 2 and fields[1] == source_name:
+            return True
+    return False
