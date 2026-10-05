@@ -23,6 +23,7 @@ from scripts.build_polyu_knowledge import (
     _select_docx_sources,
     _shared_web_navigation,
     _split_paragraphs,
+    _topics_for,
 )
 
 
@@ -48,6 +49,7 @@ Q2：有冇實習機會？
     assert len(chunks) == 2
     assert "Q1：課程主要讀啲咩？\n答：人工智能同資訊工程。" in chunks[0]["original_text"]
     assert chunks[1]["original_text"] == "Q2：有冇實習機會？\n答：學生需要完成校外實習。"
+    assert all(chunk["retrieval_question_kind"] == "faq" for chunk in chunks)
 
 
 def test_faq_question_without_colon_starts_new_chunk() -> None:
@@ -85,6 +87,8 @@ def test_js3180_q14_to_q16_are_tagged_as_eee_general_knowledge() -> None:
     assert chunks[0]["title"] == "常見問題（FAQ）– JS3180"
     assert [chunk["title"] for chunk in chunks[1:]] == ["EEE 學系常見問題（FAQ）"] * 3
     assert all("JS3180" not in chunk["tags"] for chunk in chunks[1:])
+    assert "student_support" in chunks[2]["topics"]
+    assert "service_learning" in chunks[3]["topics"]
 
 
 def test_general_faq_questions_are_not_assigned_to_a_programme() -> None:
@@ -105,6 +109,7 @@ def test_general_faq_questions_are_not_assigned_to_a_programme() -> None:
     assert all("JS3170" not in chunk["tags"] for chunk in chunks)
     assert all("JS3180" not in chunk["tags"] for chunk in chunks)
     assert chunks[0]["retrieval_questions"] == ["我中學冇讀 M1 或 M2，入唔入到？"]
+    assert "subject_prerequisite" in chunks[0]["topics"]
 
 
 def test_newest_dated_faq_replaces_older_programme_version(tmp_path) -> None:
@@ -210,6 +215,7 @@ def test_web_chunk_has_content_based_questions_and_programme_scope() -> None:
     ]
     assert "JS3170 有冇 HKIE 專業認可？" in chunks[0]["search_text"]
     assert "呢段官方資料可用嚟回答" in chunks[0]["audience_summary_zh"]
+    assert chunks[0]["retrieval_question_kind"] == "generated"
 
 
 def test_faq_retrieval_question_does_not_include_inline_answer() -> None:
@@ -311,3 +317,121 @@ def test_qa_seed_includes_deduplicated_content_questions() -> None:
 
     assert questions.count("JS3170 有冇 HKIE 專業認可？") == 1
     assert "EEE 有邊啲研究方向？" in questions
+
+
+def test_policy_sections_are_chunked_and_tagged_by_topic() -> None:
+    document = Document(
+        source_id="docx:JS3180-policy.docx",
+        source_type="docx",
+        source="JS3180-policy.docx",
+        title="JS3180 Programme Requirement Document",
+        text=(
+            "Academic Regulations\nGeneral introduction.\n"
+            "Transfer of Study within the University\n"
+            "Applications are considered by both programme departments.\n"
+            "Credit Transfer\nCredits from prior study may be transferred.\n"
+            "Progression / Academic Probation / Deregistration\n"
+            "A student with a GPA lower than 1.70 is put on academic probation."
+        ),
+    )
+
+    chunks = _chunk_document(document)
+
+    transfer_chunk = next(
+        chunk
+        for chunk in chunks
+        if chunk["original_text"].startswith("Transfer of Study within the University")
+    )
+    credit_chunk = next(
+        chunk for chunk in chunks if chunk["original_text"].startswith("Credit Transfer")
+    )
+    deregistration_chunk = next(
+        chunk
+        for chunk in chunks
+        if chunk["original_text"].startswith("Progression / Academic Probation / Deregistration")
+    )
+    assert transfer_chunk["topics"] == ["programme_transfer"]
+    assert transfer_chunk["section_title"] == "Transfer of Study within the University"
+    assert "internal transfer" in transfer_chunk["retrieval_questions"][0]
+    assert credit_chunk["topics"] == ["credit_transfer"]
+    assert "credit transfer" in credit_chunk["retrieval_questions"][0]
+    assert deregistration_chunk["topics"] == ["deregistration", "gpa"]
+    assert "academic probation" in deregistration_chunk["retrieval_questions"][0]
+    assert transfer_chunk["audience_summary_zh"] not in transfer_chunk["search_text"]
+
+
+def test_policy_topics_generate_bilingual_retrieval_questions() -> None:
+    document = Document(
+        source_id="docx:JS3170-policy.docx",
+        source_type="docx",
+        source="JS3170-policy.docx",
+        title="JS3170 Programme Requirement Document",
+        text=(
+            "Concurrent Enrolment\nStudents may not enrol concurrently in two UGC-funded programmes.\n"
+            "Study Load\nThe normal study load is 15 credits and the maximum study load is 21 credits.\n"
+            "Retaking of Subjects\nStudents may retake a failed subject no more than two times.\n"
+            "Medium of Instruction\nEnglish is the medium of instruction."
+        ),
+    )
+
+    chunks = _chunk_document(document)
+
+    by_section = {chunk["section_title"]: chunk for chunk in chunks}
+    assert by_section["Concurrent Enrolment"]["topics"] == ["concurrent_enrolment"]
+    assert "政府資助" in by_section["Concurrent Enrolment"]["retrieval_questions"][0]
+    assert by_section["Study Load"]["topics"] == ["study_load"]
+    assert "最多" in by_section["Study Load"]["retrieval_questions"][0]
+    assert by_section["Retaking of Subjects"]["topics"] == ["retake"]
+    assert "重讀" in by_section["Retaking of Subjects"]["retrieval_questions"][0]
+    assert by_section["Medium of Instruction"]["topics"] == ["instruction_language"]
+    assert "英文" in by_section["Medium of Instruction"]["retrieval_questions"][0]
+
+
+def test_policy_topics_distinguish_specific_rules_within_a_broad_subject() -> None:
+    assert "prior_study_credit_transfer" in _topics_for(
+        "Programme",
+        "Students may be given credits for recognised previous studies.",
+    )
+    assert "gpa_calculation" in _topics_for(
+        "Programme",
+        "A Grade Point Average (GPA) will be computed as follows.",
+    )
+    assert "minor_enrolment" in _topics_for(
+        "Programme",
+        "Only students with a GPA of 2.5 or above can be considered for Minor study enrolment.",
+    )
+    assert "department_history" in _topics_for(
+        "Message from Head",
+        "The merger of the Department of Electrical Engineering took place on 1st July 2023.",
+    )
+
+
+def test_cantonese_faq_topics_include_both_internship_and_exchange() -> None:
+    topics = _topics_for(
+        "EEE 常見問題",
+        "讀書期間有冇實習或者海外交流機會？學生必須完成校外實習，亦有海外交流機會。",
+    )
+
+    assert {"internship", "exchange"} <= set(topics)
+
+
+def test_table_of_contents_fragments_are_not_indexed_as_evidence() -> None:
+    document = Document(
+        source_id="docx:JS3170-policy.docx",
+        source_type="docx",
+        source="JS3170-policy.docx",
+        title="JS3170 Programme Requirement Document",
+        text=(
+            "Transfer of Study within the University\n45\n"
+            "Credit Transfer\n48\n"
+            "Progression / Academic Probation / Deregistration\n50\n"
+            "Actual policy section\nStudents may apply subject to departmental approval."
+        ),
+    )
+
+    chunks = _chunk_document(document)
+
+    assert all(
+        chunk["original_text"] != "Transfer of Study within the University\n45" for chunk in chunks
+    )
+    assert all(chunk["original_text"] != "Credit Transfer\n48" for chunk in chunks)

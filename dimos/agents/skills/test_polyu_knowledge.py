@@ -19,9 +19,87 @@ import pytest
 # ruff: noqa: RUF001
 from dimos.agents.skills.polyu_knowledge import (
     PolyUKnowledgeSkill,
+    _concepts,
+    _query_tokens,
+    _without_programme_code,
     identify_programme,
     is_shared_programme_question,
 )
+
+
+def test_career_concepts_distinguish_salary_from_artificial_intelligence() -> None:
+    assert _concepts("畢業搵工情況同月薪係點？") == {"career"}
+    assert "career" not in _concepts("人工智能同 COMP AI 有咩不同？")
+
+
+def test_professional_recognition_takes_precedence_over_graduation_context() -> None:
+    assert _concepts("畢業學位受唔受工程師學會認證？") == {"professional_recognition"}
+
+
+def test_student_question_concepts_cover_prerequisites_support_and_service_learning() -> None:
+    assert "subject_prerequisite" in _concepts("中學無讀資訊科技得唔得？")
+    assert "student_support" in _concepts("有冇 programming 同 robotics 活動資源？")
+    assert "hands_on_support" in _concepts("有冇 programming 同 robotics 活動或資源？")
+    assert "service_learning" in _concepts("可唔可以去海外做 service learning？")
+
+
+def test_faq_paraphrases_keep_curriculum_admission_and_exchange_intents() -> None:
+    assert "curriculum" in _concepts("3180 第一年的內容主要係咩？")
+    assert "admission_score" in _concepts("申請 IAIE 要符合咩 DSE 成績？")
+    assert {"internship", "exchange"} <= _concepts("本科有冇 internship 或去外國交換？")
+
+
+@pytest.mark.parametrize(
+    ("question", "expected_concept"),
+    [
+        ("可唔可以同時讀兩個政府資助課程？", "concurrent_enrolment"),
+        ("想暫停學業一個學期", "deferment"),
+        ("過咗 add/drop period 仲想退科", "subject_withdrawal"),
+        ("每學期正常同最多修幾多 credits？", "study_load"),
+        ("肥咗一科最多可以重讀幾多次？", "retake"),
+        ("主要用中文定英文上堂？", "instruction_language"),
+        ("讀 Minor 要幾多 GPA？", "minor_study"),
+        ("Fast-track 要保持幾多 GPA？", "fast_track"),
+        ("以前讀過嘅科點申請轉學分？", "prior_study_credit_transfer"),
+        ("GPA 點計，重讀科計邊一次成績？", "gpa_calculation"),
+        ("想讀 Minor 係咪要 GPA 2.5？", "minor_enrolment"),
+        ("EEE 由邊兩個舊學系合併成立？", "department_history"),
+    ],
+)
+def test_policy_question_concepts_cover_student_wording(
+    question: str,
+    expected_concept: str,
+) -> None:
+    assert expected_concept in _concepts(question)
+
+
+@pytest.mark.parametrize(
+    ("question", "expected_tokens"),
+    [
+        ("中學無讀資訊科技", {"ict"}),
+        ("鍾意 programming 同 robotics", {"code", "機械人"}),
+        ("有冇 service learning", {"服務學習", "義工"}),
+        ("肥咗一科要重讀", {"failed", "retake"}),
+        ("主要用中文定英文上堂", {"medium", "instruction"}),
+        ("同時讀兩個政府資助課程", {"concurrent", "ugc-funded"}),
+        ("以前讀過嘅科點批轉學分", {"recognised", "previous", "judgment"}),
+        ("GPA 點計，重讀科計邊一次成績", {"computed", "retaken"}),
+    ],
+)
+def test_query_tokens_expand_common_cross_language_paraphrases(
+    question: str,
+    expected_tokens: set[str],
+) -> None:
+    assert expected_tokens <= set(_query_tokens(question))
+
+
+def test_programme_code_is_removed_after_candidate_filtering() -> None:
+    assert _without_programme_code("JS3170 嘅 WIE 係咪必修？", "JS3170") == "嘅 WIE 係咪必修？"
+    assert (
+        _without_programme_code("JS3170 第一個學年會學啲乜？", "JS3170")
+        == "JS3170 第一個學年會學啲乜？"
+    )
+    assert _without_programme_code("JS3170", "JS3170") == "JS3170"
 
 
 def test_polyu_knowledge_returns_structured_facts(tmp_path) -> None:  # type: ignore[no-untyped-def]
@@ -588,3 +666,143 @@ def test_polyu_knowledge_prioritizes_faq_question_over_generic_overlap(tmp_path)
 
     assert "Q3：我中學冇讀過物理" in result
     assert "Q2：我中學冇讀 M1 或 M2" not in result
+
+
+def test_polyu_knowledge_distinguishes_programme_transfer_from_credit_transfer(
+    tmp_path,
+) -> None:  # type: ignore[no-untyped-def]
+    processed = tmp_path / "processed"
+    processed.mkdir()
+    (processed / "facts.zh.json").write_text("{}", encoding="utf-8")
+    chunks = [
+        {
+            "id": "credit-transfer",
+            "source": "credit-transfer.docx",
+            "title": "Credit Transfer",
+            "topics": ["credit_transfer"],
+            "retrieval_questions": ["點樣申請學分轉移（credit transfer）？"],
+            "original_text": "Credits earned from prior study may be transferred.",
+        },
+        {
+            "id": "programme-transfer",
+            "source": "programme-transfer.docx",
+            "title": "Transfer of Study within the University",
+            "topics": ["programme_transfer"],
+            "retrieval_questions": ["入學後可唔可以 internal transfer，申請有咩條件？"],
+            "original_text": (
+                "Applications for transfer to another programme are considered "
+                "by both programme departments based on academic merit and places available."
+            ),
+        },
+    ]
+    (processed / "chunks.zh.jsonl").write_text(
+        "\n".join(json.dumps(chunk, ensure_ascii=False) for chunk in chunks) + "\n",
+        encoding="utf-8",
+    )
+    skill = PolyUKnowledgeSkill(knowledge_dir=tmp_path, max_chunks=1)
+
+    try:
+        skill.start()
+        result = skill.search_polyu_knowledge("internal transfer 難唔難，有冇 GPA 要求？")
+    finally:
+        skill.stop()
+
+    assert "programme-transfer.docx" in result
+    assert "credit-transfer.docx" not in result
+    assert "搵唔到固定門檻唔等於冇門檻" in result
+
+
+def test_polyu_knowledge_distinguishes_deregistration_from_other_gpa_rules(
+    tmp_path,
+) -> None:  # type: ignore[no-untyped-def]
+    processed = tmp_path / "processed"
+    processed.mkdir()
+    (processed / "facts.zh.json").write_text("{}", encoding="utf-8")
+    chunks = [
+        {
+            "id": "minor-gpa",
+            "source": "minor.docx",
+            "title": "Minor Study",
+            "topics": ["graduation", "gpa"],
+            "original_text": "A GPA of at least 1.70 is required to graduate with a Minor.",
+        },
+        {
+            "id": "deregistration",
+            "source": "deregistration.docx",
+            "title": "Academic Probation and Deregistration",
+            "topics": ["deregistration", "academic_probation", "gpa"],
+            "retrieval_questions": ["咩情況會進入 academic probation 或被 deregister？"],
+            "original_text": (
+                "GPA below 1.70 leads to academic probation. A student may be "
+                "deregistered after the conditions stated in this section are met."
+            ),
+        },
+        {
+            "id": "major-allocation-gpa",
+            "source": "major-allocation.docx",
+            "title": "Choosing a Major",
+            "topics": ["major_allocation", "gpa"],
+            "retrieval_questions": ["揀主修嗰陣洗唔洗睇 GPA？"],
+            "original_text": (
+                "Students do not compete by GPA when choosing a Major. "
+                "Every student can enter their preferred Major."
+            ),
+        },
+    ]
+    (processed / "chunks.zh.jsonl").write_text(
+        "\n".join(json.dumps(chunk, ensure_ascii=False) for chunk in chunks) + "\n",
+        encoding="utf-8",
+    )
+    skill = PolyUKnowledgeSkill(knowledge_dir=tmp_path, max_chunks=1)
+
+    try:
+        skill.start()
+        result = skill.search_polyu_knowledge("GPA 幾低會俾人 terminate？")
+    finally:
+        skill.stop()
+
+    assert "deregistration.docx" in result
+    assert "minor.docx" not in result
+    assert "major-allocation.docx" not in result
+
+
+def test_polyu_knowledge_prioritizes_salary_faq_over_graduation_policy(
+    tmp_path,
+) -> None:  # type: ignore[no-untyped-def]
+    processed = tmp_path / "processed"
+    processed.mkdir()
+    (processed / "facts.zh.json").write_text("{}", encoding="utf-8")
+    chunks = [
+        {
+            "id": "gpa-policy",
+            "source": "gpa-policy.docx",
+            "programme": "JS3180",
+            "topics": ["deregistration", "gpa"],
+            "retrieval_question_kind": "generated",
+            "retrieval_questions": ["JS3180 GPA 點樣計，同學籍或畢業有咩關係？"],
+            "original_text": "The Board determines progression and deregistration.",
+        },
+        {
+            "id": "salary-faq",
+            "source": "salary-faq.docx",
+            "programme": "JS3180",
+            "topics": ["career"],
+            "retrieval_question_kind": "faq",
+            "retrieval_questions": ["JS3180 畢業生平均起薪同就業率係點？"],
+            "original_text": "畢業生平均月薪為 HK$23,659，就業率超過九成。",
+        },
+    ]
+    (processed / "chunks.zh.jsonl").write_text(
+        "\n".join(json.dumps(chunk, ensure_ascii=False) for chunk in chunks) + "\n",
+        encoding="utf-8",
+    )
+    skill = PolyUKnowledgeSkill(knowledge_dir=tmp_path, max_chunks=1)
+
+    try:
+        skill.start()
+        result = skill.search_polyu_knowledge("3180 畢業搵工情況好唔好，月薪通常幾多？")
+    finally:
+        skill.stop()
+
+    assert "salary-faq.docx" in result
+    assert "gpa-policy.docx" not in result

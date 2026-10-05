@@ -136,7 +136,9 @@ unitree_go2_infoday_agentic = autoconnect(
     PolyUKnowledgeSkill.blueprint(
         knowledge_dir="/home/jiaru/infoday/knowledge",
         max_chunks=3,
-        max_chunk_chars=500,
+        max_chunk_chars=800,
+        semantic_model="intfloat/multilingual-e5-small",
+        semantic_local_files_only=True,
     ),
     InfodayVoiceAnswerSkill.blueprint(
         response_max_tokens=96,

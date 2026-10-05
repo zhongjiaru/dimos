@@ -39,6 +39,25 @@ FAQ_QUESTION_RE = re.compile(r"^Q\d+\s*[:：]?", re.IGNORECASE)
 FAQ_QUESTION_NUMBER_RE = re.compile(r"^Q(\d+)", re.IGNORECASE)
 FAQ_PROGRAMME_RE = re.compile(r"(?<![A-Z0-9])(JS\d{4})(?![A-Z0-9])", re.IGNORECASE)
 SOURCE_DATE_RE = re.compile(r"(?<!\d)(20\d{6})(?!\d)")
+POLICY_SECTION_HEADINGS = {
+    "academic advising",
+    "concurrent enrolment",
+    "credit transfer",
+    "deferment of study",
+    "different types of gpa",
+    "fast-track integrated bachelor’s and master’s degree programme",
+    "fast-track integrated bachelor's and master's degree programme",
+    "medium of instruction",
+    "minor programme",
+    "progression / academic probation / deregistration",
+    "re-admission",
+    "retaking of subjects",
+    "study load",
+    "subject exemption",
+    "subject registration and withdrawal",
+    "transfer of study within the university",
+    "work-integrated education",
+}
 
 POLYU_URLS = [
     "https://www.polyu.edu.hk/",
@@ -421,7 +440,7 @@ def _looks_like_navigation_line(text: str) -> bool:
 
 def _chunk_document(
     document: Document,
-    max_chars: int = 1800,
+    max_chars: int = 1200,
     ignored_web_lines: set[str] | None = None,
 ) -> list[dict[str, Any]]:
     paragraphs = _split_paragraphs(
@@ -439,8 +458,14 @@ def _chunk_document(
         if not current:
             return
         text = "\n".join(current).strip()
+        if _looks_like_toc_fragment(text):
+            current = []
+            current_len = 0
+            return
         title = document.title
         tags = _tags_for(title, text)
+        topics = _topics_for(title, text)
+        section_title = _section_title(text)
         programme = _chunk_programme(document, text)
         if is_faq and programme is None and _is_eee_general_faq_chunk(document, text):
             title = "EEE 學系常見問題（FAQ）"
@@ -456,11 +481,14 @@ def _chunk_document(
             "source_type": document.source_type,
             "source": document.source,
             "title": title,
+            "section_title": section_title,
             "audience_summary_zh": summary,
-            "search_text": " ".join([title, summary, *tags, *questions]),
+            "search_text": " ".join([title, section_title, *topics, *tags, *questions]),
             "original_text": text,
             "tags": tags,
+            "topics": topics,
             "retrieval_questions": questions,
+            "retrieval_question_kind": "faq" if is_faq else "generated",
             "programme": programme,
         }
         chunks.append(chunk)
@@ -473,7 +501,7 @@ def _chunk_document(
             if seen_faq_question:
                 flush()
             seen_faq_question = True
-        elif not is_faq and para.startswith("#") and current:
+        elif not is_faq and (para.startswith("#") or _is_policy_section_heading(para)) and current:
             flush()
         if current and current_len + len(para) > max_chars:
             flush()
@@ -481,6 +509,29 @@ def _chunk_document(
         current_len += len(para)
     flush()
     return chunks
+
+
+def _is_policy_section_heading(text: str) -> bool:
+    normalized = re.sub(r"\s+", " ", text).strip().casefold()
+    return normalized in POLICY_SECTION_HEADINGS
+
+
+def _section_title(text: str) -> str:
+    first_line = next((line.strip() for line in text.splitlines() if line.strip()), "")
+    cleaned = first_line.lstrip("#").strip()
+    return cleaned if _is_policy_section_heading(cleaned) else ""
+
+
+def _looks_like_toc_fragment(text: str) -> bool:
+    """Reject short table-of-contents fragments that contain headings but no evidence."""
+    if len(text) >= 350:
+        return False
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    return (
+        any(_is_policy_section_heading(line) for line in lines)
+        and any(line.isdigit() for line in lines)
+        and not any(len(line) > 100 or re.search(r"[.!?。！？]", line) for line in lines)
+    )
 
 
 def _chunk_programme(document: Document, text: str) -> str | None:
@@ -537,8 +588,33 @@ def _retrieval_questions(
         if question not in questions:
             questions.append(question)
 
+    topics = _topics_for(title, text)
+    concept_question_by_topic = {
+        "programme_transfer": f"{subject} 入學後可唔可以 internal transfer，申請有咩條件？",
+        "credit_transfer": f"{subject} 點樣申請學分轉移（credit transfer）？",
+        "prior_study_credit_transfer": f"{subject} 以前修讀過嘅科目點樣申請學分轉移？",
+        "concurrent_enrolment": f"{subject} 可唔可以同時修讀兩個政府資助課程？",
+        "deferment": f"{subject} 點樣申請暫停學業或 deferment of study？",
+        "subject_withdrawal": f"{subject} 過咗 add/drop period 仲可唔可以退科？",
+        "study_load": f"{subject} 每學期正常同最多可以修讀幾多學分？",
+        "retake": f"{subject} 不合格科目最多可以重讀幾多次？",
+        "instruction_language": f"{subject} 主要用中文定英文授課？",
+        "minor_study": f"{subject} 申請 Minor 有咩 GPA 同修讀要求？",
+        "minor_enrolment": f"{subject} 想修讀 Minor 要符合咩 GPA 入讀門檻？",
+        "fast_track": f"{subject} Fast-track programme 有咩 GPA 同入讀要求？",
+        "gpa_calculation": f"{subject} GPA 點樣計，重讀科目計邊次成績？",
+        "department_history": "EEE 係幾時、由邊兩個學系合併成立？",
+        "deregistration": f"{subject} 咩情況會進入 academic probation 或被 deregister？",
+        "gpa": f"{subject} GPA 點樣計，同學籍或畢業有咩關係？",
+        "major_allocation": f"{subject} 點樣揀主修或分流，有冇名額同成績要求？",
+    }
+    for topic in topics:
+        topic_question = concept_question_by_topic.get(topic)
+        if topic_question is not None:
+            add(topic_question)
+
     if programme is not None:
-        topic_questions = [
+        content_questions = [
             (
                 ("award title", "awards offered", "preferred award"),
                 f"{subject} 有邊啲主修方向同學位選擇？",
@@ -588,7 +664,7 @@ def _retrieval_questions(
         elif "jupas applicants" in title_context:
             add("EEE 本科課程嘅 JUPAS 申請方法同要求係點？")
         if "EEE" in tags:
-            topic_questions = [
+            content_questions = [
                 (
                     ("programmes for undergraduate students", "undergraduate programmes"),
                     "EEE 有邊啲本科課程同專業方向？",
@@ -611,7 +687,7 @@ def _retrieval_questions(
                 ),
             ]
         else:
-            topic_questions = [
+            content_questions = [
                 (("university ranking", "rankings", "qs world"), "PolyU 嘅大學排名係點？"),
                 (("polyu in figures", "facts and figures"), "PolyU 有咩主要數據同規模資料？"),
                 (("why polyu",), "點解學生會選擇 PolyU？"),
@@ -620,11 +696,11 @@ def _retrieval_questions(
                     "PolyU 有邊啲學院、學校同學系？",
                 ),
             ]
-    for needles, question in topic_questions:
+    for needles, question in content_questions:
         if any(needle in context for needle in needles):
             add(question)
 
-    return questions[:6]
+    return questions[:8]
 
 
 def _faq_question_text(line: str) -> str:
@@ -689,6 +765,218 @@ def _tags_for(title: str, text: str) -> list[str]:
         if any(needle in lower for needle in needles):
             tags.append(tag)
     return tags or ["PolyU"]
+
+
+def _topics_for(title: str, text: str) -> list[str]:
+    context = f"{title}\n{text}".casefold()
+    topic_terms = {
+        "programme_transfer": (
+            "transfer of study",
+            "transfer to another programme",
+            "internal transfer",
+            "轉系",
+            "轉課程",
+            "轉專業",
+        ),
+        "credit_transfer": (
+            "credit transfer",
+            "transfer of credit",
+            "transfer credits",
+            "學分轉移",
+            "轉學分",
+        ),
+        "prior_study_credit_transfer": (
+            "credits for recognised previous studies",
+            "recognised previous studies",
+            "granting of credit transfer is a matter of academic judgment",
+            "以前修讀",
+            "以往修讀",
+        ),
+        "concurrent_enrolment": (
+            "concurrent enrolment",
+            "ugc-funded programme",
+            "同時修讀兩個",
+            "同時讀兩個",
+        ),
+        "deferment": (
+            "deferment of study",
+            "defer study",
+            "暫停學業",
+            "休學",
+        ),
+        "subject_withdrawal": (
+            "subject registration and withdrawal",
+            "withdrawal of their registration on a subject",
+            "add/drop period",
+            "退科",
+        ),
+        "study_load": (
+            "normal study load",
+            "maximum study load",
+            "每學期學分",
+            "修讀學分上限",
+        ),
+        "retake": (
+            "retaking of subjects",
+            "retake a failed subject",
+            "second retake",
+            "重讀",
+        ),
+        "instruction_language": (
+            "medium of instruction",
+            "english is the medium",
+            "授課語言",
+            "教學語言",
+        ),
+        "minor_study": (
+            "minor study enrolment",
+            "minor programme",
+            "chosen minor",
+            "修讀 minor",
+        ),
+        "minor_enrolment": (
+            "minor study enrolment",
+            "students interested in a minor must submit",
+            "gpa of 2.5 or above can be considered for minor",
+        ),
+        "fast_track": (
+            "fast-track programme",
+            "fast-track integrated",
+        ),
+        "gpa_calculation": (
+            "grade point average (gpa) will be computed",
+            "gpa will be computed as follows",
+            "calculation of cumulative gpa",
+            "gpa calculation",
+        ),
+        "department_history": (
+            "merger of the department of electrical engineering",
+            "to form the department of electrical and electronic engineering",
+            "1st july 2023",
+            "合併成立",
+        ),
+        "deregistration": (
+            "deregistration",
+            "deregistered",
+            "de-register",
+            "academic probation",
+            "terminate",
+            "退學",
+        ),
+        "gpa": ("gpa", "grade point average", "semester gpa", "cumulative gpa", "types of gpa"),
+        "major_allocation": (
+            "major allocation",
+            "choice of major",
+            "choose major",
+            "主修分配",
+            "主修分流",
+        ),
+        "scholarship": ("scholarship", "獎學金"),
+        "admission": (
+            "admission",
+            "entry requirement",
+            "jupas",
+            "入學要求",
+            "收生",
+            "申請",
+            "報唔報得",
+        ),
+        "admission_score": (
+            "admission score",
+            "entry score",
+            "reference score",
+            "best five",
+            "收生分數",
+            "參考分",
+            "最佳五科",
+            "加權分數",
+        ),
+        "professional_recognition": (
+            "professional recognition",
+            "accreditation",
+            "hkie",
+            "工程師學會",
+            "註冊工程師",
+            "工程師認證",
+        ),
+        "internship": (
+            "internship",
+            "industrial training",
+            "work-integrated education",
+            "實習",
+        ),
+        "exchange": (
+            "student exchange",
+            "exchange programme",
+            "overseas exchange",
+            "海外交流",
+            "外國交換",
+        ),
+        "career": (
+            "career",
+            "employment",
+            "starting salary",
+            "就業",
+            "出路",
+            "起薪",
+            "搵工",
+            "做邊行",
+            "返工",
+            "月薪",
+            "薪酬",
+            "工資",
+        ),
+        "curriculum": (
+            "curriculum",
+            "programme structure",
+            "credit requirement",
+            "課程主要讀",
+            "課程內容",
+        ),
+        "graduation": ("graduation requirement", "award requirement"),
+        "tuition": ("tuition", "學費"),
+        "subject_prerequisite": (
+            "prerequisite subject",
+            "m1",
+            "m2",
+            "ict",
+            "資訊科技",
+            "冇讀",
+            "無讀",
+            "未讀",
+        ),
+        "student_support": (
+            "student support",
+            "student activity",
+            "programming",
+            "robotics",
+            "寫 code",
+            "編程",
+            "機械人",
+            "機器人",
+            "工作坊",
+        ),
+        "hands_on_support": (
+            "activities or resources",
+            "活動或資源",
+            "學系支援",
+            "有冇支援",
+            "有無支援",
+            "engineering entrepreneurship club",
+            "工作坊",
+        ),
+        "service_learning": (
+            "service learning",
+            "服務學習",
+            "海外義工",
+            "海外服務",
+        ),
+    }
+    return [
+        topic
+        for topic, terms in topic_terms.items()
+        if any(term.casefold() in context for term in terms)
+    ]
 
 
 def _facts() -> dict[str, Any]:
@@ -788,13 +1076,23 @@ def _to_yaml_like(data: Any, indent: int = 0) -> str:
     return f"{prefix}{json.dumps(data, ensure_ascii=False)}\n"
 
 
-def build(knowledge_dir: Path, urls: list[str]) -> None:
+def build(knowledge_dir: Path, urls: list[str], *, offline: bool = False) -> None:
     knowledge_dir.mkdir(parents=True, exist_ok=True)
     processed_dir = knowledge_dir / "processed"
     processed_dir.mkdir(parents=True, exist_ok=True)
 
     documents = _copy_docx_sources(knowledge_dir)
-    documents.extend(_fetch_polyu_pages(knowledge_dir, urls))
+    if offline:
+        cached_pages = [
+            cached
+            for url in urls
+            if (cached := _load_cached_polyu_page(knowledge_dir, url)) is not None
+        ]
+        documents.extend(cached_pages)
+        if len(cached_pages) != len(urls):
+            print(f"WARN: {len(urls) - len(cached_pages)} web pages were not available offline")
+    else:
+        documents.extend(_fetch_polyu_pages(knowledge_dir, urls))
 
     ignored_web_lines = _shared_web_navigation(documents)
     chunks = [
@@ -883,10 +1181,15 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Build PolyU/EEE infoday knowledge files.")
     parser.add_argument("--knowledge-dir", type=Path, default=DEFAULT_KNOWLEDGE_DIR)
     parser.add_argument("--url", action="append", dest="urls", default=[])
+    parser.add_argument(
+        "--offline",
+        action="store_true",
+        help="Reuse cached official web pages without making network requests.",
+    )
     args = parser.parse_args()
 
     urls = args.urls or POLYU_URLS
-    build(args.knowledge_dir, urls)
+    build(args.knowledge_dir, urls, offline=args.offline)
 
 
 if __name__ == "__main__":

@@ -18,6 +18,7 @@ from dimos.agents.mcp.mcp_client import McpClient
 from dimos.agents.mcp.mcp_server import McpServer
 from dimos.agents.push_to_talk_input import PushToTalkInput
 from dimos.agents.skills.infoday_voice_answer import InfodayVoiceAnswerSkill
+from dimos.agents.skills.polyu_knowledge import PolyUKnowledgeSkill
 from dimos.agents.web_human_input import WebInput
 from dimos.robot.unitree.go2.blueprints.agentic.unitree_go2_infoday_agentic import (
     INFODAY_AGENT_TOOLS,
@@ -126,6 +127,17 @@ def test_infoday_blueprint_streams_audio_to_go2_without_local_debug_playback() -
     )
     assert voice_answer.kwargs["wait_for_audio_playback"] is False
     assert voice_answer.kwargs["stream_audio_playback"] is True
+
+
+def test_infoday_blueprint_enables_local_multilingual_semantic_retrieval() -> None:
+    knowledge = next(
+        atom
+        for atom in unitree_go2_infoday_agentic.blueprints
+        if atom.module is PolyUKnowledgeSkill
+    )
+
+    assert knowledge.kwargs["semantic_model"] == "intfloat/multilingual-e5-small"
+    assert knowledge.kwargs["semantic_local_files_only"] is True
 
 
 def test_infoday_blueprint_uses_usb_button_push_to_talk_instead_of_web_input() -> None:

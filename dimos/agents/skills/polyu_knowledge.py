@@ -16,6 +16,7 @@ from __future__ import annotations
 
 # ruff: noqa: RUF001
 from collections.abc import Iterable
+from hashlib import sha256
 import json
 import math
 from pathlib import Path
@@ -23,9 +24,17 @@ import re
 from typing import Any, Literal
 import unicodedata
 
+import numpy as np
+from numpy.typing import NDArray
 from pydantic import Field
 
 from dimos.agents.annotation import skill
+from dimos.agents.skills.hybrid_retriever import (
+    HybridRetriever,
+    RetrievalHit,
+    TextEmbedder,
+    TransformerTextEmbedder,
+)
 from dimos.core.core import rpc
 from dimos.core.module import Module, ModuleConfig
 from dimos.utils.logging_config import setup_logger
@@ -39,6 +48,10 @@ class PolyUKnowledgeConfig(ModuleConfig):
     knowledge_dir: Path = Path("/home/jiaru/infoday/knowledge")
     max_chunks: int = Field(default=5, ge=1, le=10)
     max_chunk_chars: int = Field(default=900, ge=200, le=2000)
+    semantic_model: str | None = None
+    semantic_local_files_only: bool = True
+    semantic_batch_size: int = Field(default=16, ge=1, le=128)
+    semantic_cache_filename: str = "semantic_embeddings.npz"
 
 
 class PolyUKnowledgeSkill(Module):
@@ -47,11 +60,13 @@ class PolyUKnowledgeSkill(Module):
     config: PolyUKnowledgeConfig
     _facts: dict[str, Any]
     _chunks: list[dict[str, Any]]
+    _retriever: HybridRetriever | None
 
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
         self._facts = {}
         self._chunks = []
+        self._retriever = None
 
     @rpc
     def start(self) -> None:
@@ -74,11 +89,57 @@ class PolyUKnowledgeSkill(Module):
         else:
             logger.warning("PolyU knowledge chunks file missing", path=str(chunks_path))
 
+        self._retriever = self._build_retriever(processed_dir)
+
         logger.info(
             "Loaded PolyU knowledge",
             knowledge_dir=str(self.config.knowledge_dir),
             facts=bool(self._facts),
             chunks=len(self._chunks),
+            semantic_model=self.config.semantic_model,
+        )
+
+    def _build_retriever(self, processed_dir: Path) -> HybridRetriever:
+        lexical_retriever = HybridRetriever(
+            self._chunks,
+            tokenize=_query_tokens,
+            concepts=_concepts,
+            query_variants=_query_variants,
+        )
+        if not self.config.semantic_model or not self._chunks:
+            return lexical_retriever
+
+        try:
+            embedder = TransformerTextEmbedder(
+                self.config.semantic_model,
+                local_files_only=self.config.semantic_local_files_only,
+                batch_size=self.config.semantic_batch_size,
+            )
+            embeddings = _semantic_embeddings(
+                processed_dir / self.config.semantic_cache_filename,
+                embedder,
+                lexical_retriever.semantic_texts,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Semantic retrieval unavailable; using fielded BM25",
+                model=self.config.semantic_model,
+                error=repr(exc),
+            )
+            return lexical_retriever
+
+        logger.info(
+            "Enabled semantic PolyU knowledge retrieval",
+            model=self.config.semantic_model,
+            embeddings=len(embeddings),
+        )
+        return HybridRetriever(
+            self._chunks,
+            tokenize=_query_tokens,
+            concepts=_concepts,
+            query_variants=_query_variants,
+            embedder=embedder,
+            document_embeddings=embeddings,
         )
 
     @skill
@@ -105,7 +166,7 @@ class PolyUKnowledgeSkill(Module):
             return "沒有足夠相關資料可回答呢條問題。請唔好編造答案。"
 
         sections = [
-            "以下係可用嘅 PolyU/EEE 參考資料。請只基於呢啲資料回答；官方英文名稱保留原文；如果資料不足，要直接說明。",
+            "以下係可用嘅 PolyU/EEE 參考資料。請只基於呢啲資料回答，逐項處理用戶問題，而且每個結論都必須有下方片段支持；官方英文名稱保留原文。資料只覆蓋部分問題時，要講清楚邊部分有資料、邊部分未列明；搵唔到固定門檻唔等於冇門檻，唔可以自行推斷或編造。",
         ]
         if fact_hits:
             sections.append("\n[结构化事实]\n" + "\n".join(f"- {hit}" for hit in fact_hits))
@@ -122,6 +183,8 @@ class PolyUKnowledgeSkill(Module):
                         [
                             f"[{index}] {chunk.get('title', 'Untitled')}",
                             f"來源: {chunk.get('source', 'unknown')}",
+                            f"章節: {chunk.get('section_title') or '未標註'}",
+                            f"主題: {', '.join(str(topic) for topic in chunk.get('topics', [])) or '未標註'}",
                             f"中文提示: {_to_hk_traditional(str(chunk.get('audience_summary_zh', '')))}",
                             f"原文內容: {text}",
                         ]
@@ -193,61 +256,21 @@ class PolyUKnowledgeSkill(Module):
         return [hit for hit in hits if hit and not hit.endswith(": ")]
 
     def _chunk_hits(self, query: str, limit: int) -> list[dict[str, Any]]:
-        tokens = _query_tokens(query)
-        if not tokens:
+        if self._retriever is None:
             return []
         programme = identify_programme(query)
-        ranking_tokens = _ranking_tokens(tokens, programme)
-        if ranking_tokens:
-            tokens = ranking_tokens
-        candidates: list[tuple[dict[str, Any], str]] = []
-        for chunk in self._chunks:
-            chunk_programmes = _chunk_programmes(chunk)
-            if programme is not None and chunk_programmes and programme not in chunk_programmes:
-                continue
-            haystack = _normalize(
-                "\n".join(
-                    [
-                        str(chunk.get("title", "")),
-                        str(chunk.get("audience_summary_zh", "")),
-                        str(chunk.get("search_text", "")),
-                        " ".join(
-                            str(question) for question in chunk.get("retrieval_questions", [])
-                        ),
-                        " ".join(str(tag) for tag in chunk.get("tags", [])),
-                        str(chunk.get("original_text", "")),
-                    ]
-                )
-            )
-            candidates.append((chunk, haystack))
+        retrieval_query = _without_programme_code(query, programme)
 
-        document_count = len(candidates)
-        document_frequencies = {
-            token: sum(token.casefold() in haystack for _chunk, haystack in candidates)
-            for token in tokens
-        }
-        scored: list[tuple[float, dict[str, Any]]] = []
-        for chunk, haystack in candidates:
-            score = _score(
-                tokens,
-                haystack,
-                document_frequencies=document_frequencies,
-                document_count=document_count,
-            )
-            faq_question = _faq_question_line(str(chunk.get("original_text", "")))
-            if faq_question:
-                score += 2.0 * _score(
-                    tokens,
-                    _normalize(faq_question),
-                    document_frequencies=document_frequencies,
-                    document_count=document_count,
-                )
-            if score > 0:
-                scored.append((score, chunk))
-        scored.sort(key=lambda item: item[0], reverse=True)
+        def matches_programme(chunk: dict[str, Any]) -> bool:
+            chunk_programmes = _chunk_programmes(chunk)
+            return programme is None or not chunk_programmes or programme in chunk_programmes
+
+        hits = self._retriever.search(
+            retrieval_query, limit=max(limit * 3, limit), predicate=matches_programme
+        )
         if programme is None and is_shared_programme_question(query):
-            scored = _prioritize_both_programmes(scored)
-        return [chunk for _score_value, chunk in scored[:limit]]
+            hits = _prioritize_both_programmes(hits)
+        return [hit.chunk for hit in hits[:limit]]
 
 
 def _programme_hits(label: str, data: dict[str, Any]) -> list[str]:
@@ -259,6 +282,42 @@ def _programme_hits(label: str, data: dict[str, Any]) -> list[str]:
         f"{label} awards: {awards}",
         f"{label} normal duration: {data.get('normal_duration', '')}; Normal Year 1 academic credits: {data.get('normal_year_1_academic_credits', '')}; source: {data.get('source', '')}",
     ]
+
+
+def _semantic_embeddings(
+    cache_path: Path,
+    embedder: TextEmbedder,
+    texts: list[str],
+) -> NDArray[np.float32]:
+    fingerprint = sha256(
+        json.dumps(
+            {"model": embedder.model_name, "texts": texts},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+    if cache_path.exists():
+        try:
+            with np.load(cache_path, allow_pickle=False) as cached:
+                cached_fingerprint = str(cached["fingerprint"].item())
+                cached_embeddings: NDArray[np.float32] = np.asarray(
+                    cached["embeddings"], dtype=np.float32
+                )
+            if cached_fingerprint == fingerprint and len(cached_embeddings) == len(texts):
+                return cached_embeddings
+        except (OSError, ValueError, KeyError):
+            logger.warning("Ignoring invalid semantic embedding cache", path=str(cache_path))
+
+    embeddings = embedder.encode_documents(texts)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = cache_path.with_name(f".{cache_path.name}.tmp.npz")
+    np.savez_compressed(
+        temporary_path,
+        fingerprint=np.asarray(fingerprint),
+        embeddings=embeddings,
+    )
+    temporary_path.replace(cache_path)
+    return embeddings
 
 
 def _normalize(text: str) -> str:
@@ -324,21 +383,21 @@ def is_shared_programme_question(question: str) -> bool:
 
 
 def _prioritize_both_programmes(
-    scored: list[tuple[float, dict[str, Any]]],
-) -> list[tuple[float, dict[str, Any]]]:
-    prioritized: list[tuple[float, dict[str, Any]]] = []
+    scored: list[RetrievalHit],
+) -> list[RetrievalHit]:
+    prioritized: list[RetrievalHit] = []
     selected_ids: set[int] = set()
     for programme in ("JS3170", "JS3180"):
         candidates = [
             (index, item)
             for index, item in enumerate(scored)
-            if programme in _chunk_programmes(item[1])
+            if programme in _chunk_programmes(item.chunk)
         ]
         faq_candidate = next(
             (
                 candidate
                 for candidate in candidates
-                if "faq" in str(candidate[1][1].get("source", "")).casefold()
+                if "faq" in str(candidate[1].chunk.get("source", "")).casefold()
             ),
             None,
         )
@@ -443,7 +502,59 @@ def _query_tokens(query: str) -> list[str]:
     for phrase in _CHINESE_PHRASES:
         if phrase in normalized:
             tokens.add(phrase)
-    return sorted(token for token in tokens if len(token) > 1)
+    return sorted(
+        token
+        for token in tokens
+        if len(token) > 1 and token not in _CONVERSATIONAL_RANKING_STOPWORDS
+    )
+
+
+def _query_variants(query: str) -> list[str]:
+    """Keep the whole question while also retrieving evidence for each sub-question."""
+    variants = [query.strip()]
+    clauses = re.split(
+        r"[，,；;。！？?]+|(?:同埋|以及|另外|仲有)\s*|\band\b\s*",
+        query,
+        flags=re.IGNORECASE,
+    )
+    for clause in clauses:
+        clause = clause.strip()
+        if len(_query_tokens(clause)) < 2:
+            continue
+        if clause not in variants:
+            variants.append(clause)
+    return variants[:6]
+
+
+def _without_programme_code(query: str, programme: ProgrammeCode | None) -> str:
+    """Drop a programme code after it has already been applied as a candidate filter."""
+    if programme is None or not (_concepts(query) & _POLICY_RETRIEVAL_CONCEPTS):
+        return query
+    stripped = re.sub(
+        rf"(?i)(?<![a-z0-9])(?:js\s*)?{programme[-4:]}(?![a-z0-9])",
+        " ",
+        query,
+    )
+    stripped = re.sub(r"\s+", " ", stripped).strip(" ，,：:")
+    return stripped if _query_tokens(stripped) else query
+
+
+def _concepts(text: str) -> set[str]:
+    """Map wording variants to broad retrieval topics without encoding answers."""
+    normalized = _normalize(text)
+    concepts: set[str] = set()
+    for concept, terms in _CONCEPT_TERMS.items():
+        if _has_any(normalized, terms):
+            concepts.add(concept)
+    if (
+        "dse" in normalized
+        and "成績" in normalized
+        and _has_any(normalized, ("申請", "入學", "報讀", "收生"))
+    ):
+        concepts.add("admission_score")
+    if concepts & {"career", "professional_recognition"}:
+        concepts.discard("graduation")
+    return concepts
 
 
 def _score(
@@ -595,22 +706,322 @@ _ALIASES = {
     "hkdse": ["dse"],
     "d s e": ["dse", "hkdse"],
     "d a c": ["dse", "hkdse"],
+    "資訊科技": ["ict"],
+    "信息科技": ["ict"],
+    "programming": ["code", "寫 code", "編程"],
+    "robotics": ["robot", "機械人", "機器人"],
+    "service learning": ["服務學習", "義工", "海外服務學習"],
+    "轉去另一個課程": ["transfer", "study", "programme", "internal"],
+    "轉課程": ["transfer", "study", "programme", "internal"],
+    "以前讀過嘅科": ["recognised", "previous", "studies", "credit", "transfer"],
+    "以前修讀": ["recognised", "previous", "studies", "credit", "transfer"],
+    "點批": ["granting", "academic", "judgment"],
+    "同時讀兩個": ["concurrent", "enrolment", "ugc-funded", "programme"],
+    "同時修讀兩個": ["concurrent", "enrolment", "ugc-funded", "programme"],
+    "政府資助": ["ugc-funded"],
+    "暫停學業": ["deferment", "study"],
+    "休學": ["deferment", "study"],
+    "退科": ["subject", "withdrawal", "add/drop"],
+    "每學期": ["semester", "study", "load"],
+    "最多可以讀幾多": ["maximum", "study", "load"],
+    "重讀": ["retake", "failed", "subject"],
+    "肥咗": ["failed", "subject", "retake"],
+    "授課語言": ["medium", "instruction", "english"],
+    "中文定英文": ["medium", "instruction", "english"],
+    "上堂": ["teaching", "medium", "instruction"],
+    "minor": ["minor", "study", "enrolment"],
+    "fast-track": ["fast-track", "programme"],
+    "gpa 點計": ["grade", "point", "average", "computed", "calculation"],
+    "計邊一次成績": ["retaken", "last", "attempt", "grade"],
+    "第一個學年": ["year", "1", "curriculum"],
+    "第一年": ["year", "1", "curriculum"],
+    "學啲乜": ["curriculum", "課程"],
+    "外國交換": ["exchange", "overseas"],
+    "合併成立": ["merger", "formed", "department"],
+    "舊學系": ["merger", "department"],
+    "wie": ["work-integrated", "education", "industrial", "placement"],
+    "必修": ["compulsory", "mandatory"],
     "terminate": [
         "deregistered",
         "deregistration",
         "de-register",
         "academic probation",
-        "1.70",
     ],
     "退學": [
         "deregistered",
         "deregistration",
         "de-register",
         "academic probation",
-        "1.70",
     ],
     "js3180": ["js3180", "3180", "資訊", "人工智能", "工程"],
     "js3170": ["js3170", "3170", "電機", "工程"],
+}
+
+_CONCEPT_TERMS: dict[str, tuple[str, ...]] = {
+    "programme_transfer": (
+        "internal transfer",
+        "transfer of study",
+        "transfer to another programme",
+        "change programme",
+        "轉系",
+        "轉課程",
+        "轉programme",
+        "轉 program",
+        "轉專業",
+    ),
+    "credit_transfer": (
+        "credit transfer",
+        "transfer of credit",
+        "transfer credits",
+        "學分轉移",
+        "轉學分",
+        "學分豁免",
+    ),
+    "prior_study_credit_transfer": (
+        "recognised previous studies",
+        "previous study credit",
+        "以前讀過嘅科",
+        "以前修讀",
+        "以往修讀",
+    ),
+    "concurrent_enrolment": (
+        "concurrent enrolment",
+        "ugc-funded",
+        "同時讀兩個",
+        "同時修讀兩個",
+        "政府資助嘅本科課程",
+    ),
+    "deferment": (
+        "deferment of study",
+        "deferment",
+        "暫停學業",
+        "休學",
+    ),
+    "subject_withdrawal": (
+        "subject withdrawal",
+        "add/drop period",
+        "退科",
+    ),
+    "study_load": (
+        "study load",
+        "每學期正常",
+        "最多可以讀幾多 credits",
+        "修讀學分上限",
+    ),
+    "retake": (
+        "retake",
+        "retaking of subjects",
+        "重讀",
+        "肥咗一科",
+    ),
+    "instruction_language": (
+        "medium of instruction",
+        "授課語言",
+        "教學語言",
+        "中文定英文",
+        "用中文定英文上堂",
+    ),
+    "minor_study": (
+        "minor study",
+        "minor programme",
+        "讀 minor",
+        "修讀 minor",
+    ),
+    "minor_enrolment": (
+        "minor study enrolment",
+        "想讀 minor",
+        "申請 minor",
+        "minor 入讀",
+        "minor gpa 2.5",
+    ),
+    "fast_track": (
+        "fast-track",
+        "fast track",
+    ),
+    "gpa_calculation": (
+        "gpa 點計",
+        "gpa 點樣計",
+        "gpa calculation",
+        "計邊一次成績",
+    ),
+    "department_history": (
+        "合併成立",
+        "幾時成立",
+        "舊學系",
+        "merger",
+        "formed from",
+    ),
+    "deregistration": (
+        "deregistration",
+        "deregistered",
+        "de-register",
+        "terminate",
+        "termination",
+        "退學",
+        "踢出",
+        "取消學籍",
+    ),
+    "academic_probation": (
+        "academic probation",
+        "probation",
+        "留校察看",
+        "學業警告",
+    ),
+    "gpa": (
+        "gpa",
+        "grade point average",
+        "semester gpa",
+        "cumulative gpa",
+        "學業成績",
+    ),
+    "major_allocation": (
+        "major allocation",
+        "choose major",
+        "choice of major",
+        "主修分配",
+        "主修分流",
+        "揀主修",
+        "選主修",
+    ),
+    "graduation": (
+        "graduation requirement",
+        "award requirement",
+        "graduate",
+        "graduation",
+        "畢業要求",
+        "畢業",
+    ),
+    "scholarship": ("scholarship", "獎學金", "獎助學金"),
+    "admission": (
+        "admission",
+        "entry requirement",
+        "entrance requirement",
+        "jupas",
+        "non-jupas",
+        "入學要求",
+        "收生",
+        "報讀",
+        "申請",
+        "報唔報得",
+    ),
+    "admission_score": (
+        "admission score",
+        "entry score",
+        "best five",
+        "收生分數",
+        "幾多分",
+        "最佳五科",
+        "加權分數",
+    ),
+    "curriculum": (
+        "curriculum",
+        "programme structure",
+        "credit requirement",
+        "課程結構",
+        "課程內容",
+        "學啲乜",
+        "內容主要",
+        "第一個學年",
+        "第一年",
+        "讀啲咩",
+        "學啲咩",
+    ),
+    "professional_recognition": (
+        "professional recognition",
+        "accreditation",
+        "hkie",
+        "專業認可",
+        "工程師牌",
+        "工程師學會",
+        "註冊工程師",
+        "工程師認證",
+    ),
+    "internship": (
+        "internship",
+        "industrial training",
+        "work-integrated education",
+        "wie",
+        "實習",
+    ),
+    "exchange": (
+        "student exchange",
+        "overseas exchange",
+        "海外交流",
+        "外國交換",
+        "交換生",
+    ),
+    "career": (
+        "career",
+        "employment",
+        "starting salary",
+        "就業",
+        "出路",
+        "起薪",
+        "搵工",
+        "找工作",
+        "做邊行",
+        "返工",
+        "月薪",
+        "薪酬",
+        "工資",
+    ),
+    "tuition": ("tuition", "tuition fee", "學費"),
+    "subject_prerequisite": (
+        "prerequisite subject",
+        "m1",
+        "m2",
+        "ict",
+        "資訊科技",
+        "冇讀",
+        "無讀",
+        "未讀",
+    ),
+    "student_support": (
+        "student support",
+        "student activity",
+        "programming",
+        "robotics",
+        "寫 code",
+        "編程",
+        "機械人",
+        "機器人",
+        "工作坊",
+    ),
+    "hands_on_support": (
+        "activities or resources",
+        "活動或資源",
+        "學系支援",
+        "有冇支援",
+        "有無支援",
+        "engineering entrepreneurship club",
+        "工作坊",
+    ),
+    "service_learning": (
+        "service learning",
+        "服務學習",
+        "海外義工",
+        "海外服務",
+    ),
+}
+
+_POLICY_RETRIEVAL_CONCEPTS = {
+    "programme_transfer",
+    "credit_transfer",
+    "prior_study_credit_transfer",
+    "concurrent_enrolment",
+    "deferment",
+    "subject_withdrawal",
+    "study_load",
+    "retake",
+    "instruction_language",
+    "minor_study",
+    "minor_enrolment",
+    "fast_track",
+    "gpa_calculation",
+    "deregistration",
+    "academic_probation",
+    "internship",
+    "exchange",
 }
 
 _PROGRAMME_DETAIL_TERMS = (
