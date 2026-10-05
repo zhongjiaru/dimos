@@ -59,6 +59,7 @@ def test_response_prompt_keeps_common_admission_acronyms_compact() -> None:
 
 def test_response_prompt_speaks_as_the_go2_robot_in_first_person() -> None:
     assert '"我" refers to the robot' in INFODAY_CANTONESE_RESPONSE_PROMPT
+    assert INFODAY_IDENTITY_ANSWER in INFODAY_CANTONESE_RESPONSE_PROMPT
     assert 'say "叫我跳隻舞" instead of "叫我隻機械狗跳隻舞"' in (INFODAY_CANTONESE_RESPONSE_PROMPT)
 
 
@@ -857,10 +858,8 @@ def test_fast_answer_does_not_discard_substantive_questions(question: str) -> No
     "question",
     ["你係邊個？", "你叫咩名？", "你叫什么名字？", "What's your name?", "你好"],
 )
-def test_fast_identity_answer_introduces_named_persona(question: str) -> None:
-    assert _fast_infoday_answer(question) == (
-        "我係理大 EEE 嘅機械狗電電，好開心喺開放日見到你！你想同我傾下 EEE 課程，定係睇我表演？"
-    )
+def test_fast_identity_answer_uses_eee_helper_identity(question: str) -> None:
+    assert _fast_infoday_answer(question) == "我係電機及電子工程學系嘅機械小助手。"
 
 
 def test_infoday_voice_answer_fast_identity_skips_response_llm(mocker) -> None:  # type: ignore[no-untyped-def]

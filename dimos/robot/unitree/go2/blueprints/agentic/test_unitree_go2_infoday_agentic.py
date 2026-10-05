@@ -103,6 +103,7 @@ def test_infoday_agent_receives_only_two_business_tools() -> None:
 
 
 def test_infoday_prompt_keeps_capability_speech_and_action_in_one_tool() -> None:
+    assert "我係電機及電子工程學系嘅機械小助手。" in INFODAY_SYSTEM_PROMPT
     assert "call only\n  `perform_robot_action` with the user's complete original words" in (
         INFODAY_SYSTEM_PROMPT
     )
