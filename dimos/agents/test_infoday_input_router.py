@@ -84,6 +84,12 @@ def test_classifier_routes_clear_infoday_questions_directly(text: str) -> None:
         ("向前行兩米", InputRoute.ACTION),
         ("跳个舞嚟睇下。", InputRoute.ACTION),
         ("跳正舞。", InputRoute.ACTION),
+        ("跳第一支舞", InputRoute.ACTION),
+        ("再跳第二支舞", InputRoute.ACTION),
+        ("跳另一支舞", InputRoute.ACTION),
+        ("你會跳第二支舞嗎？", InputRoute.ACTION),
+        ("你有幾支舞？", InputRoute.ACTION),
+        ("先揮手再跳第二支舞", InputRoute.ACTION),
         ("給我比個心～", InputRoute.ACTION),
         ("俾個心我", InputRoute.ACTION),
         ("畀我一個心", InputRoute.ACTION),
@@ -291,7 +297,10 @@ def test_router_expands_action_followup_from_previous_answer(router_factory) -> 
     router.voice_answer.answer_infoday_question.assert_not_called()
 
 
-@pytest.mark.parametrize("user_text", ["跳个舞嚟睇下。", "跳正舞。"])
+@pytest.mark.parametrize(
+    "user_text",
+    ["跳个舞嚟睇下。", "跳正舞。", "再跳第二支舞", "跳另一支舞"],
+)
 def test_router_sends_dance_asr_variants_to_action_worker(
     router_factory,
     user_text: str,

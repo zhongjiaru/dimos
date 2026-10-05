@@ -41,6 +41,7 @@ InfodayAction = Literal[
     "sit",
     "stand",
     "dance",
+    "dance_two",
     "wiggle_hips",
     "finger_heart",
     "stop",
@@ -62,42 +63,56 @@ _ACTION_SPECS: dict[InfodayAction, _ActionSpec] = {
         3.0,
         "好呀，我同你揮揮手，你睇住啦！",
         "揮手",
-        (r"\bwave\b", r"揮手|挥手|打招呼"),
+        (r"\bwave\b", r"揮(?:揮)?手|挥(?:挥)?手|打(?:個|个)?招呼"),
     ),
     "stretch": _ActionSpec(
         "Stretch",
         4.0,
         "好呀，我伸展一下先！",
         "伸展",
-        (r"\bstretch\b", r"伸展|拉筋"),
+        (r"\bstretch\b", r"伸展|拉(?:下|吓|一下)?筋|伸(?:伸)?(?:懶|懒)腰"),
     ),
     "sit": _ActionSpec(
         "Sit",
         3.0,
         "好呀，我而家坐低俾你睇！",
         "坐低",
-        (r"\bsit\b", r"坐低|坐下"),
+        (r"\bsit\b", r"坐(?:返)?(?:低|下)"),
     ),
     "stand": _ActionSpec(
         "RiseSit",
         3.0,
         "好呀，我而家企返起身！",
         "企起身",
-        (r"\bstand\b", r"企起身|企返起身|站起來|站起来"),
+        (r"\bstand\b", r"企起身|企返起身|站起來|站起来|起身"),
     ),
     "dance": _ActionSpec(
         "Dance1",
         8.0,
-        "好呀，我跳隻舞俾你睇！",
-        "跳舞",
-        (r"\bdance\b", r"跳(?:返|一)?(?:隻|只|個|个|支|正)?舞"),
+        "好呀，我跳第一支舞俾你睇！",
+        "第一支舞",
+        (
+            r"\bdance\s*(?:1|one)\b|\bdance\b(?!\s*(?:2|two)\b)",
+            r"跳(?:返|一)?(?:隻|只|個|个|支|正)?舞|第(?:一|1)(?:隻|只|支|個|个)?舞"
+            r"|表演(?:一)?(?:隻|只|支|個|个)?舞",
+        ),
+    ),
+    "dance_two": _ActionSpec(
+        "Dance2",
+        8.0,
+        "好呀，我跳第二支舞俾你睇！",
+        "第二支舞",
+        (
+            r"\bdance\s*(?:2|two)\b",
+            r"第(?:二|2|兩|两)(?:隻|只|支|個|个)?舞|(?:二|2)號舞",
+        ),
     ),
     "wiggle_hips": _ActionSpec(
         "WiggleHips",
         4.0,
         "好呀，睇下我扭下身先！",
         "扭身",
-        (r"\bwiggle\b", r"扭身|扭下|扭屁股|擺動|摆动"),
+        (r"\bwiggle\b", r"扭身|扭下|扭屁股|擺動|摆动|搖(?:搖)?屁股|摇(?:摇)?屁股"),
     ),
     "finger_heart": _ActionSpec(
         "FingerHeart",
@@ -137,6 +152,8 @@ _DEMONSTRATION_PATTERN = (
     r"睇下|看看|來一個|来一个"
 )
 _ACTION_OFFER_PATTERN = r"你想|想唔想|想不想|可以揀|可以选|定係|還是|还是|或者|要唔要"
+_OTHER_DANCE_PATTERN = r"(?:另一|另外一|換|换)(?:隻|只|支|個|个)?舞|\banother\s+dance\b"
+_DANCE_COUNT_PATTERN = r"(?<!第)(?:幾|几|兩|两|2)(?:種|种|隻|只|支|個|个)舞"
 _ACTION_FOLLOWUP_PATTERNS = (
     r"^(?:好|好呀|好啊|可以|得|要|就呢個|就呢个|就這個|就这个)[!！。，, ]*$",
     r"^(?:我)?(?:想|要|可以)?(?:你)?(?:示範|示范|表演|做|試|试|睇|看)"
@@ -174,6 +191,7 @@ class InfodayActionSkill(Module):
         self._explicit_action_in_progress = False
         self._attention_busy_until = 0.0
         self._attention_action_index = 0
+        self._last_dance: Literal["dance", "dance_two"] | None = None
 
     @rpc
     def start_attention_action(self) -> str:
@@ -217,7 +235,9 @@ class InfodayActionSkill(Module):
             request: The user's complete original capability or action request.
         """
         clean_request = request.strip()
-        resolved = _resolve_action_request(clean_request)
+        with self._motion_lock:
+            previous_dance = self._last_dance
+        resolved = _resolve_action_request(clean_request, previous_dance=previous_dance)
         if resolved.action is None:
             self.voice_answer.speak_message(resolved.message)
             return f"Answered robot action capability request: {clean_request or '<empty>'}"
@@ -243,6 +263,10 @@ class InfodayActionSkill(Module):
                 self.voice_answer.speak_message(_ACTION_FAILED)
                 return f"Info Day action '{action}' was rejected by the robot"
 
+            if action == "dance" or action == "dance_two":
+                with self._motion_lock:
+                    self._last_dance = action
+
             delay = spec.duration_sec * self.config.action_time_scale
             if delay:
                 time.sleep(delay)
@@ -253,7 +277,11 @@ class InfodayActionSkill(Module):
                 self._explicit_action_in_progress = False
 
 
-def _resolve_action_request(request: str) -> _ResolvedAction:
+def _resolve_action_request(
+    request: str,
+    *,
+    previous_dance: Literal["dance", "dance_two"] | None = None,
+) -> _ResolvedAction:
     normalized = _normalize_action_request(request)
     if re.search(_CAPABILITY_OVERVIEW_PATTERN, normalized):
         return _ResolvedAction(None, _capability_overview())
@@ -263,6 +291,14 @@ def _resolve_action_request(request: str) -> _ResolvedAction:
     if "stop" in matched_actions:
         spec = _ACTION_SPECS["stop"]
         return _ResolvedAction("stop", spec.introduction)
+    if re.search(_DANCE_COUNT_PATTERN, normalized):
+        return _ResolvedAction(None, "我識兩支舞㗎。你想睇第一支定第二支？")
+    if re.search(_OTHER_DANCE_PATTERN, normalized):
+        if previous_dance is None:
+            return _ResolvedAction(None, "我識兩支舞㗎。你想睇第一支定第二支？")
+        other_dance: InfodayAction = "dance_two" if previous_dance == "dance" else "dance"
+        if other_dance not in matched_actions:
+            matched_actions.append(other_dance)
     if not matched_actions:
         return _ResolvedAction(None, _unsupported_action_response())
     if len(matched_actions) > 1:
@@ -277,6 +313,8 @@ def _resolve_action_request(request: str) -> _ResolvedAction:
     action = matched_actions[0]
     spec = _ACTION_SPECS[action]
     if re.search(_CAPABILITY_QUESTION_PATTERN, normalized) and not wants_demo:
+        if action == "dance":
+            return _ResolvedAction(None, "我識兩支舞㗎。你想睇第一支定第二支？")
         return _ResolvedAction(
             None,
             f"我識{spec.spoken_name}㗎。想唔想我而家做俾你睇？",
@@ -292,6 +330,8 @@ def is_robot_action_request(request: str) -> bool:
     return bool(
         re.search(_CAPABILITY_OVERVIEW_PATTERN, normalized)
         or _match_supported_actions(normalized)
+        or re.search(_OTHER_DANCE_PATTERN, normalized)
+        or re.search(_DANCE_COUNT_PATTERN, normalized)
         or (has_capability_question and wants_demonstration)
         or any(re.search(pattern, normalized) for pattern in _ROBOT_ACTION_INTENT_PATTERNS)
     )

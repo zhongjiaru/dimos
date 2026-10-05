@@ -20,6 +20,7 @@ import json
 import pytest
 from unitree_webrtc_connect.constants import SPORT_CMD
 
+from dimos.agents.infoday_input_router import InputRoute, classify_infoday_input
 from dimos.agents.skills.infoday_action import (
     InfodayActionSkill,
     resolve_offered_action_followup,
@@ -57,6 +58,126 @@ def test_infoday_action_accepts_cantonese_and_asr_dance_variants(
     result = action_skill.perform_robot_action(user_text)
 
     assert result == "Completed Info Day action: dance"
+    action_skill.go2.sport_command.assert_called_once_with(SPORT_CMD["Dance1"])
+
+
+@pytest.mark.parametrize(
+    ("user_text", "action", "command"),
+    [
+        ("揮手俾我睇", "wave", "Hello"),
+        ("向我揮揮手", "wave", "Hello"),
+        ("打個招呼", "wave", "Hello"),
+        ("wave at me", "wave", "Hello"),
+        ("伸展一下", "stretch", "Stretch"),
+        ("拉下筋", "stretch", "Stretch"),
+        ("伸伸懶腰", "stretch", "Stretch"),
+        ("stretch please", "stretch", "Stretch"),
+        ("坐低俾我睇", "sit", "Sit"),
+        ("坐返低", "sit", "Sit"),
+        ("坐下啦", "sit", "Sit"),
+        ("sit down", "sit", "Sit"),
+        ("企返起身", "stand", "RiseSit"),
+        ("起身啦", "stand", "RiseSit"),
+        ("站起来", "stand", "RiseSit"),
+        ("stand up", "stand", "RiseSit"),
+        ("跳個舞", "dance", "Dance1"),
+        ("跳正舞", "dance", "Dance1"),
+        ("扭下身", "wiggle_hips", "WiggleHips"),
+        ("扭屁股", "wiggle_hips", "WiggleHips"),
+        ("搖搖屁股", "wiggle_hips", "WiggleHips"),
+        ("wiggle your hips", "wiggle_hips", "WiggleHips"),
+        ("跳第一支舞", "dance", "Dance1"),
+        ("表演一隻舞", "dance", "Dance1"),
+        ("再跳第二支舞", "dance_two", "Dance2"),
+        ("跳第2支舞", "dance_two", "Dance2"),
+        ("跳二號舞", "dance_two", "Dance2"),
+        ("dance two", "dance_two", "Dance2"),
+        ("給我比個心", "finger_heart", "FingerHeart"),
+        ("送我一顆愛心", "finger_heart", "FingerHeart"),
+        ("做個心形手勢", "finger_heart", "FingerHeart"),
+        ("finger heart", "finger_heart", "FingerHeart"),
+    ],
+)
+def test_infoday_action_dispatches_spoken_request_to_expected_go2_command(
+    action_skill,
+    user_text: str,
+    action: str,
+    command: str,
+) -> None:  # type: ignore[no-untyped-def]
+    route = classify_infoday_input(user_text)
+    result = action_skill.perform_robot_action(user_text)
+
+    assert route is InputRoute.ACTION
+    assert result == f"Completed Info Day action: {action}"
+    action_skill.go2.sport_command.assert_called_once_with(SPORT_CMD[command])
+
+
+@pytest.mark.parametrize("user_text", ["停低", "停止", "唔好郁", "stop now"])
+def test_infoday_stop_phrases_route_to_immediate_stop(action_skill, user_text: str) -> None:  # type: ignore[no-untyped-def]
+    route = classify_infoday_input(user_text)
+    result = action_skill.perform_robot_action(user_text)
+
+    assert route is InputRoute.ACTION
+    assert result == "Completed Info Day action: stop"
+    action_skill.go2.stop_movement.assert_called_once_with()
+    action_skill.go2.sport_command.assert_not_called()
+
+
+def test_infoday_action_uses_previous_dance_to_resolve_another_dance(action_skill) -> None:  # type: ignore[no-untyped-def]
+    first = action_skill.perform_robot_action("跳個舞")
+    second = action_skill.perform_robot_action("再跳另一支舞")
+    third = action_skill.perform_robot_action("換支舞")
+
+    assert [first, second, third] == [
+        "Completed Info Day action: dance",
+        "Completed Info Day action: dance_two",
+        "Completed Info Day action: dance",
+    ]
+    assert [call.args[0] for call in action_skill.go2.sport_command.call_args_list] == [
+        SPORT_CMD["Dance1"],
+        SPORT_CMD["Dance2"],
+        SPORT_CMD["Dance1"],
+    ]
+
+
+def test_infoday_action_asks_for_dance_choice_without_previous_dance(action_skill) -> None:  # type: ignore[no-untyped-def]
+    result = action_skill.perform_robot_action("跳另一支舞")
+
+    assert result == "Answered robot action capability request: 跳另一支舞"
+    action_skill.go2.sport_command.assert_not_called()
+    action_skill.voice_answer.speak_message.assert_called_once_with(
+        "我識兩支舞㗎。你想睇第一支定第二支？"
+    )
+
+
+def test_infoday_action_answers_dance_count_without_moving(action_skill) -> None:  # type: ignore[no-untyped-def]
+    result = action_skill.perform_robot_action("你有幾支舞？")
+
+    assert result == "Answered robot action capability request: 你有幾支舞？"
+    action_skill.go2.sport_command.assert_not_called()
+    action_skill.voice_answer.speak_message.assert_called_once_with(
+        "我識兩支舞㗎。你想睇第一支定第二支？"
+    )
+
+
+def test_infoday_action_does_not_execute_two_dances_from_one_request(action_skill) -> None:  # type: ignore[no-untyped-def]
+    result = action_skill.perform_robot_action("先跳第一支舞再跳第二支舞")
+
+    assert result == "Answered robot action capability request: 先跳第一支舞再跳第二支舞"
+    action_skill.go2.sport_command.assert_not_called()
+    action_skill.voice_answer.speak_message.assert_called_once_with(
+        "為咗安全，我每次只做一個動作。你想我先做第一支舞同第二支舞入面邊一個？"
+    )
+
+
+def test_rejected_dance_does_not_become_previous_dance(action_skill) -> None:  # type: ignore[no-untyped-def]
+    action_skill.go2.sport_command.return_value = False
+
+    rejected = action_skill.perform_robot_action("跳個舞")
+    followup = action_skill.perform_robot_action("跳另一支舞")
+
+    assert rejected == "Info Day action 'dance' was rejected by the robot"
+    assert followup == "Answered robot action capability request: 跳另一支舞"
     action_skill.go2.sport_command.assert_called_once_with(SPORT_CMD["Dance1"])
 
 
@@ -167,6 +288,14 @@ def test_infoday_action_stop_uses_immediate_stop_rpc(action_skill) -> None:  # t
     action_skill.go2.sport_command.assert_not_called()
 
 
+def test_stop_takes_priority_over_a_relative_dance_request(action_skill) -> None:  # type: ignore[no-untyped-def]
+    result = action_skill.perform_robot_action("停低，再跳另一支舞")
+
+    assert result == "Completed Info Day action: stop"
+    action_skill.go2.stop_movement.assert_called_once_with()
+    action_skill.go2.sport_command.assert_not_called()
+
+
 def test_infoday_action_schema_accepts_original_request(action_skill) -> None:  # type: ignore[no-untyped-def]
     skills = action_skill.get_skills()
 
@@ -182,7 +311,7 @@ def test_unsupported_demo_is_refused_without_substituting_an_action(action_skill
     assert result == "Answered robot action capability request: 你會握手嗎，做個我看看"
     action_skill.go2.sport_command.assert_not_called()
     action_skill.voice_answer.speak_message.assert_called_once_with(
-        "呢個動作我暫時未支援，不過我可以做其他動作俾你睇，例如原地揮手、伸展、跳舞。你想睇邊一個？"
+        "呢個動作我暫時未支援，不過我可以做其他動作俾你睇，例如原地揮手、伸展、第一支舞。你想睇邊一個？"
     )
 
 
@@ -192,7 +321,7 @@ def test_capability_question_answers_without_moving(action_skill) -> None:  # ty
     assert result == "Answered robot action capability request: 你會跳舞嗎？"
     action_skill.go2.sport_command.assert_not_called()
     action_skill.voice_answer.speak_message.assert_called_once_with(
-        "我識跳舞㗎。想唔想我而家做俾你睇？"
+        "我識兩支舞㗎。你想睇第一支定第二支？"
     )
 
 
@@ -202,5 +331,5 @@ def test_multiple_demo_actions_ask_user_to_choose_without_moving(action_skill) -
     assert result == "Answered robot action capability request: 先揮手再跳舞俾我睇"
     action_skill.go2.sport_command.assert_not_called()
     action_skill.voice_answer.speak_message.assert_called_once_with(
-        "為咗安全，我每次只做一個動作。你想我先做揮手同跳舞入面邊一個？"
+        "為咗安全，我每次只做一個動作。你想我先做揮手同第一支舞入面邊一個？"
     )
