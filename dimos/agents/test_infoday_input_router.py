@@ -84,6 +84,17 @@ def test_classifier_routes_clear_infoday_questions_directly(text: str) -> None:
         ("向前行兩米", InputRoute.ACTION),
         ("跳个舞嚟睇下。", InputRoute.ACTION),
         ("跳正舞。", InputRoute.ACTION),
+        ("給我比個心～", InputRoute.ACTION),
+        ("俾個心我", InputRoute.ACTION),
+        ("畀我一個心", InputRoute.ACTION),
+        ("比個小心心俾我睇", InputRoute.ACTION),
+        ("送我一顆愛心", InputRoute.ACTION),
+        ("做個心形手勢", InputRoute.ACTION),
+        ("擺個手指心", InputRoute.ACTION),
+        ("比個heart", InputRoute.ACTION),
+        ("理大有愛心活動嗎？", InputRoute.INFODAY),
+        ("心理課程學啲咩？", InputRoute.INFODAY),
+        ("送心意卡係咪開放日活動？", InputRoute.INFODAY),
         ("stop", InputRoute.ACTION),
         ("follow that person", InputRoute.ACTION),
         ("帶我去 EEE office", InputRoute.AGENT),
@@ -251,6 +262,18 @@ def test_router_directly_runs_action_through_worker(router_factory) -> None:  # 
     router.action.perform_robot_action.assert_called_once_with("立即停低")
     router.action.start_attention_action.assert_not_called()
     router.human_input.publish.assert_not_called()
+    router.voice_answer.answer_infoday_question.assert_not_called()
+
+
+def test_router_sends_finger_heart_request_to_action_without_answering(router_factory) -> None:  # type: ignore[no-untyped-def]
+    router = router_factory()
+
+    router._on_input("給我比個心～")
+    router._answer_queue.put_nowait(None)
+    router._run_answers()
+
+    router.action.perform_robot_action.assert_called_once_with("給我比個心～")
+    router.action.start_attention_action.assert_not_called()
     router.voice_answer.answer_infoday_question.assert_not_called()
 
 

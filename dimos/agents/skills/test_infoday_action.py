@@ -60,6 +60,29 @@ def test_infoday_action_accepts_cantonese_and_asr_dance_variants(
     action_skill.go2.sport_command.assert_called_once_with(SPORT_CMD["Dance1"])
 
 
+@pytest.mark.parametrize(
+    "user_text",
+    [
+        "給我比個心～",
+        "俾個心我",
+        "畀我一個心",
+        "比個小心心俾我睇",
+        "送我一顆愛心",
+        "做個心形手勢",
+        "擺個手指心",
+        "比個heart",
+    ],
+)
+def test_infoday_action_performs_finger_heart_for_cantonese_requests(
+    action_skill,
+    user_text: str,
+) -> None:  # type: ignore[no-untyped-def]
+    result = action_skill.perform_robot_action(user_text)
+
+    assert result == "Completed Info Day action: finger_heart"
+    action_skill.go2.sport_command.assert_called_once_with(SPORT_CMD["FingerHeart"])
+
+
 @pytest.mark.parametrize("followup", ["想你示範。", "示范下", "好呀", "就呢個"])
 def test_action_followup_resolves_single_action_offered_by_previous_answer(
     followup: str,
