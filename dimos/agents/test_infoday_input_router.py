@@ -90,6 +90,12 @@ def test_classifier_routes_clear_infoday_questions_directly(text: str) -> None:
         ("你會跳第二支舞嗎？", InputRoute.ACTION),
         ("你有幾支舞？", InputRoute.ACTION),
         ("先揮手再跳第二支舞", InputRoute.ACTION),
+        ("歡迎", InputRoute.ACTION),
+        ("欢迎。", InputRoute.ACTION),
+        ("welcome", InputRoute.ACTION),
+        ("WELCOME!", InputRoute.ACTION),
+        ("歡迎來理大", InputRoute.INFODAY),
+        ("welcome to PolyU", InputRoute.INFODAY),
         ("給我比個心～", InputRoute.ACTION),
         ("俾個心我", InputRoute.ACTION),
         ("畀我一個心", InputRoute.ACTION),
@@ -279,6 +285,18 @@ def test_router_sends_finger_heart_request_to_action_without_answering(router_fa
     router._run_answers()
 
     router.action.perform_robot_action.assert_called_once_with("給我比個心～")
+    router.action.start_attention_action.assert_not_called()
+    router.voice_answer.answer_infoday_question.assert_not_called()
+
+
+def test_router_sends_welcome_command_to_action_without_attention_motion(router_factory) -> None:  # type: ignore[no-untyped-def]
+    router = router_factory()
+
+    router._on_input("welcome")
+    router._answer_queue.put_nowait(None)
+    router._run_answers()
+
+    router.action.perform_robot_action.assert_called_once_with("welcome")
     router.action.start_attention_action.assert_not_called()
     router.voice_answer.answer_infoday_question.assert_not_called()
 

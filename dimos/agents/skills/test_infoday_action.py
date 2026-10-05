@@ -16,6 +16,7 @@
 
 from collections.abc import Iterator
 import json
+from threading import Event
 
 import pytest
 from unitree_webrtc_connect.constants import SPORT_CMD
@@ -121,6 +122,70 @@ def test_infoday_stop_phrases_route_to_immediate_stop(action_skill, user_text: s
     assert result == "Completed Info Day action: stop"
     action_skill.go2.stop_movement.assert_called_once_with()
     action_skill.go2.sport_command.assert_not_called()
+
+
+@pytest.mark.parametrize("user_text", ["歡迎", "欢迎。", "welcome", "WELCOME!"])
+def test_welcome_command_starts_stretch_wave_heart_without_speech_first(
+    action_skill,
+    user_text: str,
+) -> None:  # type: ignore[no-untyped-def]
+    route = classify_infoday_input(user_text)
+
+    result = action_skill.perform_robot_action(user_text)
+    worker = action_skill._welcome_thread
+    assert worker is not None
+    worker.join(timeout=1.0)
+
+    assert route is InputRoute.ACTION
+    assert result == "Started Info Day welcome sequence"
+    assert not worker.is_alive()
+    assert [call.args[0] for call in action_skill.go2.sport_command.call_args_list] == [
+        SPORT_CMD["Stretch"],
+        SPORT_CMD["Hello"],
+        SPORT_CMD["FingerHeart"],
+    ]
+    action_skill.voice_answer.speak_message.assert_not_called()
+
+
+def test_welcome_sequence_stops_after_rejected_action(action_skill) -> None:  # type: ignore[no-untyped-def]
+    action_skill.go2.sport_command.side_effect = [True, False]
+
+    result = action_skill.perform_robot_action("歡迎")
+    worker = action_skill._welcome_thread
+    assert worker is not None
+    worker.join(timeout=1.0)
+
+    assert result == "Started Info Day welcome sequence"
+    assert not worker.is_alive()
+    assert [call.args[0] for call in action_skill.go2.sport_command.call_args_list] == [
+        SPORT_CMD["Stretch"],
+        SPORT_CMD["Hello"],
+    ]
+    action_skill.voice_answer.speak_message.assert_called_once()
+
+
+def test_stop_interrupts_welcome_sequence_before_next_action(mocker) -> None:  # type: ignore[no-untyped-def]
+    skill = InfodayActionSkill(action_time_scale=1.0)
+    skill.go2 = mocker.Mock()
+    skill.voice_answer = mocker.Mock()
+    first_action_started = Event()
+    skill.go2.sport_command.side_effect = lambda _command: first_action_started.set() or True
+
+    try:
+        started = skill.perform_robot_action("welcome")
+        assert first_action_started.wait(timeout=1.0)
+        stopped = skill.perform_robot_action("停低")
+        worker = skill._welcome_thread
+        assert worker is not None
+        worker.join(timeout=1.0)
+
+        assert started == "Started Info Day welcome sequence"
+        assert stopped == "Completed Info Day action: stop"
+        assert not worker.is_alive()
+        skill.go2.sport_command.assert_called_once_with(SPORT_CMD["Stretch"])
+        skill.go2.stop_movement.assert_called_once_with()
+    finally:
+        skill.stop()
 
 
 def test_infoday_action_uses_previous_dance_to_resolve_another_dance(action_skill) -> None:  # type: ignore[no-untyped-def]

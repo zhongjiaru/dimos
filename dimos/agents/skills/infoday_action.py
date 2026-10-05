@@ -28,6 +28,7 @@ from unitree_webrtc_connect.constants import SPORT_CMD
 from dimos.agents.annotation import skill
 from dimos.agents.capabilities import CAP_MOVEMENT
 from dimos.agents.skills.infoday_voice_answer_spec import InfodayVoiceAnswerSpec
+from dimos.constants import DEFAULT_THREAD_JOIN_TIMEOUT
 from dimos.core.core import rpc
 from dimos.core.module import Module, ModuleConfig
 from dimos.robot.unitree.go2.connection_spec import GO2ConnectionSpec
@@ -137,6 +138,9 @@ _ACTION_SPECS: dict[InfodayAction, _ActionSpec] = {
 
 _ACTION_COMPLETE = "完成啦！你想睇我做另一個動作，定係問下 EEE 嘅課程？"
 _ACTION_FAILED = "唔好意思，呢個動作今次做唔到；你想試下揮手，定係問下 EEE 嘅課程？"
+_ACTION_BUSY = "我而家做緊動作，等我做完再試啦。"
+_WELCOME_REQUEST_PATTERN = r"(?:歡迎|欢迎|welcome)[!！。,.，~～\s]*"
+_WELCOME_ACTIONS: tuple[InfodayAction, ...] = ("stretch", "wave", "finger_heart")
 _SUGGESTED_ACTIONS: tuple[InfodayAction, ...] = ("wave", "stretch", "dance")
 _ATTENTION_ACTIONS: tuple[InfodayAction, ...] = (
     "wave",
@@ -192,6 +196,18 @@ class InfodayActionSkill(Module):
         self._attention_busy_until = 0.0
         self._attention_action_index = 0
         self._last_dance: Literal["dance", "dance_two"] | None = None
+        self._welcome_cancel = threading.Event()
+        self._welcome_thread: threading.Thread | None = None
+
+    @rpc
+    def stop(self) -> None:
+        self._welcome_cancel.set()
+        thread = self._welcome_thread
+        if thread is not None and thread.is_alive() and thread is not threading.current_thread():
+            thread.join(timeout=DEFAULT_THREAD_JOIN_TIMEOUT)
+            if thread.is_alive():
+                logger.error("InfoDay welcome action worker did not stop")
+        super().stop()
 
     @rpc
     def start_attention_action(self) -> str:
@@ -228,13 +244,17 @@ class InfodayActionSkill(Module):
 
         Pass the user's original words. This tool determines whether the request is
         a capability question, a supported stationary demonstration, or an unsupported
-        action. It never substitutes another action without a new explicit user request.
+        action. The standalone "歡迎" or "welcome" command starts the explicit
+        stretch, wave, finger-heart sequence immediately. Other requests never
+        substitute or chain actions without a new explicit user request.
         It owns both the spoken response and physical command so they cannot conflict.
 
         Args:
             request: The user's complete original capability or action request.
         """
         clean_request = request.strip()
+        if _is_welcome_request(clean_request):
+            return self._start_welcome_sequence()
         with self._motion_lock:
             previous_dance = self._last_dance
         resolved = _resolve_action_request(clean_request, previous_dance=previous_dance)
@@ -244,16 +264,30 @@ class InfodayActionSkill(Module):
 
         action = resolved.action
         spec = _ACTION_SPECS[action]
+        if action == "stop":
+            self._welcome_cancel.set()
+            try:
+                with self._motion_lock:
+                    self.go2.stop_movement()
+            except Exception as exc:
+                logger.exception("InfoDay stop command failed")
+                self.voice_answer.speak_message(_ACTION_FAILED)
+                return f"Error performing Info Day action 'stop': {exc}"
+            self.voice_answer.speak_message(resolved.message)
+            return "Completed Info Day action: stop"
         with self._motion_lock:
-            self._explicit_action_in_progress = True
+            if self._explicit_action_in_progress:
+                busy = True
+            else:
+                busy = False
+                self._explicit_action_in_progress = True
+        if busy:
+            self.voice_answer.speak_message(_ACTION_BUSY)
+            return f"Skipped Info Day action '{action}': another action is in progress"
         try:
             self.voice_answer.speak_message(resolved.message)
             try:
-                if action == "stop":
-                    self.go2.stop_movement()
-                    succeeded = True
-                else:
-                    succeeded = self.go2.sport_command(SPORT_CMD[spec.command])
+                succeeded = self.go2.sport_command(SPORT_CMD[spec.command])
             except Exception as exc:
                 logger.exception("InfoDay action command failed", action=action)
                 self.voice_answer.speak_message(_ACTION_FAILED)
@@ -272,6 +306,54 @@ class InfodayActionSkill(Module):
                 time.sleep(delay)
             self.voice_answer.speak_message(_ACTION_COMPLETE)
             return f"Completed Info Day action: {action}"
+        finally:
+            with self._motion_lock:
+                self._explicit_action_in_progress = False
+
+    def _start_welcome_sequence(self) -> str:
+        with self._motion_lock:
+            if self._explicit_action_in_progress:
+                busy = True
+            else:
+                busy = False
+                self._explicit_action_in_progress = True
+                self._welcome_cancel.clear()
+                thread = threading.Thread(
+                    target=self._run_welcome_sequence,
+                    daemon=True,
+                    name="InfodayActionSkill-welcome",
+                )
+                self._welcome_thread = thread
+        if busy:
+            self.voice_answer.speak_message(_ACTION_BUSY)
+            return "Skipped Info Day welcome sequence: another action is in progress"
+        try:
+            thread.start()
+        except Exception:
+            with self._motion_lock:
+                self._explicit_action_in_progress = False
+                self._welcome_thread = None
+            raise
+        return "Started Info Day welcome sequence"
+
+    def _run_welcome_sequence(self) -> None:
+        try:
+            for action in _WELCOME_ACTIONS:
+                spec = _ACTION_SPECS[action]
+                with self._motion_lock:
+                    if self._welcome_cancel.is_set():
+                        return
+                    succeeded = self.go2.sport_command(SPORT_CMD[spec.command])
+                if not succeeded:
+                    logger.warning("InfoDay welcome action rejected", action=action)
+                    self.voice_answer.speak_message(_ACTION_FAILED)
+                    return
+                delay = spec.duration_sec * self.config.action_time_scale
+                if delay and self._welcome_cancel.wait(delay):
+                    return
+        except Exception:
+            logger.exception("InfoDay welcome action failed")
+            self.voice_answer.speak_message(_ACTION_FAILED)
         finally:
             with self._motion_lock:
                 self._explicit_action_in_progress = False
@@ -328,7 +410,8 @@ def is_robot_action_request(request: str) -> bool:
     has_capability_question = bool(re.search(_CAPABILITY_QUESTION_PATTERN, normalized))
     wants_demonstration = bool(re.search(_DEMONSTRATION_PATTERN, normalized))
     return bool(
-        re.search(_CAPABILITY_OVERVIEW_PATTERN, normalized)
+        _is_welcome_request(request)
+        or re.search(_CAPABILITY_OVERVIEW_PATTERN, normalized)
         or _match_supported_actions(normalized)
         or re.search(_OTHER_DANCE_PATTERN, normalized)
         or re.search(_DANCE_COUNT_PATTERN, normalized)
@@ -357,6 +440,10 @@ def _normalize_action_request(request: str) -> str:
         " ",
         unicodedata.normalize("NFKC", request).casefold(),
     ).strip()
+
+
+def _is_welcome_request(request: str) -> bool:
+    return bool(re.fullmatch(_WELCOME_REQUEST_PATTERN, _normalize_action_request(request)))
 
 
 def _match_supported_actions(normalized_request: str) -> list[InfodayAction]:
