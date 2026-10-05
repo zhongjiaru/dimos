@@ -129,6 +129,7 @@ unitree_go2_infoday_agentic = autoconnect(
         target_sample_rate=GO2_AUDIO_SAMPLE_RATE,
         target_peak=30000,
         max_gain=6.0,
+        output_gain=4.0,
         wait_for_playback=False,
         debug_local_playback=False,
         webrtc_channel_warmup_sec=0.15,

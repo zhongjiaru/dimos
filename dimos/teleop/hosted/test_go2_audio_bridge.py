@@ -498,6 +498,32 @@ def test_quiet_audio_is_amplified_to_target_peak(bridge: AudioBridgeTestModule) 
     np.testing.assert_array_equal(result, np.array([-12000, 0, 12000], dtype=np.int16))
 
 
+def test_output_gain_boosts_speech_without_clipping_peaks() -> None:
+    bridge = AudioBridgeTestModule(
+        speaker="enabled",
+        speaker_backend="webrtc",
+        target_sample_rate=GO2_AUDIO_SAMPLE_RATE,
+        target_peak=30000,
+        max_gain=6.0,
+        output_gain=4.0,
+    )
+    bridge.go2 = MagicMock()
+    bridge.go2.enqueue_audio.return_value = True
+    pcm = np.array([-30000, -3000, 0, 3000, 30000], dtype=np.int16)
+
+    try:
+        result = bridge._flush([pcm])
+        queued = bridge.go2.enqueue_audio.call_args.args[0].data
+    finally:
+        bridge.stop()
+
+    assert result is True
+    assert queued[0] == -30000
+    assert queued[-1] == 30000
+    assert 11000 <= queued[3] <= 11800
+    assert np.max(np.abs(queued.astype(np.int32))) < 32767
+
+
 def test_near_silence_is_removed_by_noise_gate(bridge: AudioBridgeTestModule) -> None:
     pcm = np.array([-20, 0, 20], dtype=np.int16)
 

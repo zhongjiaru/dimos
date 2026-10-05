@@ -29,6 +29,7 @@ import wave
 
 import numpy as np
 from numpy.typing import NDArray
+from pydantic import Field
 from reactivex.disposable import Disposable
 from scipy.signal import resample_poly
 import sounddevice as sd  # type: ignore[import-untyped]
@@ -69,6 +70,7 @@ class Go2AudioBridgeConfig(ModuleConfig):
     playback_tail_sec: float = 0.5
     target_peak: int = 12000
     max_gain: float = 128.0
+    output_gain: float = Field(default=1.0, ge=1.0, le=4.0)
     noise_gate_peak: int = 32
     megaphone_edge_fade_ms: float = 5.0
     debug_local_playback: bool = False
@@ -290,6 +292,7 @@ class Go2AudioBridgeModule(Module):
         if pcm.size == 0:
             logger.info("Go2 playback PCM suppressed by noise gate", **input_stats)
             return False
+        pcm = self._apply_output_gain(pcm)
         if self.config.speaker_backend == "megaphone":
             pcm = self._fade_edges(
                 pcm,
@@ -651,6 +654,19 @@ class Go2AudioBridgeModule(Module):
             return pcm
         amplified = np.clip(pcm.astype(np.float32) * gain, INT16_MIN, INT16_MAX)
         return amplified.astype(np.int16)
+
+    def _apply_output_gain(self, pcm: NDArray[np.int16]) -> NDArray[np.int16]:
+        """Boost speech while smoothly limiting peaks below the PCM ceiling."""
+        gain = self.config.output_gain
+        if gain == 1.0 or pcm.size == 0:
+            return pcm
+        ceiling = float(min(self.config.target_peak, INT16_MAX))
+        values = pcm.astype(np.float32)
+        boosted = ceiling * np.tanh(gain * values / ceiling) / np.tanh(gain)
+        limited: NDArray[np.int16] = np.rint(np.clip(boosted, INT16_MIN, INT16_MAX)).astype(
+            np.int16
+        )
+        return limited
 
     @staticmethod
     def _to_mono_target_rate(

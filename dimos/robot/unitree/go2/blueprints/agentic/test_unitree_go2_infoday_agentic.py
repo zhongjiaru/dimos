@@ -14,6 +14,8 @@
 
 import re
 
+from unitree_webrtc_connect.constants import WebRTCConnectionMethod
+
 from dimos.agents.mcp.mcp_client import McpClient
 from dimos.agents.mcp.mcp_server import McpServer
 from dimos.agents.push_to_talk_input import PushToTalkInput
@@ -66,6 +68,7 @@ def test_infoday_blueprint_uses_minimal_sensor_free_go2_connection() -> None:
     )
 
     assert connection.kwargs == {
+        "webrtc_connection_method": WebRTCConnectionMethod.LocalAP,
         "camera": False,
         "lidar": False,
         "odom": False,
@@ -120,6 +123,7 @@ def test_infoday_blueprint_streams_audio_to_go2_without_local_debug_playback() -
     assert bridge.kwargs["webrtc_channel_warmup_sec"] == 0.15
     assert bridge.kwargs["target_peak"] == 30000
     assert bridge.kwargs["max_gain"] == 6.0
+    assert bridge.kwargs["output_gain"] == 4.0
     voice_answer = next(
         atom
         for atom in unitree_go2_infoday_agentic.blueprints
