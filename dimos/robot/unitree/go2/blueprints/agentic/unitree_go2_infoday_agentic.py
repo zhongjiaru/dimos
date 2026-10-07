@@ -110,7 +110,8 @@ unitree_go2_infoday_agentic = autoconnect(
     InfodayActionSkill.blueprint(),
     PushToTalkInput.blueprint(
         button_device="Smart 2.4G Receiver",
-        button_keycode=117,
+        start_button_keycode=112,
+        stop_button_keycode=117,
         stt_model="Qwen/Qwen3-ASR-0.6B",
         stt_language="Cantonese",
         stt_endpoint="http://localhost:8000",

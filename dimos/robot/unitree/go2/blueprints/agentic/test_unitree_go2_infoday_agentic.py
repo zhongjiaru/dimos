@@ -153,7 +153,8 @@ def test_infoday_blueprint_uses_usb_button_push_to_talk_instead_of_web_input() -
 
     assert WebInput not in module_names
     assert push_to_talk.kwargs["button_device"] == "Smart 2.4G Receiver"
-    assert push_to_talk.kwargs["button_keycode"] == 117
+    assert push_to_talk.kwargs["start_button_keycode"] == 112
+    assert push_to_talk.kwargs["stop_button_keycode"] == 117
     assert push_to_talk.kwargs["stt_endpoint"] == "http://localhost:8000"
     assert push_to_talk.kwargs["stt_language"] == "Cantonese"
     assert push_to_talk.kwargs["stt_initial_prompt"] == INFODAY_STT_INITIAL_PROMPT

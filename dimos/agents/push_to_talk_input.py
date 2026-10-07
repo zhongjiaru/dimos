@@ -27,7 +27,7 @@ import wave
 
 import numpy as np
 from numpy.typing import NDArray
-from pydantic import Field
+from pydantic import Field, model_validator
 from reactivex import Subject
 from reactivex.abc import DisposableBase
 import sounddevice as sd  # type: ignore[import-untyped]
@@ -51,7 +51,8 @@ _PULSE_WEBRTC_AEC_ARGS = (
 
 class PushToTalkInputConfig(ModuleConfig):
     button_device: str
-    button_keycode: int = Field(ge=8, le=255)
+    start_button_keycode: int = Field(ge=8, le=255)
+    stop_button_keycode: int = Field(ge=8, le=255)
     microphone_device: int | str | None = None
     sample_rate: int = Field(default=16000, ge=8000, le=192000)
     channels: int = Field(default=1, ge=1, le=8)
@@ -76,9 +77,15 @@ class PushToTalkInputConfig(ModuleConfig):
     alsa_mic_boost_control: str = "Mic Boost"
     alsa_mic_boost_level: int | None = Field(default=None, ge=0)
 
+    @model_validator(mode="after")
+    def validate_button_keycodes(self) -> PushToTalkInputConfig:
+        if self.start_button_keycode == self.stop_button_keycode:
+            raise ValueError("Start and stop buttons must use different keycodes")
+        return self
+
 
 class PushToTalkInput(Module):
-    """Toggle local microphone capture with a button and publish final ASR text."""
+    """Start and stop local microphone capture with separate buttons."""
 
     config: PushToTalkInputConfig
     human_input: Out[str]
@@ -157,7 +164,8 @@ class PushToTalkInput(Module):
         logger.info(
             "Push-to-talk input ready",
             button_device=self.config.button_device,
-            button_keycode=self.config.button_keycode,
+            start_button_keycode=self.config.start_button_keycode,
+            stop_button_keycode=self.config.stop_button_keycode,
             microphone_device=(
                 "default"
                 if self.config.microphone_device is None
@@ -169,39 +177,39 @@ class PushToTalkInput(Module):
         )
 
     @rpc
-    def toggle_recording(self) -> str:
-        """Toggle microphone recording for diagnostics and attached button input."""
-        should_end = False
-        debug_chunks: list[NDArray[np.float32]] = []
+    def start_recording(self) -> str:
+        """Start microphone recording; repeated starts preserve the current recording."""
         with self._recording_lock:
             if self._recording:
-                self._recording = False
-                should_end = True
-                duration = time.monotonic() - self._recording_started_at
-                chunks = self._recording_chunks
-                debug_chunks = self._take_debug_recording_chunks()
-            else:
-                self._configure_input_gain()
-                self._recording = True
-                self._recording_started_at = time.monotonic()
-                self._recording_chunks = 0
-                self._debug_recording_chunks = []
-                duration = 0.0
-                chunks = 0
-
-        if should_end:
-            self._audio_end_subject.on_next(None)
-            debug_path = self._save_debug_recording(debug_chunks)
-            logger.info(
-                "Push-to-talk recording stopped",
-                duration_sec=round(duration, 3),
-                audio_chunks=chunks,
-                debug_recording_path=(str(debug_path) if debug_path is not None else None),
-            )
-            return "recording stopped; recognizing speech"
+                return "already recording"
+            self._configure_input_gain()
+            self._recording = True
+            self._recording_started_at = time.monotonic()
+            self._recording_chunks = 0
+            self._debug_recording_chunks = []
 
         logger.info("Push-to-talk recording started")
         return "recording started"
+
+    @rpc
+    def stop_recording(self) -> str:
+        """Stop microphone recording and submit it for speech recognition."""
+        with self._recording_lock:
+            if not self._recording:
+                return "not recording"
+            self._recording = False
+            duration = time.monotonic() - self._recording_started_at
+            chunks = self._recording_chunks
+            debug_chunks = self._take_debug_recording_chunks()
+            self._audio_end_subject.on_next(None)
+        debug_path = self._save_debug_recording(debug_chunks)
+        logger.info(
+            "Push-to-talk recording stopped",
+            duration_sec=round(duration, 3),
+            audio_chunks=chunks,
+            debug_recording_path=(str(debug_path) if debug_path is not None else None),
+        )
+        return "recording stopped; recognizing speech"
 
     @rpc
     def stop(self) -> None:
@@ -439,6 +447,12 @@ class PushToTalkInput(Module):
         logger.info("Push-to-talk transcript ready", text=text or "<empty>")
         self.human_input.publish(text)
 
+    def _on_button_event(self, line: str) -> None:
+        if is_xinput_key_press(line, self.config.start_button_keycode):
+            self.start_recording()
+        elif is_xinput_key_press(line, self.config.stop_button_keycode):
+            self.stop_recording()
+
     def _run_button_monitor(self) -> None:
         xinput = shutil.which("xinput")
         stdbuf = shutil.which("stdbuf")
@@ -473,8 +487,7 @@ class PushToTalkInput(Module):
             for line in process.stdout:
                 if self._stop_event.is_set():
                     break
-                if is_xinput_key_press(line, self.config.button_keycode):
-                    self.toggle_recording()
+                self._on_button_event(line)
 
             process.stdout.close()
             returncode = process.wait()

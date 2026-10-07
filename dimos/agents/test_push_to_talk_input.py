@@ -27,6 +27,7 @@ from reactivex import Subject
 
 from dimos.agents.push_to_talk_input import (
     PushToTalkInput,
+    PushToTalkInputConfig,
     is_xinput_key_press,
     parse_xinput_key_event,
 )
@@ -72,7 +73,8 @@ def mock_module_loop(mocker) -> None:  # type: ignore[no-untyped-def]
 def push_to_talk() -> Iterator[PushToTalkInput]:
     module = PushToTalkInput(
         button_device="Smart 2.4G Receiver",
-        button_keycode=117,
+        start_button_keycode=112,
+        stop_button_keycode=117,
         rpc_transport=_FakeRPC,
     )
     try:
@@ -82,18 +84,18 @@ def push_to_talk() -> Iterator[PushToTalkInput]:
 
 
 def test_xinput_key_event_parser_distinguishes_press_and_release() -> None:
-    assert parse_xinput_key_event("key press   117\n") == ("press", 117)
-    assert parse_xinput_key_event("key release 117\n") == ("release", 117)
+    assert parse_xinput_key_event("key press   112\n") == ("press", 112)
+    assert parse_xinput_key_event("key release 112\n") == ("release", 112)
     assert parse_xinput_key_event("unable to find device Smart 2.4G Receiver\n") is None
 
 
-def test_only_configured_key_press_toggles_recording() -> None:
-    assert is_xinput_key_press("key press   117\n", 117) is True
-    assert is_xinput_key_press("key release 117\n", 117) is False
-    assert is_xinput_key_press("key press   112\n", 117) is False
+def test_only_configured_key_press_matches() -> None:
+    assert is_xinput_key_press("key press   112\n", 112) is True
+    assert is_xinput_key_press("key release 112\n", 112) is False
+    assert is_xinput_key_press("key press   117\n", 112) is False
 
 
-def test_toggle_records_only_between_two_button_presses(
+def test_records_only_between_start_and_stop_button_presses(
     push_to_talk: PushToTalkInput,
 ) -> None:
     audio_events = []
@@ -103,13 +105,11 @@ def test_toggle_records_only_between_two_button_presses(
     first_frame = np.array([[0.25], [-0.25]], dtype=np.float32)
     ignored_frame = np.array([[0.75]], dtype=np.float32)
 
-    started = push_to_talk.toggle_recording()
+    push_to_talk._on_button_event("key press 112")
     push_to_talk._audio_callback(first_frame, 2, None, None)
-    stopped = push_to_talk.toggle_recording()
+    push_to_talk._on_button_event("key press 117")
     push_to_talk._audio_callback(ignored_frame, 1, None, None)
 
-    assert started == "recording started"
-    assert stopped == "recording stopped; recognizing speech"
     assert len(audio_events) == 1
     np.testing.assert_array_equal(audio_events[0].data, first_frame)
     assert audio_events[0].sample_rate == 16000
@@ -120,7 +120,8 @@ def test_toggle_records_only_between_two_button_presses(
 def test_debug_recording_writes_complete_utterance_as_pcm_wav(tmp_path: Path) -> None:
     module = PushToTalkInput(
         button_device="Smart 2.4G Receiver",
-        button_keycode=117,
+        start_button_keycode=112,
+        stop_button_keycode=117,
         sample_rate=16000,
         channels=1,
         debug_recording_dir=str(tmp_path),
@@ -130,10 +131,10 @@ def test_debug_recording_writes_complete_utterance_as_pcm_wav(tmp_path: Path) ->
     second_frame = np.array([[0.5], [1.0]], dtype=np.float32)
 
     try:
-        module.toggle_recording()
+        module.start_recording()
         module._audio_callback(first_frame, 2, None, None)
         module._audio_callback(second_frame, 2, None, None)
-        module.toggle_recording()
+        module.stop_recording()
     finally:
         module.stop()
 
@@ -146,6 +147,62 @@ def test_debug_recording_writes_complete_utterance_as_pcm_wav(tmp_path: Path) ->
         assert recording.getnframes() == 4
         samples = np.frombuffer(recording.readframes(4), dtype="<i2")
     np.testing.assert_array_equal(samples, [-32767, 0, 16384, 32767])
+
+
+def test_repeated_start_and_stop_presses_preserve_one_complete_recording(
+    push_to_talk: PushToTalkInput,
+) -> None:
+    audio_events = []
+    utterance_ends = []
+    push_to_talk._audio_subject.subscribe(audio_events.append)
+    push_to_talk._audio_end_subject.subscribe(utterance_ends.append)
+    frame = np.array([[0.25]], dtype=np.float32)
+
+    push_to_talk._on_button_event("key press 117")
+    push_to_talk._audio_callback(frame, 1, None, None)
+    push_to_talk._on_button_event("key press 112")
+    push_to_talk._audio_callback(frame, 1, None, None)
+    push_to_talk._on_button_event("key press 112")
+    push_to_talk._audio_callback(frame, 1, None, None)
+    push_to_talk._on_button_event("key press 117")
+    push_to_talk._on_button_event("key press 117")
+    push_to_talk._audio_callback(frame, 1, None, None)
+
+    assert len(audio_events) == 2
+    assert utterance_ends == [None]
+    assert push_to_talk._recording_chunks == 2
+
+
+def test_releases_and_unrelated_keys_do_not_change_recording(
+    push_to_talk: PushToTalkInput,
+) -> None:
+    audio_events = []
+    utterance_ends = []
+    push_to_talk._audio_subject.subscribe(audio_events.append)
+    push_to_talk._audio_end_subject.subscribe(utterance_ends.append)
+    frame = np.array([[0.25]], dtype=np.float32)
+
+    push_to_talk._on_button_event("key release 112")
+    push_to_talk._on_button_event("key press 113")
+    push_to_talk._audio_callback(frame, 1, None, None)
+    push_to_talk._on_button_event("key press 112")
+    push_to_talk._on_button_event("key release 112")
+    push_to_talk._on_button_event("key release 117")
+    push_to_talk._on_button_event("key press 113")
+    push_to_talk._audio_callback(frame, 1, None, None)
+    push_to_talk._on_button_event("key press 117")
+
+    assert len(audio_events) == 1
+    assert utterance_ends == [None]
+
+
+def test_start_and_stop_cannot_share_one_button() -> None:
+    with pytest.raises(ValueError, match="Start and stop buttons must use different keycodes"):
+        PushToTalkInputConfig(
+            button_device="Smart 2.4G Receiver",
+            start_button_keycode=112,
+            stop_button_keycode=112,
+        )
 
 
 def test_start_wires_microphone_asr_and_transcript_output(mocker) -> None:  # type: ignore[no-untyped-def]
@@ -186,7 +243,8 @@ def test_start_wires_microphone_asr_and_transcript_output(mocker) -> None:  # ty
     mocker.patch.object(PushToTalkInput, "_run_button_monitor")
     module = PushToTalkInput(
         button_device="Smart 2.4G Receiver",
-        button_keycode=117,
+        start_button_keycode=112,
+        stop_button_keycode=117,
         stt_initial_prompt="理大，EEE",
         rpc_transport=_FakeRPC,
     )
@@ -279,7 +337,8 @@ def test_start_uses_webrtc_noise_suppression_with_fixed_gain_and_no_agc(
     monkeypatch.setenv("PULSE_SOURCE", "original_source")
     module = PushToTalkInput(
         button_device="Smart 2.4G Receiver",
-        button_keycode=117,
+        start_button_keycode=112,
+        stop_button_keycode=117,
         pulse_webrtc_noise_suppression=True,
         pulse_source_volume_percent=50,
         alsa_capture_card=0,
@@ -289,7 +348,7 @@ def test_start_uses_webrtc_noise_suppression_with_fixed_gain_and_no_agc(
 
     try:
         module.start()
-        module.toggle_recording()
+        module.start_recording()
     finally:
         module.stop()
 
